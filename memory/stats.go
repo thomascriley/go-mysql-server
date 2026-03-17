@@ -137,17 +137,19 @@ func (s *StatsProv) estimateStats(ctx *sql.Context, table sql.Table, keys map[st
 		if len(keyVals) < bucketCnt {
 			bucketCnt = len(keyVals)
 		}
-		offset := len(keyVals) / bucketCnt
-		perBucket := int(rowCount) / bucketCnt
 		buckets := make([]sql.HistogramBucket, bucketCnt)
-		for i := range buckets {
-			var upperBound []interface{}
-			for _, v := range keyVals[i*offset] {
-				upperBound = append(upperBound, v)
+		if bucketCnt > 0 {
+			offset := len(keyVals) / bucketCnt
+			perBucket := uint64(int(rowCount) / bucketCnt)
+			for i := range buckets {
+				var upperBound []interface{}
+				for _, v := range keyVals[i*offset] {
+					upperBound = append(upperBound, v)
+				}
+				buckets[i] = stats.NewHistogramBucket(perBucket, perBucket, 0, 1, upperBound, nil, nil)
 			}
-			buckets[i] = stats.NewHistogramBucket(uint64(perBucket), uint64(perBucket), 0, 1, upperBound, nil, nil)
 		}
-
+		
 		// columns and types
 		var cols []string
 		var types []sql.Type
