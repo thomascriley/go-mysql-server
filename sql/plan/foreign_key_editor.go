@@ -15,6 +15,7 @@
 package plan
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -42,24 +43,95 @@ type ForeignKeyRefActionData struct {
 	RowMapper          *ForeignKeyRowMapper
 	Editor             *ForeignKeyEditor
 	ChildParentMapping ChildParentMapping
-	ForeignKey         sql.ForeignKeyConstraint
+	// GeneratedProjections holds the child schema's generated column expressions to eval FK referential actions.
+	GeneratedProjections []sql.Expression
+	ForeignKey           sql.ForeignKeyConstraint
 }
 
 // ForeignKeyEditor handles update and delete operations, as they may have referential actions on other tables (such as
 // cascading). If this editor is Cyclical, then that means that following the referential actions will eventually lead
 // back to this same editor. Self-referential foreign keys are inherently cyclical.
+//
+// A plan holds a ForeignKeyEditor that describes the foreign key graph and holds no table editors: Editor and each
+// RowMapper's Updater are nil, and Slot names the table each one edits or reads, as an index into
+// ForeignKeyHandler.Tables. Executing the plan opens an editor for each of those tables and makes an instance of the
+// graph with Instantiate, which fills in Editor and Updater.
 type ForeignKeyEditor struct {
 	Schema     sql.Schema
+	Slot       int
 	Editor     sql.ForeignKeyEditor
 	References []*ForeignKeyReferenceHandler
 	RefActions []ForeignKeyRefActionData
 	Cyclical   bool
 }
 
+// Instantiate returns a copy of this foreign key graph that edits and reads through |editors|, which are indexed by
+// Slot.
+func (fkEditor *ForeignKeyEditor) Instantiate(editors []sql.ForeignKeyEditor) *ForeignKeyEditor {
+	return fkEditor.instantiate(editors, make(map[*ForeignKeyEditor]*ForeignKeyEditor))
+}
+
+func (fkEditor *ForeignKeyEditor) instantiate(editors []sql.ForeignKeyEditor, copies map[*ForeignKeyEditor]*ForeignKeyEditor) *ForeignKeyEditor {
+	if fkEditor == nil {
+		return nil
+	}
+	// Cyclical graphs share editors, so each is copied once.
+	if c, ok := copies[fkEditor]; ok {
+		return c
+	}
+	c := &ForeignKeyEditor{
+		Schema:     fkEditor.Schema,
+		Slot:       fkEditor.Slot,
+		Editor:     editors[fkEditor.Slot],
+		References: make([]*ForeignKeyReferenceHandler, len(fkEditor.References)),
+		RefActions: make([]ForeignKeyRefActionData, len(fkEditor.RefActions)),
+		Cyclical:   fkEditor.Cyclical,
+	}
+	copies[fkEditor] = c
+	for i, reference := range fkEditor.References {
+		r := *reference
+		r.RowMapper.Updater = editors[r.RowMapper.Slot]
+		c.References[i] = &r
+	}
+	for i, refAction := range fkEditor.RefActions {
+		mapper := *refAction.RowMapper
+		mapper.Updater = editors[mapper.Slot]
+		refAction.RowMapper = &mapper
+		refAction.Editor = refAction.Editor.instantiate(editors, copies)
+		c.RefActions[i] = refAction
+	}
+	return c
+}
+
+// Slots returns the slots of every table this graph edits or reads.
+func (fkEditor *ForeignKeyEditor) Slots() map[int]struct{} {
+	slots := make(map[int]struct{})
+	fkEditor.addSlots(slots, make(map[*ForeignKeyEditor]struct{}))
+	return slots
+}
+
+func (fkEditor *ForeignKeyEditor) addSlots(slots map[int]struct{}, seen map[*ForeignKeyEditor]struct{}) {
+	if fkEditor == nil {
+		return
+	}
+	if _, ok := seen[fkEditor]; ok {
+		return
+	}
+	seen[fkEditor] = struct{}{}
+	slots[fkEditor.Slot] = struct{}{}
+	for _, reference := range fkEditor.References {
+		slots[reference.RowMapper.Slot] = struct{}{}
+	}
+	for _, refAction := range fkEditor.RefActions {
+		slots[refAction.RowMapper.Slot] = struct{}{}
+		refAction.Editor.addSlots(slots, seen)
+	}
+}
+
 // IsInitialized returns whether this editor has been initialized. The given map is used to prevent cycles, as editors
 // will reference themselves if a cycle is formed between foreign keys.
 func (fkEditor *ForeignKeyEditor) IsInitialized(editors map[*ForeignKeyEditor]struct{}) bool {
-	if fkEditor == nil || fkEditor.Editor == nil {
+	if fkEditor == nil {
 		return false
 	}
 	if _, ok := editors[fkEditor]; ok {
@@ -110,6 +182,13 @@ func (fkEditor *ForeignKeyEditor) Update(ctx *sql.Context, old sql.Row, new sql.
 		case sql.ForeignKeyReferentialAction_Cascade:
 		case sql.ForeignKeyReferentialAction_SetNull:
 		case sql.ForeignKeyReferentialAction_SetDefault:
+		}
+	}
+	// check for null update on non-nullable column
+	// (Doltgres allows adding the constraint SET NULL on NOT NULL column, so we catch the error when it attempts to set it null)
+	for i, col := range fkEditor.Schema {
+		if !col.Nullable && new[i] == nil {
+			return errors.New(fmt.Sprintf(`null value in column "%s" violates not-null constraint`, col.Name))
 		}
 	}
 	if err := fkEditor.Editor.Update(ctx, old, new); err != nil {
@@ -184,6 +263,9 @@ func (fkEditor *ForeignKeyEditor) OnUpdateCascade(ctx *sql.Context, refActionDat
 				updatedRow[i] = new[mappedVal]
 			}
 		}
+		if err = sql.EvalProjections(ctx, refActionData.GeneratedProjections, updatedRow); err != nil {
+			return err
+		}
 		err = refActionData.Editor.Update(ctx, rowToUpdate, updatedRow, depth)
 		if err != nil {
 			return err
@@ -236,6 +318,9 @@ func (fkEditor *ForeignKeyEditor) OnUpdateSetDefault(ctx *sql.Context, refAction
 				}
 			}
 		}
+		if err = sql.EvalProjections(ctx, refActionData.GeneratedProjections, modifiedRow); err != nil {
+			return err
+		}
 		err = refActionData.Editor.Update(ctx, rowToDefault, modifiedRow, depth)
 		if err != nil {
 			return err
@@ -271,6 +356,9 @@ func (fkEditor *ForeignKeyEditor) OnUpdateSetNull(ctx *sql.Context, refActionDat
 			if refActionData.ChildParentMapping[i] == -1 {
 				updatedRow[i] = rowToUpdate[i]
 			}
+		}
+		if err = sql.EvalProjections(ctx, refActionData.GeneratedProjections, updatedRow); err != nil {
+			return err
 		}
 		err = refActionData.Editor.Update(ctx, rowToUpdate, updatedRow, depth)
 		if err != nil {
@@ -400,6 +488,9 @@ func (fkEditor *ForeignKeyEditor) OnDeleteSetDefault(ctx *sql.Context, refAction
 				}
 			}
 		}
+		if err = sql.EvalProjections(ctx, refActionData.GeneratedProjections, modifiedRow); err != nil {
+			return err
+		}
 		err = refActionData.Editor.Update(ctx, rowToDefault, modifiedRow, depth)
 		if err != nil {
 			return err
@@ -435,6 +526,9 @@ func (fkEditor *ForeignKeyEditor) OnDeleteSetNull(ctx *sql.Context, refActionDat
 			if refActionData.ChildParentMapping[i] == -1 {
 				nulledRow[i] = rowToNull[i]
 			}
+		}
+		if err = sql.EvalProjections(ctx, refActionData.GeneratedProjections, nulledRow); err != nil {
+			return err
 		}
 		err = refActionData.Editor.Update(ctx, rowToNull, nulledRow, depth)
 		if err != nil {
@@ -494,9 +588,33 @@ func (reference *ForeignKeyReferenceHandler) IsInitialized() bool {
 
 // CheckReference checks that the given row has an index entry in the referenced table.
 func (reference *ForeignKeyReferenceHandler) CheckReference(ctx *sql.Context, row sql.Row) error {
-	// If even one of the values are NULL then we don't check the parent
+	matchFull := reference.ForeignKey.MatchType == sql.ForeignKeyMatchType_Full
+
+	nullCount := 0
 	for _, pos := range reference.RowMapper.IndexPositions {
 		if row[pos] == nil {
+			if matchFull {
+				nullCount++
+			} else {
+				return nil
+			}
+
+		}
+	}
+
+	if matchFull {
+		// all columns NULL is fine
+		if nullCount == len(reference.RowMapper.IndexPositions) {
+			return nil
+		}
+		// partial NULL is a violation
+		if nullCount != 0 {
+			return sql.ErrForeignKeyChildViolation.New(reference.ForeignKey.Name, reference.ForeignKey.Table,
+				reference.ForeignKey.ParentTable, reference.RowMapper.GetKeyString(row))
+		}
+	} else {
+		// any NULL exempts the row
+		if nullCount > 0 {
 			return nil
 		}
 	}
@@ -556,7 +674,7 @@ func (reference *ForeignKeyReferenceHandler) validateColumnTypeConstraints(ctx *
 		return nil
 	}
 
-	for parentIdx, parentCol := range mapper.Index.ColumnExpressionTypes() {
+	for parentIdx, parentCol := range mapper.Index.ColumnExpressionTypes(ctx) {
 		if parentIdx >= len(mapper.IndexPositions) {
 			break
 		}
@@ -618,7 +736,10 @@ func (reference *ForeignKeyReferenceHandler) CheckTable(ctx *sql.Context, tbl sq
 // ForeignKeyRowMapper takes a source row and returns all matching rows on the contained table according to the row
 // mapping from the source columns to the contained index's columns.
 type ForeignKeyRowMapper struct {
-	Index     sql.Index
+	Index sql.Index
+	// Slot names the table this mapper reads, as ForeignKeyEditor.Slot does, and Updater is that table's editor once
+	// instantiated.
+	Slot      int
 	Updater   sql.ForeignKeyEditor
 	SourceSch sql.Schema
 	// TargetTypeConversions are a set of functions to transform the value in the table to the corresponding value in the
@@ -638,7 +759,7 @@ type ForeignKeyRowMapper struct {
 
 // IsInitialized returns whether this mapper has been initialized.
 func (mapper *ForeignKeyRowMapper) IsInitialized() bool {
-	return mapper.Updater != nil && mapper.Index != nil
+	return mapper.Index != nil
 }
 
 // GetIter returns a row iterator for all rows that match the given source row.
@@ -672,7 +793,7 @@ func (mapper *ForeignKeyRowMapper) GetIter(ctx *sql.Context, row sql.Row, refChe
 	}
 
 	if !mapper.Index.CanSupport(ctx, rang) {
-		return nil, ErrInvalidLookupForIndexedTable.New(rang.DebugString())
+		return nil, ErrInvalidLookupForIndexedTable.New(rang.DebugString(ctx))
 	}
 	// TODO: profile this, may need to redesign this or add a fast path
 	lookup := sql.IndexLookup{Ranges: sql.MySQLRangeCollection{rang}, Index: mapper.Index}
@@ -787,7 +908,7 @@ func GetForeignKeyTypeConversions(
 				convFns = make([]ForeignKeyTypeConversionFn, len(childSch))
 			}
 			convFns[childIndex] = func(ctx *sql.Context, val any) (sql.Type, any, error) {
-				convertedVal, inRange, err := toType.ConvertToType(ctx, fromType, val)
+				convertedVal, inRange, err := toType.ConvertToType(ctx, fromType, val, 'a')
 				if inRange != sql.InRange {
 					return toType, nil, sql.ErrValueOutOfRange.New(val, toType)
 				}

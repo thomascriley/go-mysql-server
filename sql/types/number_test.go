@@ -23,9 +23,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/apd/v3"
 	"github.com/dolthub/vitess/go/sqltypes"
 	"github.com/dolthub/vitess/go/vt/proto/query"
-	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -192,7 +192,7 @@ func TestNumberConvert(t *testing.T) {
 		{typ: Uint16, inp: int16(35), exp: uint16(35), err: false, inRange: sql.InRange},
 		{typ: Uint24, inp: 36.756, exp: uint32(37), err: false, inRange: sql.InRange},
 		{typ: Uint32, inp: uint8(37), exp: uint32(37), err: false, inRange: sql.InRange},
-		{typ: Uint64, inp: time.Date(2009, 1, 2, 3, 4, 5, 0, time.UTC), exp: uint64(time.Date(2009, 1, 2, 3, 4, 5, 0, time.UTC).Unix()), err: false, inRange: sql.InRange},
+		{typ: Uint64, inp: time.Date(2009, 1, 2, 3, 4, 5, 0, time.UTC), exp: uint64(20090102030405), err: false, inRange: sql.InRange},
 		{typ: Uint64, inp: "01000", exp: uint64(1000), err: false, inRange: sql.InRange},
 		{typ: Uint64, inp: true, exp: uint64(1), err: false, inRange: sql.InRange},
 		{typ: Uint64, inp: false, exp: uint64(0), err: false, inRange: sql.InRange},
@@ -485,6 +485,31 @@ func TestNumberSQL_NumberFromString(t *testing.T) {
 	assert.Equal(t, "0", val.ToString())
 }
 
+func TestNumberSQLUnsignedClamp(t *testing.T) {
+	tests := []struct {
+		typ sql.Type
+		val interface{}
+		exp string
+	}{
+		{typ: Uint8, val: uint64(math.MaxUint8), exp: "255"},
+		{typ: Uint8, val: uint64(math.MaxUint8 + 1), exp: "255"},
+		{typ: Uint16, val: uint64(math.MaxUint16 + 1), exp: "65535"},
+		{typ: Uint24, val: uint64(1<<24 - 1), exp: "16777215"},
+		{typ: Uint24, val: uint64(1 << 24), exp: "16777215"},
+		{typ: Uint24, val: uint64(99999999), exp: "16777215"},
+		{typ: Uint32, val: uint64(math.MaxUint32 + 1), exp: "4294967295"},
+		{typ: Int24, val: int64(1 << 23), exp: "8388607"},
+	}
+
+	for _, test := range tests {
+		t.Run(fmt.Sprintf("%s %v", test.typ.String(), test.val), func(t *testing.T) {
+			val, err := test.typ.SQL(sql.NewEmptyContext(), nil, test.val)
+			require.NoError(t, err)
+			assert.Equal(t, test.exp, val.ToString())
+		})
+	}
+}
+
 func TestNumberString(t *testing.T) {
 	tests := []struct {
 		typ         sql.Type
@@ -703,33 +728,78 @@ func TestTruncateStringToDouble(t *testing.T) {
 			exp:      ".0e123",
 			expTrunc: false,
 		},
+		{
+			// https://github.com/dolthub/dolt/issues/11918
+			input:    "1E",
+			exp:      "1",
+			expTrunc: true,
+		},
+		{
+			input:    "1e+",
+			exp:      "1",
+			expTrunc: true,
+		},
+		{
+			input:    "-1.5e-",
+			exp:      "-1.5",
+			expTrunc: true,
+		},
+		{
+			input:    "1.e",
+			exp:      "1.",
+			expTrunc: true,
+		},
+		{
+			input:    "1ee2",
+			exp:      "1",
+			expTrunc: true,
+		},
+		{
+			input:    "1e2.5",
+			exp:      "1e2",
+			expTrunc: true,
+		},
+		{
+			input:    "1e.5",
+			exp:      "1",
+			expTrunc: true,
+		},
 	}
 
 	for _, test := range tests {
 		t.Run(fmt.Sprintf("%v", test.input), func(t *testing.T) {
-			truncStr, didTrunc := TruncateStringToDouble(test.input)
+			truncStr, didTrunc := TruncateStringToDouble(test.input, true)
 			assert.Equal(t, test.exp, truncStr)
 			assert.Equal(t, test.expTrunc, didTrunc)
 		})
 	}
 }
 
-func serializeDecimal(dec decimal.Decimal) []byte {
+func serializeDecimal(dec *apd.Decimal) []byte {
 	var res []byte
-	coef := dec.Coefficient()
-	res = binary.LittleEndian.AppendUint32(res, uint32(dec.Exponent()))
-	res = append(res, byte(coef.Sign()))
-	res = append(res, coef.Bytes()...)
+	if dec.Form == apd.NaN {
+		res = binary.LittleEndian.AppendUint32(res, DecimalNaN)
+	} else if dec.Form == apd.Infinite {
+		if dec.Negative {
+			res = binary.LittleEndian.AppendUint32(res, DecimalNegInf)
+		} else {
+			res = binary.LittleEndian.AppendUint32(res, DecimalPosInf)
+		}
+	} else {
+		res = binary.LittleEndian.AppendUint32(res, uint32(dec.Exponent))
+		res = append(res, byte(dec.Sign()))
+		res = append(res, dec.Coeff.Bytes()...)
+	}
 	return res
 }
 
 func TestConvertValueToInt64(t *testing.T) {
 	ctx := sql.NewEmptyContext()
 
-	zeroDec := serializeDecimal(decimal.Zero)
-	testDec := serializeDecimal(decimal.NewFromFloat(123.456))
-	minInt64Dec := serializeDecimal(decimal.NewFromInt(math.MinInt64))
-	maxInt64Dec := serializeDecimal(decimal.NewFromInt(math.MaxInt64))
+	zeroDec := serializeDecimal(apd.New(0, 0))
+	testDec := serializeDecimal(DecimalFromFloat64(123.456))
+	minInt64Dec := serializeDecimal(DecimalFromInt64(math.MinInt64))
+	maxInt64Dec := serializeDecimal(DecimalFromInt64(math.MaxInt64))
 
 	tests := []struct {
 		val sql.Value
@@ -1237,9 +1307,9 @@ func TestConvertValueToInt64(t *testing.T) {
 func TestConvertValueToUint64(t *testing.T) {
 	ctx := sql.NewEmptyContext()
 
-	zeroDec := serializeDecimal(decimal.Zero)
-	testDec := serializeDecimal(decimal.NewFromFloat(123.456))
-	maxInt64Dec := serializeDecimal(decimal.NewFromInt(math.MaxInt64))
+	zeroDec := serializeDecimal(apd.New(0, 0))
+	testDec := serializeDecimal(DecimalFromFloat64(123.456))
+	maxInt64Dec := serializeDecimal(DecimalFromInt64(math.MaxInt64))
 
 	tests := []struct {
 		val sql.Value
@@ -1715,10 +1785,10 @@ func TestConvertValueToUint64(t *testing.T) {
 func TestConvertValueToFloat64(t *testing.T) {
 	ctx := sql.NewEmptyContext()
 
-	zeroDec := serializeDecimal(decimal.Zero)
-	testDec := serializeDecimal(decimal.NewFromFloat(123.456))
-	minInt64Dec := serializeDecimal(decimal.NewFromInt(math.MinInt64))
-	maxInt64Dec := serializeDecimal(decimal.NewFromInt(math.MaxInt64))
+	zeroDec := serializeDecimal(apd.New(0, 0))
+	testDec := serializeDecimal(DecimalFromFloat64(123.456))
+	minInt64Dec := serializeDecimal(DecimalFromInt64(math.MinInt64))
+	maxInt64Dec := serializeDecimal(DecimalFromInt64(math.MaxInt64))
 
 	tests := []struct {
 		val sql.Value

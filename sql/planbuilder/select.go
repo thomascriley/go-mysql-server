@@ -27,6 +27,17 @@ import (
 )
 
 func (b *Builder) buildSelectStmt(inScope *scope, s ast.SelectStatement) (outScope *scope) {
+	// A nested SELECT has its own context, so the defer restores the
+	// outer query's aggregate and window settings when done.
+	defer func(inAgg, inWin, inAggFilter bool) {
+		b.inAgg = inAgg
+		b.inWindow = inWin
+		b.inAggFilter = inAggFilter
+	}(b.inAgg, b.inWindow, b.inAggFilter)
+	b.inAgg = false
+	b.inWindow = false
+	b.inAggFilter = false
+
 	switch s := s.(type) {
 	case *ast.Select:
 		if s.With != nil {
@@ -41,7 +52,14 @@ func (b *Builder) buildSelectStmt(inScope *scope, s ast.SelectStatement) (outSco
 		}
 		return b.buildSetOp(inScope, s)
 	case *ast.ParenSelect:
-		return b.buildSelectStmt(inScope, s.Select)
+		outScope = b.buildSelectStmt(inScope, s.Select)
+		// Apply any trailing ORDER BY or LIMIT clauses attached outside the parentheses.
+		if len(s.OrderBy) > 0 {
+			orderByScope := b.analyzeOrderBy(outScope, outScope, s.OrderBy)
+			b.buildOrderBy(outScope, orderByScope)
+		}
+		b.buildLimitAndOffset(inScope, outScope, s.Limit, false)
+		return outScope
 	default:
 		b.handleErr(fmt.Errorf("unknown select statement %T", s))
 	}
@@ -59,7 +77,13 @@ func (b *Builder) buildSelect(inScope *scope, s *ast.Select) (outScope *scope) {
 	// 5) Build top-level scopes, replacing aggregation and aliases with
 	//    projections from (4).
 	// 6) Finish with final target projections.
+	parentQueryBlock := inScope.queryBlock
 	fromScope := b.buildFrom(inScope, s.From)
+	fromScope.queryBlock = &queryBlock{
+		source:       fromScope,
+		parent:       parentQueryBlock,
+		correlations: inScope.nearestSubquery(),
+	}
 	if cn, ok := fromScope.node.(sql.CommentedNode); ok && len(s.Comments) > 0 {
 		fromScope.node = cn.WithComment(string(s.Comments[0]))
 	}
@@ -80,14 +104,20 @@ func (b *Builder) buildSelect(inScope *scope, s *ast.Select) (outScope *scope) {
 	// Find aggregations in order by
 	orderByScope := b.analyzeOrderBy(fromScope, projScope, s.OrderBy)
 
-	// Find aggregations in having
-	b.analyzeHaving(fromScope, projScope, s.Having)
+	var groupingCols []sql.Expression
+	if len(s.GroupBy) > 0 {
+		groupingCols = b.buildGroupingCols(fromScope, projScope, s.GroupBy, s.SelectExprs)
+	}
+
+	// Resolve HAVING before aggregation is finalized so its aggregate functions
+	// are registered with the query blocks that own their arguments.
+	having := b.resolveHaving(fromScope, projScope, s.Having)
 
 	// At this point we've recorded dependencies for higher-level scopes,
 	// so we can build the FROM clause
-	if b.needsAggregation(fromScope, s) {
-		groupingCols := b.buildGroupingCols(fromScope, projScope, s.GroupBy, s.SelectExprs)
-		outScope = b.buildAggregation(fromScope, projScope, groupingCols)
+	needsAggregation := b.needsAggregation(fromScope, s)
+	if needsAggregation {
+		outScope = b.buildAggregation(fromScope, projScope, groupingCols, having)
 	} else if fromScope.windowFuncs != nil {
 		outScope = b.buildWindow(fromScope, projScope)
 	} else {
@@ -99,7 +129,9 @@ func (b *Builder) buildSelect(inScope *scope, s *ast.Select) (outScope *scope) {
 	// expressions in higher level scopes will be replaced with GetField
 	// references.
 
-	b.buildHaving(fromScope, projScope, outScope, s.Having)
+	if !needsAggregation {
+		b.attachHaving(outScope, having)
+	}
 
 	b.buildOrderBy(outScope, orderByScope)
 
@@ -112,20 +144,27 @@ func (b *Builder) buildSelect(inScope *scope, s *ast.Select) (outScope *scope) {
 	}
 
 	// OFFSET and LIMIT are last
-	offset := b.buildOffset(outScope, s.Limit)
-	if offset != nil {
-		outScope.node = plan.NewOffset(offset, outScope.node)
-	}
-	limit := b.buildLimit(outScope, s.Limit)
-	if limit != nil {
-		l := plan.NewLimit(limit, outScope.node)
-		l.CalcFoundRows = s.QueryOpts.SQLCalcFoundRows
-		outScope.node = l
-	}
+	b.buildLimitAndOffset(outScope, outScope, s.Limit, s.QueryOpts.SQLCalcFoundRows)
 
 	b.buildForUpdateOf(s.Lock, fromScope)
 
 	return
+}
+
+func (b *Builder) buildLimitAndOffset(inScope, outScope *scope, limit *ast.Limit, calcFoundRows bool) {
+	if limit == nil {
+		return
+	}
+	offset := b.buildOffset(inScope, limit)
+	if offset != nil {
+		outScope.node = plan.NewOffset(offset, outScope.node)
+	}
+	limitExpr := b.buildLimit(inScope, limit)
+	if limitExpr != nil {
+		l := plan.NewLimit(limitExpr, outScope.node)
+		l.CalcFoundRows = calcFoundRows
+		outScope.node = l
+	}
 }
 
 func (b *Builder) buildLimit(inScope *scope, limit *ast.Limit) sql.Expression {
@@ -164,8 +203,8 @@ func (b *Builder) buildLimitVal(inScope *scope, e ast.Expr) sql.Expression {
 			if col, ok := inScope.proc.GetVar(e.String()); ok {
 				// proc param is OK
 				if pp, ok := col.scalarGf().(*expression.ProcedureParam); ok {
-					if !pp.Type().Promote().Equals(types.Int64) && !pp.Type().Promote().Equals(types.Uint64) {
-						err := fmt.Errorf("the variable '%s' has a non-integer based type: %s", pp.Name(), pp.Type().String())
+					if !pp.Type(b.ctx).Promote().Equals(types.Int64) && !pp.Type(b.ctx).Promote().Equals(types.Uint64) {
+						err := fmt.Errorf("the variable '%s' has a non-integer based type: %s", pp.Name(), pp.Type(b.ctx).String())
 						b.handleErr(err)
 					}
 					return pp
@@ -187,7 +226,7 @@ func (b *Builder) typeCoerceLiteral(e sql.Expression) sql.Expression {
 	case *expression.Literal:
 		val, _, err := types.Int64.Convert(b.ctx, e.Value())
 		if err != nil {
-			err = fmt.Errorf("%s: %w", err.Error(), sql.ErrInvalidTypeForLimit.New(types.Int64, e.Type()))
+			err = fmt.Errorf("%s: %w", err.Error(), sql.ErrInvalidTypeForLimit.New(types.Int64, e.Type(b.ctx)))
 		}
 		return expression.NewLiteral(val, types.Int64)
 	case *expression.BindVar:
@@ -210,7 +249,7 @@ func (b *Builder) buildDistinct(inScope *scope, distinct bool, distinctOn ast.Ex
 		distinctOnExprs[i] = b.buildScalar(inScope, distinctOn[i])
 	}
 	var err error
-	inScope.node, err = b.f.buildDistinct(inScope.node, inScope.refsSubquery, distinctOnExprs)
+	inScope.node, err = b.f.buildDistinct(b.ctx, inScope.node, inScope.refsSubquery, distinctOnExprs)
 	return err
 }
 
@@ -230,6 +269,28 @@ func (b *Builder) currentDb() sql.Database {
 		b.currentDatabase = privilegedDatabase.Unwrap()
 	}
 	return b.currentDatabase
+}
+
+// isSchemaDb return true if the current database is sql.SchemaDatabase,
+// which means it is Doltgres database supports schemas. If there is no
+// database found, it returns false.
+func (b *Builder) isSchemaDb() bool {
+	if b.currentDatabase == nil {
+		currentDbName := b.ctx.GetCurrentDatabase()
+		if currentDbName == "" {
+			return false
+		}
+		database, err := b.cat.Database(b.ctx, b.ctx.GetCurrentDatabase())
+		if err != nil {
+			return false
+		}
+		b.currentDatabase = database
+	}
+	if privilegedDatabase, ok := b.currentDatabase.(mysql_db.PrivilegedDatabase); ok {
+		b.currentDatabase = privilegedDatabase.Unwrap()
+	}
+	_, isSchDb := b.currentDatabase.(sql.SchemaDatabase)
+	return isSchDb
 }
 
 func (b *Builder) renameSource(scope *scope, table string, cols []string) {

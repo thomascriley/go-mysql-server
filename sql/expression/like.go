@@ -22,8 +22,32 @@ import (
 	"sync"
 	"unicode/utf8"
 
+	"github.com/dolthub/vitess/go/mysql"
+
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/types"
+)
+
+const (
+	likeWildcardMany     = '%'
+	likeWildcardOne      = '_'
+	likeDefaultEscape    = '\\'
+	likePatternMetaChars = `\%_`
+)
+
+// LikePatternKind is the kind of pattern in a LIKE comparison, as [Like.LiteralPrefix] reports it.
+type LikePatternKind int
+
+const (
+	// LikeOther is an unclassified pattern, such as a nonliteral or empty string,
+	// a pattern with an ESCAPE clause, or wildcards before the end such as %a or a_b.
+	LikeOther LikePatternKind = iota
+	// LikeLiteral is a pattern without wildcard characters, such as abc or the escaped a\%c.
+	LikeLiteral
+	// LikePrefix is a literal prefix followed by a single %, such as abc%.
+	LikePrefix
+	// LikeAny is a pattern of only % wildcards, such as %%, which matches any string.
+	LikeAny
 )
 
 // Like performs pattern matching against two strings.
@@ -46,7 +70,7 @@ type likeMatcherErrTuple struct {
 // NewLike creates a new LIKE expression.
 func NewLike(left, right, escape sql.Expression) sql.Expression {
 	var cached = true
-	sql.Inspect(right, func(e sql.Expression) bool {
+	sql.Inspect(nil /*ctx isn't used here*/, right, func(_ *sql.Context, e sql.Expression) bool {
 		if _, ok := e.(*GetField); ok {
 			cached = false
 		}
@@ -63,7 +87,7 @@ func NewLike(left, right, escape sql.Expression) sql.Expression {
 }
 
 // Type implements the sql.Expression interface.
-func (l *Like) Type() sql.Type { return types.Boolean }
+func (l *Like) Type(ctx *sql.Context) sql.Type { return types.Boolean }
 
 // CollationCoercibility implements the interface sql.CollationCoercible.
 func (l *Like) CollationCoercibility(ctx *sql.Context) (collation sql.CollationID, coercibility byte) {
@@ -87,7 +111,7 @@ func (l *Like) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 	}
 	if _, ok := left.(string); !ok {
 		// Use type-aware conversion for enum types
-		leftStr, _, err := types.ConvertToCollatedString(ctx, left, l.Left().Type())
+		leftStr, _, err := types.ConvertToCollatedString(ctx, left, l.Left().Type(ctx))
 		if err != nil {
 			return nil, err
 		}
@@ -102,6 +126,7 @@ func (l *Like) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 	if right == nil {
 		return nil, nil
 	}
+	var tpl likeMatcherErrTuple
 	if !l.cached {
 		// for non-cached regex every time create a new matcher
 		collation, _ := l.CollationCoercibility(ctx)
@@ -116,10 +141,18 @@ func (l *Like) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 				},
 			}
 		})
-		tpl := l.pool.Get().(likeMatcherErrTuple)
+		tpl = l.pool.Get().(likeMatcherErrTuple)
 		lm, err = tpl.matcher, tpl.err
 	}
 	if err != nil {
+		if sql.ErrCharSetInvalidString.Is(err) {
+			// MySQL returns no match and issues warning 1300 instead of an error.
+			if l.cached {
+				l.pool.Put(tpl)
+			}
+			ctx.Warn(mysql.ERInvalidCharacterString, "%s", err.Error())
+			return nil, nil
+		}
 		return nil, err
 	}
 
@@ -139,47 +172,115 @@ func (l *Like) evalRight(ctx *sql.Context, row sql.Row) (right *string, escape r
 	if err != nil {
 		return nil, 0, err
 	}
-	if _, ok := rightVal.(string); !ok {
+	var rightStr string
+	var ok bool
+	if rightStr, ok = rightVal.(string); !ok {
 		// Use type-aware conversion for enum types
-		rightStr, _, err := types.ConvertToCollatedString(ctx, rightVal, l.Right().Type())
+		rightStr, _, err = types.ConvertToCollatedString(ctx, rightVal, l.Right().Type(ctx))
 		if err != nil {
 			return nil, 0, err
 		}
-		rightVal = rightStr
 	}
+	right = &rightStr
 
-	var escapeVal interface{}
+	escape = likeDefaultEscape
 	if l.Escape != nil {
+		var escapeVal any
 		escapeVal, err = l.Escape.Eval(ctx, row)
 		if err != nil {
 			return nil, 0, err
 		}
-		if escapeVal == nil {
-			escapeVal = `\`
-		}
-		if _, ok := escapeVal.(string); !ok {
-			escapeVal, _, err = types.LongText.Convert(ctx, escapeVal)
-			if err != nil {
-				return nil, 0, err
+		if escapeVal != nil {
+			var escapeStr string
+			if escapeStr, ok = escapeVal.(string); !ok {
+				escapeVal, _, err = types.LongText.Convert(ctx, escapeVal)
+				if err != nil {
+					return nil, 0, err
+				}
+				escapeStr = escapeVal.(string)
+			}
+			switch utf8.RuneCountInString(escapeStr) {
+			case 0:
+				// an empty string escape character means escape the NUL character (\0)
+				escape = 0
+			case 1:
+				escape = []rune(escapeStr)[0]
+			default:
+				return nil, 0, sql.ErrInvalidArgument.New("ESCAPE")
 			}
 		}
-		if utf8.RuneCountInString(escapeVal.(string)) > 1 {
-			return nil, 0, sql.ErrInvalidArgument.New("ESCAPE")
-		}
-	} else {
-		escapeVal = `\`
 	}
 
-	rightStr := rightVal.(string)
-	return &rightStr, []rune(escapeVal.(string))[0], nil
+	return right, escape, nil
 }
 
 func (l *Like) String() string {
+	if l.Escape != nil {
+		return fmt.Sprintf("%s LIKE %s ESCAPE %s", l.LeftChild, l.RightChild, l.Escape)
+	}
 	return fmt.Sprintf("%s LIKE %s", l.LeftChild, l.RightChild)
 }
 
+// LiteralPrefix returns the pattern's literal prefix and kind. For LikeLiteral,
+// prefix is the whole literal; for LikePrefix, it is the literal part before %.
+// Other kinds return an empty prefix.
+func (l *Like) LiteralPrefix(
+	ctx *sql.Context,
+) (prefix string, kind LikePatternKind) {
+	// TODO(#3942): handle custom ESCAPE
+	if l.Escape != nil {
+		return "", LikeOther
+	}
+	r, isLit := l.RightChild.(*Literal)
+	if !isLit || r.Value() == nil {
+		return "", LikeOther
+	}
+	pattern, isStr := r.Value().(string)
+	if !isStr || len(pattern) == 0 {
+		return "", LikeOther
+	}
+	if strings.Trim(pattern, "%") == "" {
+		return "", LikeAny
+	}
+	idx := strings.IndexAny(pattern, likePatternMetaChars)
+	if idx == -1 {
+		return pattern, LikeLiteral
+	}
+	if idx == len(pattern)-1 && pattern[idx] == likeWildcardMany {
+		return pattern[:idx], LikePrefix
+	}
+	var b strings.Builder
+	b.Grow(len(pattern))
+	escaped := false
+	for i := 0; i < len(pattern); {
+		r, size := utf8.DecodeRuneInString(pattern[i:])
+		i += size
+
+		switch {
+		case !escaped && r == likeDefaultEscape:
+			escaped = true
+		case escaped:
+			escaped = false
+			b.WriteRune(r)
+		case r == likeWildcardOne:
+			return "", LikeOther
+		case r == likeWildcardMany:
+			if i == len(pattern) && b.Len() > 0 {
+				return b.String(), LikePrefix
+			}
+			return "", LikeOther
+		default:
+			b.WriteRune(r)
+		}
+	}
+	if escaped {
+		b.WriteRune(likeDefaultEscape)
+	}
+	return b.String(), LikeLiteral
+}
+
 // WithChildren implements the Expression interface.
-func (l *Like) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (l *Like) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 2 {
 		return nil, sql.ErrInvalidChildrenNumber.New(l, len(children), 2)
 	}
@@ -292,7 +393,10 @@ func ConstructLikeMatcher(collation sql.CollationID, pattern string, escape rune
 	matcher := LikeMatcher{nil, collation, escape}
 	for i := 0; i < len(pattern); {
 		nextRune, advance := charsetEncoder.NextRune(pattern[i:])
-		if nextRune == utf8.RuneError {
+		// NextRune only pairs utf8.RuneError with an advance of one byte or fewer for a
+		// genuinely malformed sequence. The replacement character U+FFFD is valid and
+		// decodes to three bytes, so it must not be rejected here.
+		if nextRune == utf8.RuneError && advance <= 1 {
 			return LikeMatcher{}, sql.ErrCharSetInvalidString.New(collation.CharacterSet().Name(), pattern)
 		}
 		i += advance
@@ -303,8 +407,13 @@ func ConstructLikeMatcher(collation sql.CollationID, pattern string, escape rune
 		case '%': // Matches any sequence of characters, including the empty sequence
 			matcher.nodes = append(matcher.nodes, likeMatcherAny{})
 		case escape: // States that the next character should be taken literally
+			if i >= len(pattern) {
+				// A trailing escape character is matched literally.
+				matcher.nodes = append(matcher.nodes, likeMatcherRune{escape, sorter(escape)})
+				break
+			}
 			nextRune, advance = charsetEncoder.NextRune(pattern[i:])
-			if nextRune == utf8.RuneError {
+			if nextRune == utf8.RuneError && advance <= 1 {
 				return LikeMatcher{}, sql.ErrCharSetInvalidString.New(collation.CharacterSet().Name(), pattern)
 			}
 			i += advance
@@ -358,7 +467,7 @@ func (l LikeMatcher) Match(s string) bool {
 		}
 
 		nextRune, advance := charsetEncoder.NextRune(s[stringIndex:])
-		if nextRune == utf8.RuneError {
+		if nextRune == utf8.RuneError && advance <= 1 {
 			return false
 		}
 		matched, consumed := l.nodes[nodeIndex].Match(l.collation, nextRune)
@@ -418,7 +527,7 @@ func (l LikeMatcher) backtrack(s string, nodeIndex int, nodeNextIndex []int) (ma
 	for ; nodeIndex >= 0; nodeIndex-- {
 		stringIndex := nodeNextIndex[nodeIndex]
 		nextRune, advance := charsetEncoder.NextRune(s[stringIndex:])
-		if nextRune == utf8.RuneError {
+		if nextRune == utf8.RuneError && advance <= 1 {
 			return false, 0
 		}
 		if l.nodes[nodeIndex].MatchNext(l.collation, nextRune) {

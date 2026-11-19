@@ -22,7 +22,7 @@ for a reference implementation. Or, hop into the Dolt Discord server
 With the exception of specific limitations (see below),
 **go-mysql-server** is a drop-in replacement for MySQL. Any client
 library, tool, query, SQL syntax, SQL function, etc. that works with
-MySQL should also work with **go-mysql-server**. If you find a gap in
+MySQL (including the [MariaDB Java client](SUPPORTED_CLIENTS.md#mariadb-java-client)) should also work with **go-mysql-server**. If you find a gap in
 functionality, please file an issue.
 
 For full MySQL compatibility documentation, see the [Dolt
@@ -90,7 +90,9 @@ import (
 	"github.com/dolthub/go-mysql-server/memory"
 	"github.com/dolthub/go-mysql-server/server"
 	"github.com/dolthub/go-mysql-server/sql"
+	"github.com/dolthub/go-mysql-server/sql/analyzer"
 	"github.com/dolthub/go-mysql-server/sql/types"
+	"github.com/dolthub/go-mysql-server/sql/variables"
 )
 
 // This is an example of how to implement a MySQL server.
@@ -116,11 +118,12 @@ var (
 )
 
 func main() {
-	pro := createTestDatabase()
-	engine := sqle.NewDefault(pro)
+	vars := variables.NewEngineVariables()
+	pro := createTestDatabase(vars)
+	engine := sqle.New(analyzer.NewDefault(pro), &sqle.Config{EngineVariables: vars})
 
-	session := memory.NewSession(sql.NewBaseSession(), pro)
-	ctx := sql.NewContext(context.Background(), sql.WithSession(session))
+	session := memory.NewSession(sql.NewBaseSessionWithVariables(vars), pro)
+	ctx := engine.NewContext(context.Background(), sql.WithSession(session))
 	ctx.SetCurrentDatabase(dbName)
 
 	// This variable may be found in the "users_example.go" file. Please refer to that file for a walkthrough on how to
@@ -136,7 +139,7 @@ func main() {
 		Protocol: "tcp",
 		Address:  fmt.Sprintf("%s:%d", address, port),
 	}
-	s, err := server.NewServer(config, engine, sql.NewContext, memory.NewSessionBuilder(pro), nil)
+	s, err := server.NewServer(config, engine, sql.ContextFactoryWithVariables(vars), memory.NewSessionBuilderWithVariables(pro, vars), nil)
 	if err != nil {
 		panic(err)
 	}
@@ -145,14 +148,14 @@ func main() {
 	}
 }
 
-func createTestDatabase() *memory.DbProvider {
+func createTestDatabase(vars *sql.EngineVariables) *memory.DbProvider {
 	db := memory.NewDatabase(dbName)
 
 	pro := memory.NewDBProvider(db)
-	session := memory.NewSession(sql.NewBaseSession(), pro)
-	ctx := sql.NewContext(context.Background(), sql.WithSession(session))
+	session := memory.NewSession(sql.NewBaseSessionWithVariables(vars), pro)
+	ctx := sql.NewContextWithVariables(context.Background(), vars, sql.WithSession(session))
 
-	table := memory.NewTable(db, tableName, sql.NewPrimaryKeySchema(sql.Schema{
+	table := memory.NewTable(ctx, db, tableName, sql.NewPrimaryKeySchema(sql.Schema{
 		{Name: "name", Type: types.Text, Nullable: false, Source: tableName, PrimaryKey: true},
 		{Name: "email", Type: types.Text, Nullable: false, Source: tableName, PrimaryKey: true},
 		{Name: "phone_numbers", Type: types.JSON, Nullable: false, Source: tableName},

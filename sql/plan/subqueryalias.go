@@ -20,12 +20,14 @@ import (
 	"github.com/dolthub/go-mysql-server/sql"
 )
 
+type ScopeMapping = map[sql.ColumnId]sql.Expression
+
 // SubqueryAlias is a node that gives a subquery a name.
 type SubqueryAlias struct {
 	UnaryNode
 	Correlated   sql.ColSet
 	cols         sql.ColSet
-	ScopeMapping map[sql.ColumnId]sql.Expression
+	ScopeMapping ScopeMapping
 
 	name           string
 	TextDefinition string
@@ -99,8 +101,8 @@ func (sq *SubqueryAlias) IsReadOnly() bool {
 }
 
 // Schema implements the Node interface.
-func (sq *SubqueryAlias) Schema() sql.Schema {
-	childSchema := sq.Child.Schema()
+func (sq *SubqueryAlias) Schema(ctx *sql.Context) sql.Schema {
+	childSchema := sq.Child.Schema(ctx)
 	schema := make(sql.Schema, len(childSchema))
 	for i, col := range childSchema {
 		c := *col
@@ -114,7 +116,7 @@ func (sq *SubqueryAlias) Schema() sql.Schema {
 }
 
 // WithChildren implements the Node interface.
-func (sq *SubqueryAlias) WithChildren(children ...sql.Node) (sql.Node, error) {
+func (sq *SubqueryAlias) WithChildren(ctx *sql.Context, children ...sql.Node) (sql.Node, error) {
 	if len(children) != 1 {
 		return nil, sql.ErrInvalidChildrenNumber.New(sq, len(children), 1)
 	}
@@ -136,7 +138,7 @@ func (sq *SubqueryAlias) WithChild(n sql.Node) *SubqueryAlias {
 }
 
 func (sq *SubqueryAlias) CanCacheResults() bool {
-	return sq.Correlated.Empty() && !sq.Volatile
+	return sq.Correlated.Empty() && !sq.Volatile && !ReferencesOuterRecursiveTable(sq.Child)
 }
 
 func (sq *SubqueryAlias) WithCorrelated(cols sql.ColSet) *SubqueryAlias {
@@ -151,7 +153,7 @@ func (sq *SubqueryAlias) WithVolatile(v bool) *SubqueryAlias {
 	return &ret
 }
 
-func (sq *SubqueryAlias) WithScopeMapping(cols map[sql.ColumnId]sql.Expression) *SubqueryAlias {
+func (sq *SubqueryAlias) WithScopeMapping(cols ScopeMapping) *SubqueryAlias {
 	ret := *sq
 	ret.ScopeMapping = cols
 	return &ret
@@ -175,7 +177,7 @@ func (sq *SubqueryAlias) String() string {
 	return pr.String()
 }
 
-func (sq *SubqueryAlias) DebugString() string {
+func (sq *SubqueryAlias) DebugString(ctx *sql.Context) string {
 	pr := sql.NewTreePrinter()
 	_ = pr.WriteNode("SubqueryAlias")
 	children := make([]string, 7)
@@ -185,12 +187,12 @@ func (sq *SubqueryAlias) DebugString() string {
 	children[3] = fmt.Sprintf("cacheable: %t", sq.CanCacheResults())
 	children[4] = fmt.Sprintf("colSet: %s", sq.Columns())
 	children[5] = fmt.Sprintf("tableId: %d", sq.Id())
-	children[6] = sql.DebugString(sq.Child)
+	children[6] = sql.DebugString(ctx, sq.Child)
 	_ = pr.WriteChildren(children...)
 	return pr.String()
 }
 
-func (sq *SubqueryAlias) Describe(options sql.DescribeOptions) string {
+func (sq *SubqueryAlias) Describe(ctx *sql.Context, options sql.DescribeOptions) string {
 	pr := sql.NewTreePrinter()
 	_ = pr.WriteNode("SubqueryAlias")
 	children := make([]string, 7)
@@ -200,7 +202,7 @@ func (sq *SubqueryAlias) Describe(options sql.DescribeOptions) string {
 	children[3] = fmt.Sprintf("cacheable: %t", sq.CanCacheResults())
 	children[4] = fmt.Sprintf("colSet: %s", sq.Columns())
 	children[5] = fmt.Sprintf("tableId: %d", sq.Id())
-	children[6] = sql.Describe(sq.Child, options)
+	children[6] = sql.Describe(ctx, sq.Child, options)
 	_ = pr.WriteChildren(children...)
 	return pr.String()
 }
@@ -209,4 +211,56 @@ func (sq *SubqueryAlias) WithColumnNames(columns []string) *SubqueryAlias {
 	ret := *sq
 	ret.ColumnNames = columns
 	return &ret
+}
+
+// SubqueryAliasIter is an implementation of ValueRowWriter that maps child ColumnIds onto parent ColumnIds
+// as it iterates. All RowIter methods are implicitly passed through to the underlying writer.
+type SubqueryAliasIter struct {
+	sql.ValueRowWriter
+	destColumns sql.ColSet
+	childRow    sql.ValueRow
+}
+
+func NewSubqueryAliasIter(destColumns sql.ColSet, child sql.ValueRowWriter) (SubqueryAliasIter, error) {
+	if destColumns.Len() != child.Columns().Len() {
+		return SubqueryAliasIter{}, fmt.Errorf("SubqueryAliasIter column count mismatch: %d != %d", destColumns.Len(), child.Columns().Len())
+	}
+	childRow := make(sql.ValueRow, child.Columns().Max()+1)
+	return SubqueryAliasIter{child, destColumns, childRow}, nil
+}
+
+var _ sql.ValueRowWriter = SubqueryAliasIter{}
+
+func (m SubqueryAliasIter) IsValueRowWriter(ctx *sql.Context) bool {
+	return m.ValueRowWriter.IsValueRowWriter(ctx)
+}
+
+func (m SubqueryAliasIter) WriteNextValueRow(ctx *sql.Context, row sql.ValueRow) error {
+	// It is necessary to write to a new row because the subquery could be a common
+	// table expression that is referenced multiple times, in which case each reference
+	// will use the same ColumnIds.
+	// TODO: We can prevent this by pushing ColumnIds from the SQA into the subquery.
+
+	err := m.ValueRowWriter.WriteNextValueRow(ctx, m.childRow)
+	if err != nil {
+		return err
+	}
+	sourceColumns := m.ValueRowWriter.Columns()
+	nextSourceColumn, ok := sourceColumns.Next(1)
+	nextDestColumn, _ := m.destColumns.Next(1)
+	for ok {
+		row[nextDestColumn] = m.childRow[nextSourceColumn]
+		nextSourceColumn, ok = sourceColumns.Next(nextSourceColumn + 1)
+		nextDestColumn, _ = m.destColumns.Next(nextDestColumn + 1)
+	}
+	return nil
+}
+
+func (m SubqueryAliasIter) Columns() sql.ColSet {
+	return m.destColumns
+}
+
+func (m SubqueryAliasIter) WithColumns(cols sql.ColSet) sql.ValueRowWriter {
+	m.destColumns = cols
+	return m
 }

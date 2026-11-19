@@ -1205,4 +1205,49 @@ var FulltextTests = []ScriptTest{
 			},
 		},
 	},
+	{
+		// https://github.com/dolthub/dolt/issues/10882
+		Name: "REPLACE INTO/INSERT...ON DUPLICATE KEY UPDATE when words are in the same position",
+		SetUpScript: []string{
+			"CREATE TABLE t (id INT PRIMARY KEY, body LONGTEXT NOT NULL)",
+			"CREATE FULLTEXT INDEX ft ON t(body)",
+			"INSERT INTO t VALUES (1, 'hello world')",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "REPLACE INTO t VALUES (1, 'hello earth')",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 2}}},
+			},
+			{
+				Query:    "select * from t",
+				Expected: []sql.Row{{1, "hello earth"}},
+			},
+			{
+				Query:    "INSERT INTO t VALUES (1, 'hello world') ON DUPLICATE KEY UPDATE body = VALUES(body)",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 2}}},
+			},
+			{
+				Query:    "select * from t",
+				Expected: []sql.Row{{1, "hello world"}},
+			},
+		},
+	},
+	{
+		// https://github.com/dolthub/dolt/issues/12175
+		Name: "null fulltext index",
+		SetUpScript: []string{
+			"CREATE TABLE t (a VARCHAR(100), b INT, FULLTEXT INDEX fa(a), INDEX ib(b));",
+			"INSERT INTO t VALUES ('alpha',1),('alpha',1),(NULL,2),('',3),('bravo',4),('alpha bravo',5);",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "SELECT COUNT(*) FROM t WHERE a IS NULL;",
+				Expected: []sql.Row{{1}},
+			},
+			{
+				Query:    "SELECT a FROM t WHERE a='alpha';",
+				Expected: []sql.Row{{"alpha"}, {"alpha"}},
+			},
+		},
+	},
 }

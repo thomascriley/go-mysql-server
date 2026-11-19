@@ -1,9 +1,13 @@
 package analyzer
 
 import (
+	"github.com/dolthub/vitess/go/sqltypes"
+
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/plan"
+	"github.com/dolthub/go-mysql-server/sql/planbuilder"
 	"github.com/dolthub/go-mysql-server/sql/transform"
+	"github.com/dolthub/go-mysql-server/sql/types"
 )
 
 // todo this should be split into two rules. The first should be in
@@ -24,7 +28,7 @@ func resolveCreateSelect(ctx *sql.Context, a *Analyzer, n sql.Node, scope *plan.
 	// We don't want to carry any information about keys, constraints, defaults, etc. from a `create table as select`
 	// statement. When the underlying select node is a table, we must remove all such info from its schema. The only
 	// exception is NOT NULL constraints, which we leave alone.
-	selectSchema := stripSchema(analyzedSelect.Schema())
+	selectSchema := stripSchema(analyzedSelect.Schema(ctx))
 	mergedSchema := mergeSchemas(ct.PkSchema().Schema, selectSchema)
 	newSch := make(sql.Schema, len(mergedSchema))
 
@@ -34,6 +38,11 @@ func resolveCreateSelect(ctx *sql.Context, a *Analyzer, n sql.Node, scope *plan.
 		// replace system variable types with their underlying types
 		if sysType, isSysTyp := tempCol.Type.(sql.SystemVariableType); isSysTyp {
 			tempCol.Type = sysType.UnderlyingType()
+		}
+		// Untyped NULL items materialized without an explicit column
+		// definition default to empty binary storage.
+		if types.IsNullType(tempCol.Type) {
+			tempCol.Type = types.MustCreateBinary(sqltypes.VarBinary, 0)
 		}
 		newSch[i] = &tempCol
 	}
@@ -59,6 +68,15 @@ func resolveCreateSelect(ctx *sql.Context, a *Analyzer, n sql.Node, scope *plan.
 		} else {
 			nonPkIndexes = append(nonPkIndexes, idx)
 		}
+	}
+
+	// Selected columns can carry unresolved defaults loaded from storage.
+	// TODO: Ideally, this would happen in the planbuilder phase, so that we don't
+	//       have to construct a new planbuilder here.
+	builder := planbuilder.New(ctx, a.Catalog, nil)
+	newSch, err = builder.ResolveSchemaDefaults(ct.Database().Name(), ct.Name(), newSch)
+	if err != nil {
+		return nil, transform.SameTree, err
 	}
 
 	newSpec := &plan.TableSpec{

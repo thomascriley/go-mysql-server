@@ -15,7 +15,6 @@
 package iters
 
 import (
-	"container/heap"
 	"fmt"
 	"io"
 	"sort"
@@ -25,148 +24,10 @@ import (
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/expression"
 	"github.com/dolthub/go-mysql-server/sql/hash"
+	"github.com/dolthub/go-mysql-server/sql/sorters"
+	"github.com/dolthub/go-mysql-server/sql/transform"
 	"github.com/dolthub/go-mysql-server/sql/types"
 )
-
-// topRowIter is a special case of topRowsIter when N = 1
-type topRowIter struct {
-	childIter     sql.RowIter
-	sortFields    sql.SortFields
-	topRow        sql.Row
-	numFoundRows  int64
-	calcFoundRows bool
-	once          bool
-}
-
-var _ sql.RowIter = (*topRowIter)(nil)
-
-func NewTopRowIter(s sql.SortFields, calcFoundRows bool, child sql.RowIter) *topRowIter {
-	return &topRowIter{
-		childIter:     child,
-		sortFields:    s,
-		calcFoundRows: calcFoundRows,
-	}
-}
-
-func (i *topRowIter) Next(ctx *sql.Context) (sql.Row, error) {
-	if i.once {
-		return nil, io.EOF
-	}
-	i.once = true
-
-	topRow, err := i.childIter.Next(ctx)
-	if err != nil {
-		return nil, err
-	}
-	sorter := expression.Sorter{
-		Ctx:        ctx,
-		SortFields: i.sortFields,
-	}
-	for {
-		var row sql.Row
-		row, err = i.childIter.Next(ctx)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		i.numFoundRows++
-		if sorter.IsLesserRow(row, topRow) {
-			topRow = row
-		}
-	}
-	return topRow, nil
-}
-
-func (i *topRowIter) Close(ctx *sql.Context) error {
-	if i.calcFoundRows {
-		ctx.GetLastQueryInfo().FoundRows.Store(i.numFoundRows)
-	}
-	return i.childIter.Close(ctx)
-}
-
-type topRowsIter struct {
-	childIter     sql.RowIter
-	sortFields    sql.SortFields
-	topRows       []sql.Row
-	idx           int
-	limit         int64
-	numFoundRows  int64
-	calcFoundRows bool
-}
-
-var _ sql.RowIter = (*topRowsIter)(nil)
-
-func NewTopRowsIter(s sql.SortFields, limit int64, calcFoundRows bool, child sql.RowIter, childSchemaLen int) *topRowsIter {
-	return &topRowsIter{
-		sortFields:    append(s, sql.SortField{Column: expression.NewGetField(childSchemaLen, types.Int64, "order", false)}),
-		limit:         limit,
-		calcFoundRows: calcFoundRows,
-		childIter:     child,
-		idx:           -1,
-	}
-}
-
-func (i *topRowsIter) Next(ctx *sql.Context) (sql.Row, error) {
-	if i.idx == -1 {
-		err := i.computeTopRows(ctx)
-		if err != nil {
-			return nil, err
-		}
-		i.idx = 0
-	}
-
-	if i.idx >= len(i.topRows) {
-		return nil, io.EOF
-	}
-	row := i.topRows[i.idx]
-	i.idx++
-	return row[:len(row)-1], nil
-}
-
-func (i *topRowsIter) Close(ctx *sql.Context) error {
-	i.topRows = nil
-	if i.calcFoundRows {
-		ctx.GetLastQueryInfo().FoundRows.Store(i.numFoundRows)
-	}
-	return i.childIter.Close(ctx)
-}
-
-func (i *topRowsIter) computeTopRows(ctx *sql.Context) error {
-	topRowsHeap := &expression.TopRowsHeap{
-		Sorter: expression.Sorter{
-			SortFields: i.sortFields,
-			Rows:       make([]sql.Row, 0, i.limit+1),
-			LastError:  nil,
-			Ctx:        ctx,
-		},
-	}
-	for {
-		row, err := i.childIter.Next(ctx)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-		i.numFoundRows++
-
-		row = append(row, i.numFoundRows) // TODO: this triggers a malloc
-
-		heap.Push(topRowsHeap, row)
-		if int64(topRowsHeap.Len()) > i.limit {
-			heap.Pop(topRowsHeap)
-		}
-		if topRowsHeap.LastError != nil {
-			return topRowsHeap.LastError
-		}
-	}
-
-	var err error
-	i.topRows, err = topRowsHeap.Rows()
-	return err
-}
 
 // GetInt64Value returns the int64 literal value in the expression given, or an error with the errStr given if it
 // cannot.
@@ -494,6 +355,45 @@ type LimitIter struct {
 	CalcFoundRows bool
 }
 
+var _ sql.ValueRowWriter = (*LimitIter)(nil)
+
+// WriteNextValueRow implements the sql.ValueRowWriter interface.
+func (li *LimitIter) WriteNextValueRow(ctx *sql.Context, row sql.ValueRow) error {
+	childWriter := li.ChildIter.(sql.ValueRowWriter)
+	if li.currentPos >= li.Limit {
+		// If we were asked to calc all found rows, then when we are past the limit we iterate over the rest of the
+		// result set to count it
+		if li.CalcFoundRows {
+			for {
+				err := childWriter.WriteNextValueRow(ctx, row)
+				if err != nil {
+					return err
+				}
+				li.currentPos++
+			}
+		}
+		return io.EOF
+	}
+
+	err := childWriter.WriteNextValueRow(ctx, row)
+	if err != nil {
+		return err
+	}
+	li.currentPos++
+	return nil
+}
+
+// IsValueRowWriter implements the sql.ValueRowWriter interface.
+func (li *LimitIter) IsValueRowWriter(ctx *sql.Context) bool {
+	childWriter, ok := li.ChildIter.(sql.ValueRowWriter)
+	return ok && childWriter.IsValueRowWriter(ctx)
+}
+
+// Columns implements the sql.ValueRowWriter interface.
+func (li *LimitIter) Columns() sql.ColSet {
+	return li.ChildIter.(sql.ValueRowWriter).Columns()
+}
+
 func (li *LimitIter) Next(ctx *sql.Context) (sql.Row, error) {
 	if li.currentPos >= li.Limit {
 		// If we were asked to calc all found rows, then when we are past the limit we iterate over the rest of the
@@ -532,19 +432,21 @@ func (li *LimitIter) Close(ctx *sql.Context) error {
 }
 
 type sortIter struct {
-	sortFields sql.SortFields
-	childIter  sql.RowIter
-	sortedRows []sql.Row
-	idx        int
+	sortConditions  sql.SortConditions
+	childIter       sql.RowIter
+	sortedRows      []sql.Row
+	sortedValueRows []sql.ValueRow
+	idx             int
 }
 
 var _ sql.RowIter = (*sortIter)(nil)
+var _ sql.ValueRowWriter = (*sortIter)(nil)
 
-func NewSortIter(s sql.SortFields, child sql.RowIter) *sortIter {
+func NewSortIter(s sql.SortConditions, child sql.RowIter) *sortIter {
 	return &sortIter{
-		sortFields: s,
-		childIter:  child,
-		idx:        -1,
+		sortConditions: s,
+		childIter:      child,
+		idx:            -1,
 	}
 }
 
@@ -567,11 +469,107 @@ func (i *sortIter) Next(ctx *sql.Context) (sql.Row, error) {
 
 func (i *sortIter) Close(ctx *sql.Context) error {
 	i.sortedRows = nil
+	i.sortedValueRows = nil
 	return i.childIter.Close(ctx)
 }
 
+// WriteNextValueRow implements the sql.ValueRowIter interface.
+func (i *sortIter) WriteNextValueRow(ctx *sql.Context, row sql.ValueRow) error {
+	if i.idx == -1 {
+		err := i.computeSortedValueRows(ctx)
+		if err != nil {
+			return err
+		}
+		i.idx = 0
+	}
+
+	if i.idx >= len(i.sortedValueRows) {
+		return io.EOF
+	}
+	src := i.sortedValueRows[i.idx]
+	// sortedValueRows only stores the columns from the child, so
+	// we must write them into the destination row.
+	sql.UnprojectValueRow(i.Columns(), src, row)
+	i.idx++
+	return nil
+}
+
+// IsValueRowWriter implements the sql.ValueRowWriter interface. Sorting on sql.Values requires a value-capable child
+// and sort conditions that can be compared without deserializing.
+func (i *sortIter) IsValueRowWriter(ctx *sql.Context) bool {
+	childWriter, ok := i.childIter.(sql.ValueRowWriter)
+	if !ok || !childWriter.IsValueRowWriter(ctx) {
+		return false
+	}
+	for _, sc := range i.sortConditions {
+		valueExpr, ok := sc.Expr.(sql.ValueExpression)
+		if !ok || !valueExpr.IsValueExpression(ctx) {
+			return false
+		}
+		if !types.IsComparableValueType(sc.Expr.Type(ctx)) {
+			return false
+		}
+	}
+	return true
+}
+
+// Columns implements the sql.ValueRowWriter interface.
+func (i *sortIter) Columns() sql.ColSet {
+	return i.childIter.(sql.ValueRowWriter).Columns()
+}
+
+// computeSortedValueRows buffers all child rows, deep-copying each one because the child may reuse the ValueRow and
+// its byte buffers, then sorts them.
+func (i *sortIter) computeSortedValueRows(ctx *sql.Context) error {
+	// TODO: generic function that accepts an Iter or a Writer and
+	// returns an Iter
+	childWriter := i.childIter.(sql.ValueRowWriter)
+	childIter := sql.ProjectValueRowWriter(childWriter)
+	cache, dispose := ctx.Memory.NewRows2Cache(ctx)
+	defer dispose()
+
+	for {
+		row, err := childIter.NextValueRow(ctx)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+
+		if err := cache.AddValueRow(row); err != nil {
+			return err
+		}
+	}
+
+	// Rewrite the sort conditions to use the offset
+	columnIds := i.Columns().OrdinalMapping()
+
+	newSortExpressions, _, _ := transform.Exprs(ctx, i.sortConditions.ToExpressions(), func(ctx *sql.Context, e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
+		switch expr := e.(type) {
+		case *expression.GetField:
+			return expr.WithId(sql.ColumnId(columnIds[expr.Id()])), transform.NewTree, nil
+		default:
+			return e, transform.SameTree, nil
+		}
+	})
+	newSortConditions := i.sortConditions.FromExpressions(ctx, newSortExpressions...)
+
+	rows := cache.GetValueRow()
+	sorter, err := sorters.NewValueRowSorterWithRows(ctx, newSortConditions, rows, i.Columns())
+	if err != nil {
+		return err
+	}
+	sort.Stable(sorter)
+	if err := sorter.GetError(); err != nil {
+		return err
+	}
+	i.sortedValueRows = rows
+	return nil
+}
+
 func (i *sortIter) computeSortedRows(ctx *sql.Context) error {
-	cache, dispose := ctx.Memory.NewRowsCache()
+	cache, dispose := ctx.Memory.NewRowsCache(ctx)
 	defer dispose()
 
 	for {
@@ -590,15 +588,11 @@ func (i *sortIter) computeSortedRows(ctx *sql.Context) error {
 	}
 
 	rows := cache.Get()
-	sorter := &expression.Sorter{
-		SortFields: i.sortFields,
-		Rows:       rows,
-		LastError:  nil,
-		Ctx:        ctx,
-	}
+	sorter := sorters.NewRowSorterWithRows(ctx, i.sortConditions, rows)
 	sort.Stable(sorter)
-	if sorter.LastError != nil {
-		return sorter.LastError
+	err := sorter.GetError()
+	if err != nil {
+		return err
 	}
 	i.sortedRows = rows
 	return nil
@@ -622,7 +616,7 @@ type DistinctHasher interface {
 }
 
 func NewDistinctIter(ctx *sql.Context, child sql.RowIter, hasher DistinctHasher) *distinctIter {
-	cache, dispose := ctx.Memory.NewHistoryCache()
+	cache, dispose := ctx.Memory.NewHistoryCache(ctx)
 	return &distinctIter{
 		childIter:   child,
 		hasher:      hasher,
@@ -636,7 +630,7 @@ func (di *distinctIter) Next(ctx *sql.Context) (sql.Row, error) {
 		row, err := di.childIter.Next(ctx)
 		if err != nil {
 			if err == io.EOF {
-				di.Dispose()
+				di.Dispose(ctx)
 			}
 			return nil, err
 		}
@@ -659,11 +653,11 @@ func (di *distinctIter) Next(ctx *sql.Context) (sql.Row, error) {
 }
 
 func (di *distinctIter) Close(ctx *sql.Context) error {
-	di.Dispose()
+	di.Dispose(ctx)
 	return di.childIter.Close(ctx)
 }
 
-func (di *distinctIter) Dispose() {
+func (di *distinctIter) Dispose(ctx *sql.Context) {
 	if di.DisposeFunc != nil {
 		di.DisposeFunc()
 	}

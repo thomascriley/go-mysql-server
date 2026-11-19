@@ -5,54 +5,16 @@ import (
 	"math"
 	"reflect"
 
-	"github.com/cespare/xxhash/v2"
-	"github.com/shopspring/decimal"
+	"github.com/cockroachdb/apd/v3"
 
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/expression"
+	"github.com/dolthub/go-mysql-server/sql/hash"
 	"github.com/dolthub/go-mysql-server/sql/types"
 )
 
-type anyValueBuffer struct {
-	res  interface{}
-	expr sql.Expression
-}
-
-func NewAnyValueBuffer(child sql.Expression) *anyValueBuffer {
-	return &anyValueBuffer{nil, child}
-}
-
-// Update implements the AggregationBuffer interface.
-func (a *anyValueBuffer) Update(ctx *sql.Context, row sql.Row) error {
-	if a.res != nil {
-		return nil
-	}
-
-	v, err := a.expr.Eval(ctx, row)
-	if err != nil {
-		return err
-	}
-	if v == nil {
-		return nil
-	}
-
-	a.res = v
-
-	return nil
-}
-
-// Eval implements the AggregationBuffer interface.
-func (a *anyValueBuffer) Eval(ctx *sql.Context) (interface{}, error) {
-	return a.res, nil
-}
-
-// Dispose implements the Disposable interface.
-func (a *anyValueBuffer) Dispose() {
-	expression.Dispose(a.expr)
-}
-
 type sumBuffer struct {
-	sum   interface{} // sum is either decimal.Decimal or float64
+	sum   interface{} // sum is either *apd.Decimal or float64
 	expr  sql.Expression
 	isnil bool
 }
@@ -81,11 +43,14 @@ func (m *sumBuffer) Update(ctx *sql.Context, row sql.Row) error {
 	return nil
 }
 
-func (m *sumBuffer) PerformSum(ctx *sql.Context, v interface{}) {
-	// decimal.Decimal values are evaluated to string value even though the Literal expr type is Decimal type,
-	// so convert it to appropriate Decimal type
-	if s, isStr := v.(string); isStr && types.IsDecimal(m.expr.Type()) {
-		val, _, err := m.expr.Type().Convert(ctx, s)
+func (m *sumBuffer) PerformSum(ctx *sql.Context, v any) {
+	// TODO: To handle datetime conversions properly this needs to use types.TypeAwareConversion
+	//  Additionally, this could be rewritten to be cleaner and more efficient.
+	//  Tracking issue: https://github.com/dolthub/dolt/issues/10278
+	// *apd.Decimal values are evaluated to string value even though the Literal expr type is Decimal type,
+	// so convert it to the appropriate Decimal type
+	if s, isStr := v.(string); isStr && types.IsDecimal(m.expr.Type(ctx)) {
+		val, _, err := m.expr.Type(ctx).Convert(ctx, s)
 		if err == nil {
 			v = val
 		}
@@ -98,7 +63,7 @@ func (m *sumBuffer) PerformSum(ctx *sql.Context, v interface{}) {
 		}
 		switch sum := m.sum.(type) {
 		case float64:
-		case decimal.Decimal:
+		case *apd.Decimal:
 			m.sum, _ = sum.Float64()
 		default:
 			var err error
@@ -108,23 +73,25 @@ func (m *sumBuffer) PerformSum(ctx *sql.Context, v interface{}) {
 			}
 		}
 		m.sum = m.sum.(float64) + n
-	case decimal.Decimal:
+	case *apd.Decimal:
 		if m.isnil {
-			m.sum = decimal.NewFromInt(0)
+			m.sum = apd.New(0, 0)
 			m.isnil = false
 		}
 		switch sum := m.sum.(type) {
-		case decimal.Decimal:
+		case *apd.Decimal:
 		case float64:
-			m.sum = decimal.NewFromFloat(sum)
+			m.sum = types.DecimalFromFloat64(sum)
 		default:
 			var err error
 			m.sum, _, err = types.InternalDecimalType.Convert(ctx, sum)
 			if err != nil {
-				m.sum = decimal.NewFromInt(0)
+				m.sum = apd.New(0, 0)
 			}
 		}
-		m.sum = m.sum.(decimal.Decimal).Add(n)
+		curSum := m.sum.(*apd.Decimal)
+		_, _ = sql.DecimalCtx.Add(curSum, curSum, n)
+		m.sum = curSum
 	default:
 		val, _, err := types.Float64.Convert(ctx, n)
 		if err != nil {
@@ -136,7 +103,7 @@ func (m *sumBuffer) PerformSum(ctx *sql.Context, v interface{}) {
 		}
 		switch sum := m.sum.(type) {
 		case float64:
-		case decimal.Decimal:
+		case *apd.Decimal:
 			m.sum, _ = sum.Float64()
 		default:
 			sum, _, err = types.Float64.Convert(ctx, sum)
@@ -157,8 +124,8 @@ func (m *sumBuffer) Eval(ctx *sql.Context) (interface{}, error) {
 }
 
 // Dispose implements the Disposable interface.
-func (m *sumBuffer) Dispose() {
-	expression.Dispose(m.expr)
+func (m *sumBuffer) Dispose(ctx *sql.Context) {
+	expression.Dispose(ctx, m.expr)
 }
 
 type lastBuffer struct {
@@ -197,8 +164,8 @@ func (l *lastBuffer) Eval(ctx *sql.Context) (interface{}, error) {
 }
 
 // Dispose implements the Disposable interface.
-func (l *lastBuffer) Dispose() {
-	expression.Dispose(l.expr)
+func (l *lastBuffer) Dispose(ctx *sql.Context) {
+	expression.Dispose(ctx, l.expr)
 }
 
 type avgBuffer struct {
@@ -254,22 +221,22 @@ func (a *avgBuffer) Eval(ctx *sql.Context) (interface{}, error) {
 		}
 
 		return s / float64(a.rows), nil
-	case decimal.Decimal:
+	case *apd.Decimal:
 		if s.IsZero() && a.rows == 0 {
 			return nil, nil
 		}
 		if a.rows == 0 {
-			return decimal.NewFromInt(0), nil
+			return apd.New(0, 0), nil
 		}
-		scale := (s.Exponent() * -1) + 4
-		return s.DivRound(decimal.NewFromInt(a.rows), scale), nil
+		scale := (s.Exponent * -1) + 4
+		return types.DecimalDiv(s, types.DecimalFromInt64(a.rows), scale, false), nil
 	}
 	return nil, nil
 }
 
 // Dispose implements the Disposable interface.
-func (a *avgBuffer) Dispose() {
-	expression.Dispose(a.expr)
+func (a *avgBuffer) Dispose(ctx *sql.Context) {
+	expression.Dispose(ctx, a.expr)
 }
 
 type bitAndBuffer struct {
@@ -319,8 +286,8 @@ func (b *bitAndBuffer) Eval(ctx *sql.Context) (interface{}, error) {
 }
 
 // Dispose implements the Disposable interface.
-func (b *bitAndBuffer) Dispose() {
-	expression.Dispose(b.expr)
+func (b *bitAndBuffer) Dispose(ctx *sql.Context) {
+	expression.Dispose(ctx, b.expr)
 }
 
 type bitOrBuffer struct {
@@ -370,8 +337,8 @@ func (b *bitOrBuffer) Eval(ctx *sql.Context) (interface{}, error) {
 }
 
 // Dispose implements the Disposable interface.
-func (b *bitOrBuffer) Dispose() {
-	expression.Dispose(b.expr)
+func (b *bitOrBuffer) Dispose(ctx *sql.Context) {
+	expression.Dispose(ctx, b.expr)
 }
 
 type bitXorBuffer struct {
@@ -430,79 +397,109 @@ func (b *bitXorBuffer) Eval(ctx *sql.Context) (interface{}, error) {
 }
 
 // Dispose implements the Disposable interface.
-func (b *bitXorBuffer) Dispose() {
-	expression.Dispose(b.expr)
+func (b *bitXorBuffer) Dispose(ctx *sql.Context) {
+	expression.Dispose(ctx, b.expr)
 }
 
 type countDistinctBuffer struct {
-	seen  map[uint64]struct{}
-	exprs []sql.Expression
+	seen    sql.KeyValueCache
+	dispose sql.DisposeFunc
+	exprs   []sql.Expression
+	sch     sql.Schema
 }
 
 func NewCountDistinctBuffer(children []sql.Expression) *countDistinctBuffer {
-	return &countDistinctBuffer{make(map[uint64]struct{}), children}
+	return &countDistinctBuffer{exprs: children}
+}
+
+func (c *countDistinctBuffer) add(ctx *sql.Context, h uint64) error {
+	if c.seen == nil {
+		c.seen, c.dispose = ctx.Memory.NewHistoryCache(ctx)
+	}
+
+	if _, err := c.seen.Get(h); err == nil {
+		return nil
+	}
+
+	return c.seen.Put(h, struct{}{})
 }
 
 // Update implements the AggregationBuffer interface.
 func (c *countDistinctBuffer) Update(ctx *sql.Context, row sql.Row) error {
-	var value interface{}
 	if len(c.exprs) == 0 {
 		return fmt.Errorf("no expressions")
 	}
+
 	if _, ok := c.exprs[0].(*expression.Star); ok {
-		value = row
-	} else {
-		val := make(sql.Row, len(c.exprs))
-		for i, expr := range c.exprs {
-			v, err := expr.Eval(ctx, row)
-			if err != nil {
-				return err
-			}
-			// skip nil values
-			if v == nil {
+		for _, val := range row {
+			if val == nil {
 				return nil
 			}
-			val[i] = v
 		}
-		value = val
-	}
 
-	var str string
-	for _, val := range value.(sql.Row) {
-		// skip nil values
-		if val == nil {
-			return nil
-		}
-		v, _, err := types.Text.Convert(ctx, val)
+		h, err := hash.HashOf(ctx, nil, row)
 		if err != nil {
 			return err
 		}
-		vv, ok := v.(string)
-		if !ok {
-			return fmt.Errorf("count distinct unable to hash value: %s", err)
-		}
-		str += vv + ","
+
+		return c.add(ctx, h)
 	}
 
-	hash := xxhash.New()
-	_, err := hash.WriteString(str)
+	if c.sch == nil {
+		c.sch = hash.ExprsToSchema(ctx, c.exprs...)
+	}
+
+	val := make(sql.Row, len(c.exprs))
+	for i, expr := range c.exprs {
+		v, err := expr.Eval(ctx, row)
+		if err != nil {
+			return err
+		}
+
+		// skip nil values
+		if v == nil {
+			return nil
+		}
+
+		// Serialized values can differ for values that compare as equal, so we only serialize values that HashOf can't
+		// hash canonically by itself.
+		if extendedType, ok := expr.Type(ctx).(sql.ExtendedType); ok && !hash.HashesCanonically(v) {
+			serializedVal, err := extendedType.SerializeValue(ctx, v)
+			if err != nil {
+				return err
+			}
+			v = string(serializedVal)
+		}
+
+		val[i] = v
+	}
+
+	h, err := hash.HashOf(ctx, c.sch, val)
 	if err != nil {
 		return err
 	}
-	h := hash.Sum64()
-	c.seen[h] = struct{}{}
 
-	return nil
+	return c.add(ctx, h)
 }
 
 // Eval implements the AggregationBuffer interface.
 func (c *countDistinctBuffer) Eval(ctx *sql.Context) (interface{}, error) {
-	return int64(len(c.seen)), nil
+	if c.seen == nil {
+		return int64(0), nil
+	}
+
+	return int64(c.seen.Size()), nil
 }
 
-func (c *countDistinctBuffer) Dispose() {
+func (c *countDistinctBuffer) Dispose(ctx *sql.Context) {
+	if c.dispose != nil {
+		c.dispose()
+		c.dispose = nil
+		c.seen = nil
+	}
+
 	for _, e := range c.exprs {
-		expression.Dispose(e)
+		expression.Dispose(ctx, e)
 	}
 }
 
@@ -546,8 +543,8 @@ func (c *countBuffer) Eval(ctx *sql.Context) (interface{}, error) {
 }
 
 // Dispose implements the Disposable interface.
-func (c *countBuffer) Dispose() {
-	expression.Dispose(c.expr)
+func (c *countBuffer) Dispose(ctx *sql.Context) {
+	expression.Dispose(ctx, c.expr)
 }
 
 type firstBuffer struct {
@@ -589,8 +586,8 @@ func (f *firstBuffer) Eval(ctx *sql.Context) (interface{}, error) {
 }
 
 // Dispose implements the Disposable interface.
-func (f *firstBuffer) Dispose() {
-	expression.Dispose(f.expr)
+func (f *firstBuffer) Dispose(ctx *sql.Context) {
+	expression.Dispose(ctx, f.expr)
 }
 
 type maxBuffer struct {
@@ -618,7 +615,7 @@ func (m *maxBuffer) Update(ctx *sql.Context, row sql.Row) error {
 		return nil
 	}
 
-	cmp, err := m.expr.Type().Compare(ctx, v, m.val)
+	cmp, err := m.expr.Type(ctx).Compare(ctx, v, m.val)
 	if err != nil {
 		return err
 	}
@@ -635,8 +632,8 @@ func (m *maxBuffer) Eval(ctx *sql.Context) (interface{}, error) {
 }
 
 // Dispose implements the Disposable interface.
-func (m *maxBuffer) Dispose() {
-	expression.Dispose(m.expr)
+func (m *maxBuffer) Dispose(ctx *sql.Context) {
+	expression.Dispose(ctx, m.expr)
 }
 
 type minBuffer struct {
@@ -664,7 +661,7 @@ func (m *minBuffer) Update(ctx *sql.Context, row sql.Row) error {
 		return nil
 	}
 
-	cmp, err := m.expr.Type().Compare(ctx, v, m.val)
+	cmp, err := m.expr.Type(ctx).Compare(ctx, v, m.val)
 	if err != nil {
 		return err
 	}
@@ -681,8 +678,8 @@ func (m *minBuffer) Eval(ctx *sql.Context) (interface{}, error) {
 }
 
 // Dispose implements the Disposable interface.
-func (m *minBuffer) Dispose() {
-	expression.Dispose(m.expr)
+func (m *minBuffer) Dispose(ctx *sql.Context) {
+	expression.Dispose(ctx, m.expr)
 }
 
 type jsonArrayBuffer struct {
@@ -726,7 +723,7 @@ func (j *jsonArrayBuffer) Eval(ctx *sql.Context) (interface{}, error) {
 }
 
 // Dispose implements the Disposable interface.
-func (j *jsonArrayBuffer) Dispose() {
+func (j *jsonArrayBuffer) Dispose(ctx *sql.Context) {
 }
 
 type varBaseBuffer struct {
@@ -767,7 +764,7 @@ func (vb *varBaseBuffer) Update(ctx *sql.Context, row sql.Row) error {
 }
 
 // Dispose implements the Disposable interface.
-func (vb *varBaseBuffer) Dispose() {}
+func (vb *varBaseBuffer) Dispose(ctx *sql.Context) {}
 
 type stdDevPopBuffer struct {
 	varBaseBuffer

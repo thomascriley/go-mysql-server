@@ -71,22 +71,22 @@ func (b *BitOp) String() string {
 	return fmt.Sprintf("(%s %s %s)", b.LeftChild, b.Op, b.RightChild)
 }
 
-func (b *BitOp) DebugString() string {
-	return fmt.Sprintf("(%s %s %s)", sql.DebugString(b.LeftChild), b.Op, sql.DebugString(b.RightChild))
+func (b *BitOp) DebugString(ctx *sql.Context) string {
+	return fmt.Sprintf("(%s %s %s)", sql.DebugString(ctx, b.LeftChild), b.Op, sql.DebugString(ctx, b.RightChild))
 }
 
 // IsNullable implements the sql.Expression interface.
-func (b *BitOp) IsNullable() bool {
-	return b.BinaryExpressionStub.IsNullable()
+func (b *BitOp) IsNullable(ctx *sql.Context) bool {
+	return b.BinaryExpressionStub.IsNullable(ctx)
 }
 
 // Type returns the greatest type for given operation.
-func (b *BitOp) Type() sql.Type {
-	rTyp := b.RightChild.Type()
+func (b *BitOp) Type(ctx *sql.Context) sql.Type {
+	rTyp := b.RightChild.Type(ctx)
 	if types.IsDeferredType(rTyp) {
 		return rTyp
 	}
-	lTyp := b.LeftChild.Type()
+	lTyp := b.LeftChild.Type(ctx)
 	if types.IsDeferredType(lTyp) {
 		return lTyp
 	}
@@ -101,7 +101,7 @@ func (*BitOp) CollationCoercibility(ctx *sql.Context) (collation sql.CollationID
 }
 
 // WithChildren implements the Expression interface.
-func (b *BitOp) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (b *BitOp) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 2 {
 		return nil, sql.ErrInvalidChildrenNumber.New(b, len(children), 2)
 	}
@@ -158,26 +158,25 @@ func (b *BitOp) evalLeftRight(ctx *sql.Context, row sql.Row) (interface{}, inter
 	return lval, rval, nil
 }
 
-func (b *BitOp) convertLeftRight(ctx *sql.Context, left interface{}, right interface{}) (interface{}, interface{}, error) {
+func (b *BitOp) convertLeftRight(ctx *sql.Context, lVal, rVal any) (any, any, error) {
 	// Determine the appropriate conversion type based on operand types
 	var typ sql.Type
-	lTyp := b.LeftChild.Type()
-	rTyp := b.RightChild.Type()
+	lTyp := b.LeftChild.Type(ctx)
+	rTyp := b.RightChild.Type(ctx)
 
-	if types.IsText(lTyp) || types.IsText(rTyp) {
-		typ = types.Float64
-	} else if types.IsUnsigned(lTyp) && types.IsUnsigned(rTyp) {
-		typ = types.Uint64
-	} else if types.IsSigned(lTyp) && types.IsSigned(rTyp) {
+	switch {
+	case types.IsSigned(lTyp) && types.IsSigned(rTyp):
 		typ = types.Int64
-	} else {
+	case types.IsInteger(lTyp) && types.IsInteger(rTyp):
+		typ = types.Uint64
+	default:
 		typ = types.Float64
 	}
 
-	left = convertValueToType(ctx, typ, left, types.IsTime(b.LeftChild.Type()))
-	right = convertValueToType(ctx, typ, right, types.IsTime(b.RightChild.Type()))
+	lVal = convertValueToType(ctx, lVal, lTyp, typ)
+	rVal = convertValueToType(ctx, rVal, rTyp, typ)
 
-	return left, right, nil
+	return lVal, rVal, nil
 }
 
 // convertUintFromInt returns any int64 value converted to uint64 value

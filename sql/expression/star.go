@@ -17,6 +17,8 @@ package expression
 import (
 	"fmt"
 
+	"github.com/dolthub/vitess/go/vt/sqlparser"
+
 	"github.com/dolthub/go-mysql-server/sql"
 )
 
@@ -51,12 +53,12 @@ func (*Star) Children() []sql.Expression {
 }
 
 // IsNullable implements the Expression interface.
-func (*Star) IsNullable() bool {
+func (*Star) IsNullable(ctx *sql.Context) bool {
 	return false
 }
 
 // Type implements the Expression interface.
-func (*Star) Type() sql.Type {
+func (*Star) Type(ctx *sql.Context) sql.Type {
 	panic("star is just a placeholder node, but Type was called")
 }
 
@@ -67,7 +69,7 @@ func (*Star) CollationCoercibility(ctx *sql.Context) (collation sql.CollationID,
 
 func (s *Star) String() string {
 	if s.Table != "" {
-		return fmt.Sprintf("%s.*", s.Table)
+		return fmt.Sprintf("%s.*", sqlparser.String(sqlparser.NewTableIdent(s.Table)))
 	}
 	return "*"
 }
@@ -78,7 +80,7 @@ func (*Star) Eval(ctx *sql.Context, r sql.Row) (interface{}, error) {
 }
 
 // WithChildren implements the Expression interface.
-func (s *Star) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (s *Star) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 0 {
 		return nil, sql.ErrInvalidChildrenNumber.New(s, len(children), 0)
 	}

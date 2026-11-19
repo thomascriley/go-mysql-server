@@ -14,6 +14,8 @@
 
 package sql
 
+import "github.com/dolthub/go-mysql-server/sql/sets"
+
 // Most QFlags indicate the presence of a specific AST node.
 // Flags with more complex meanings have more specific comments.
 const (
@@ -40,7 +42,6 @@ const (
 	QFlagInnerJoin
 	QFlagLimit
 	QFlagInterval
-	QFlagAnyAgg
 
 	// QFlagMax1Row indicates that a query can only return at most one row
 	QFlagMax1Row
@@ -59,7 +60,7 @@ const (
 )
 
 type QueryFlags struct {
-	Flags FastIntSet
+	Flags sets.FastIntSet
 }
 
 func (qp *QueryFlags) Set(flag int) {
@@ -83,7 +84,7 @@ func (qp *QueryFlags) IsSet(flag int) bool {
 	return qp.Flags.Contains(flag)
 }
 
-var DmlFlags = NewFastIntSet(QFlagDelete, QFlagUpdate, QFlagInsert)
+var DmlFlags = sets.NewFastIntSet(QFlagDelete, QFlagUpdate, QFlagInsert)
 
 func (qp *QueryFlags) DmlIsSet() bool {
 	if qp == nil {
@@ -92,7 +93,7 @@ func (qp *QueryFlags) DmlIsSet() bool {
 	return qp.Flags.Intersects(DmlFlags)
 }
 
-var SubqueryFlags = NewFastIntSet(QFlagScalarSubquery, QFlagRelSubquery)
+var SubqueryFlags = sets.NewFastIntSet(QFlagScalarSubquery, QFlagRelSubquery)
 
 func (qp *QueryFlags) SubqueryIsSet() bool {
 	if qp == nil {
@@ -101,7 +102,7 @@ func (qp *QueryFlags) SubqueryIsSet() bool {
 	return qp.Flags.Intersects(SubqueryFlags)
 }
 
-var JoinFlags = NewFastIntSet(QFlagInnerJoin, QFlagCrossJoin)
+var JoinFlags = sets.NewFastIntSet(QFlagInnerJoin, QFlagCrossJoin)
 
 func (qp *QueryFlags) JoinIsSet() bool {
 	if qp == nil {

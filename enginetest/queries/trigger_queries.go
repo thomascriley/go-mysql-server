@@ -669,7 +669,7 @@ END;`,
 		Assertions: []ScriptTestAssertion{
 			{
 				Query:       "INSERT INTO t (i) VALUES (1);",
-				ExpectedErr: sql.ErrInsertIntoNonNullableDefaultNullColumn,
+				ExpectedErr: sql.ErrFieldNoDefaultValue,
 			},
 			{
 				Query:       "INSERT INTO t (i, j) VALUES (1, 2);",
@@ -691,7 +691,7 @@ END;`,
 		Assertions: []ScriptTestAssertion{
 			{
 				Query:       "INSERT INTO t (i) VALUES (1);",
-				ExpectedErr: sql.ErrInsertIntoNonNullableDefaultNullColumn,
+				ExpectedErr: sql.ErrFieldNoDefaultValue,
 			},
 			{
 				Query: "INSERT INTO t (i, j) VALUES (1, 2);",
@@ -1494,6 +1494,155 @@ END;`,
 					{14}, {21}, {22}, {26}, {33}, {34}, {35}, {39}, {51}, {55}, {65}, {85},
 				},
 			},
+		},
+	},
+	{
+		Name: "duplicate key update trigger path preserves foreign keys",
+		SetUpScript: []string{
+			"CREATE TABLE parent (id INT PRIMARY KEY)",
+			"CREATE TABLE child (id INT PRIMARY KEY, pid INT, CHECK (pid > 0), FOREIGN KEY (pid) REFERENCES parent(id))",
+			"INSERT INTO parent VALUES (1), (2)",
+			"INSERT INTO child VALUES (1, 1), (2, 1)",
+			"CREATE TRIGGER child_bu BEFORE UPDATE ON child FOR EACH ROW SET NEW.pid = 2",
+		},
+		Assertions: []ScriptTestAssertion{
+			{Query: "INSERT INTO child VALUES (1, 999), (2, 999) ON DUPLICATE KEY UPDATE pid = 99", Expected: []sql.Row{{types.NewOkResult(4)}}},
+			{Query: "SELECT * FROM child ORDER BY id", Expected: []sql.Row{{1, 2}, {2, 2}}},
+			{Query: "INSERT INTO child VALUES (1, 999) ON DUPLICATE KEY UPDATE pid = VALUES(pid)", Expected: []sql.Row{{types.NewOkResult(0)}}},
+			{Query: "SELECT * FROM child ORDER BY id", Expected: []sql.Row{{1, 2}, {2, 2}}},
+			{Query: "INSERT INTO child VALUES (3, 999) ON DUPLICATE KEY UPDATE pid = VALUES(pid)", ExpectedErr: sql.ErrForeignKeyChildViolation},
+			{Query: "SELECT * FROM child ORDER BY id", Expected: []sql.Row{{1, 2}, {2, 2}}},
+			{Query: "CREATE TRIGGER child_invalid BEFORE UPDATE ON child FOR EACH ROW SET NEW.pid = 999", Expected: []sql.Row{{types.NewOkResult(0)}}},
+			{Query: "INSERT INTO child VALUES (1, 1) ON DUPLICATE KEY UPDATE pid = VALUES(pid)", ExpectedErr: sql.ErrForeignKeyChildViolation},
+			{Query: "DROP TRIGGER child_invalid", Expected: []sql.Row{{types.NewOkResult(0)}}},
+			{Query: "CREATE TRIGGER child_invalid BEFORE UPDATE ON child FOR EACH ROW SET NEW.pid = -1", Expected: []sql.Row{{types.NewOkResult(0)}}},
+			{Query: "INSERT INTO child VALUES (1, 1) ON DUPLICATE KEY UPDATE pid = VALUES(pid)", ExpectedErr: sql.ErrCheckConstraintViolated},
+			{Query: "SELECT * FROM child ORDER BY id", Expected: []sql.Row{{1, 2}, {2, 2}}},
+		},
+	},
+	{
+		Name: "duplicate key update triggers in prepared statements",
+		SetUpScript: []string{
+			"CREATE TABLE h (id INT PRIMARY KEY, v INT)",
+			"INSERT INTO h VALUES (1, 10)",
+			"CREATE TRIGGER h_bu BEFORE UPDATE ON h FOR EACH ROW SET NEW.v = NEW.v + OLD.v",
+			"PREPARE upsert FROM 'INSERT INTO h VALUES (1, ?) ON DUPLICATE KEY UPDATE v = VALUES(v)'",
+			"SET @v = 5",
+		},
+		Assertions: []ScriptTestAssertion{
+			{Query: "EXECUTE upsert USING @v", Expected: []sql.Row{{types.NewOkResult(2)}}},
+			{Query: "SET @v = 7", Expected: []sql.Row{{types.NewOkResult(0)}}},
+			{Query: "EXECUTE upsert USING @v", Expected: []sql.Row{{types.NewOkResult(2)}}},
+			{Query: "SELECT * FROM h", Expected: []sql.Row{{1, 22}}},
+			{Query: "PREPARE read_h FROM 'SELECT * FROM h'", Expected: []sql.Row{{types.OkResult{Info: plan.PrepareInfo{}}}}},
+			{Query: "EXECUTE read_h", Expected: []sql.Row{{1, 22}}},
+		},
+	},
+	{
+		Name: "duplicate key update checks run after before triggers",
+		SetUpScript: []string{
+			"CREATE TABLE h (id INT PRIMARY KEY, v INT, CHECK (v > 0))",
+			"INSERT INTO h VALUES (1, 10)",
+			"CREATE TRIGGER h_bu BEFORE UPDATE ON h FOR EACH ROW SET NEW.v = ABS(NEW.v)",
+		},
+		Assertions: []ScriptTestAssertion{
+			{Query: "INSERT INTO h VALUES (1, 2) ON DUPLICATE KEY UPDATE v = -3", Expected: []sql.Row{{types.NewOkResult(2)}}},
+			{Query: "SELECT * FROM h", Expected: []sql.Row{{1, 3}}},
+		},
+	},
+	{
+		Name: "duplicate key update does not attach triggers to trigger bodies",
+		SetUpScript: []string{
+			"CREATE TABLE h (id INT PRIMARY KEY, v INT)",
+			"CREATE TABLE tally (id INT PRIMARY KEY, v INT)",
+			"INSERT INTO h VALUES (1, 10)",
+			"INSERT INTO tally VALUES (1, 0)",
+			"CREATE TRIGGER h_bu1 BEFORE UPDATE ON h FOR EACH ROW UPDATE tally SET v = v + 1 WHERE id = 1",
+			"CREATE TRIGGER h_bu2 BEFORE UPDATE ON h FOR EACH ROW FOLLOWS h_bu1 SET NEW.v = NEW.v + 1",
+		},
+		Assertions: []ScriptTestAssertion{
+			{Query: "INSERT INTO h VALUES (1, 20) ON DUPLICATE KEY UPDATE v = VALUES(v)", Expected: []sql.Row{{types.NewOkResult(2)}}},
+			{Query: "SELECT * FROM h", Expected: []sql.Row{{1, 21}}},
+			{Query: "SELECT * FROM tally", Expected: []sql.Row{{1, 1}}},
+		},
+	},
+	{
+		Name: "duplicate key update orders multiple update triggers",
+		SetUpScript: []string{
+			"CREATE TABLE h (id INT PRIMARY KEY, v INT)",
+			"INSERT INTO h VALUES (1, 10)",
+			"SET @trace = ''",
+			"CREATE TRIGGER h_bu1 BEFORE UPDATE ON h FOR EACH ROW SET NEW.v = NEW.v + OLD.v",
+			"CREATE TRIGGER h_bu2 BEFORE UPDATE ON h FOR EACH ROW FOLLOWS h_bu1 SET NEW.v = NEW.v * 2",
+			"CREATE TRIGGER h_au1 AFTER UPDATE ON h FOR EACH ROW SET @trace = CONCAT(@trace, ':first=', NEW.v)",
+			"CREATE TRIGGER h_au2 AFTER UPDATE ON h FOR EACH ROW FOLLOWS h_au1 SET @trace = CONCAT(@trace, ':second=', NEW.v)",
+		},
+		Assertions: []ScriptTestAssertion{
+			{Query: "INSERT INTO h VALUES (1, 3) ON DUPLICATE KEY UPDATE v = VALUES(v)", Expected: []sql.Row{{types.NewOkResult(2)}}},
+			{Query: "SELECT * FROM h", Expected: []sql.Row{{1, 26}}},
+			{Query: "SELECT @trace", Expected: []sql.Row{{":first=26:second=26"}}},
+		},
+	},
+	{
+		Name: "duplicate key no-op and secondary unique conflicts fire update triggers",
+		SetUpScript: []string{
+			"CREATE TABLE h (id INT PRIMARY KEY, v INT UNIQUE)",
+			"INSERT INTO h VALUES (1, 10)",
+			"SET @before_count = 0, @after_count = 0",
+			"CREATE TRIGGER h_bu BEFORE UPDATE ON h FOR EACH ROW SET @before_count = @before_count + 1",
+			"CREATE TRIGGER h_au AFTER UPDATE ON h FOR EACH ROW SET @after_count = @after_count + 1",
+		},
+		Assertions: []ScriptTestAssertion{
+			{Query: "INSERT INTO h VALUES (2, 10) ON DUPLICATE KEY UPDATE v = VALUES(v)", Expected: []sql.Row{{types.NewOkResult(0)}}},
+			{Query: "SELECT * FROM h", Expected: []sql.Row{{1, 10}}},
+			{Query: "SELECT @before_count, @after_count", Expected: []sql.Row{{1, 1}}},
+			{Query: "INSERT INTO h SELECT 2, 10 ON DUPLICATE KEY UPDATE v = 20", Expected: []sql.Row{{types.NewOkResult(2)}}},
+			{Query: "SELECT * FROM h", Expected: []sql.Row{{1, 20}}},
+			{Query: "SELECT @before_count, @after_count", Expected: []sql.Row{{2, 2}}},
+		},
+	},
+	{
+		Name: "duplicate key update fires update triggers",
+		SetUpScript: []string{
+			"CREATE TABLE h (id INT PRIMARY KEY, body VARCHAR(32), writer VARCHAR(64))",
+			"INSERT INTO h VALUES (1, 'original', 'owner')",
+			"CREATE TRIGGER h_bu BEFORE UPDATE ON h FOR EACH ROW BEGIN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'append-only'; END",
+		},
+		Assertions: []ScriptTestAssertion{
+			{Query: "INSERT INTO h VALUES (1, 'ignored', 'attacker') ON DUPLICATE KEY UPDATE body = 'rewritten'", ExpectedErrStr: "append-only (errno 1644) (sqlstate 45000)"},
+			{Query: "SELECT * FROM h", Expected: []sql.Row{{1, "original", "owner"}}},
+		},
+	},
+	{
+		Name: "duplicate key update trigger order and row images",
+		SetUpScript: []string{
+			"CREATE TABLE h (id INT PRIMARY KEY, v INT)",
+			"CREATE TABLE audit (seq INT AUTO_INCREMENT PRIMARY KEY, event VARCHAR(2), old_v INT, new_v INT)",
+			"INSERT INTO h VALUES (1, 10)",
+			"CREATE TRIGGER h_bi BEFORE INSERT ON h FOR EACH ROW BEGIN SET NEW.v = NEW.v + 1; INSERT INTO audit(event, old_v, new_v) VALUES ('bi', NULL, NEW.v); END",
+			"CREATE TRIGGER h_ai AFTER INSERT ON h FOR EACH ROW INSERT INTO audit(event, old_v, new_v) VALUES ('ai', NULL, NEW.v)",
+			"CREATE TRIGGER h_bu BEFORE UPDATE ON h FOR EACH ROW BEGIN SET NEW.v = NEW.v + OLD.v; INSERT INTO audit(event, old_v, new_v) VALUES ('bu', OLD.v, NEW.v); END",
+			"CREATE TRIGGER h_au AFTER UPDATE ON h FOR EACH ROW INSERT INTO audit(event, old_v, new_v) VALUES ('au', OLD.v, NEW.v)",
+		},
+		Assertions: []ScriptTestAssertion{
+			{Query: "INSERT INTO h VALUES (1, 20), (2, 30) ON DUPLICATE KEY UPDATE v = VALUES(v)", SkipResultsCheck: true},
+			{Query: "SELECT * FROM h ORDER BY id", Expected: []sql.Row{{1, 31}, {2, 31}}},
+			{Query: "SELECT event, old_v, new_v FROM audit ORDER BY seq", Expected: []sql.Row{{"bi", nil, 21}, {"bu", 10, 31}, {"au", 10, 31}, {"bi", nil, 31}, {"ai", nil, 31}}},
+		},
+	},
+	{
+		Name: "duplicate key update reuses trigger execution across repeated keys",
+		SetUpScript: []string{
+			"CREATE TABLE h (id INT PRIMARY KEY, v INT)",
+			"CREATE TABLE audit (old_v INT, new_v INT, PRIMARY KEY (old_v, new_v))",
+			"INSERT INTO h VALUES (1, 10)",
+			"CREATE TRIGGER bu BEFORE UPDATE ON h FOR EACH ROW SET NEW.v = NEW.v + OLD.v",
+			"CREATE TRIGGER au AFTER UPDATE ON h FOR EACH ROW INSERT INTO audit(old_v, new_v) VALUES (OLD.v, NEW.v)",
+		},
+		Assertions: []ScriptTestAssertion{
+			{Query: "INSERT INTO h VALUES (1, 20), (2, 30), (1, 40), (2, 50) ON DUPLICATE KEY UPDATE v = VALUES(v)", Expected: []sql.Row{{types.NewOkResult(7)}}},
+			{Query: "SELECT * FROM h ORDER BY id", Expected: []sql.Row{{1, 70}, {2, 80}}},
+			{Query: "SELECT old_v, new_v FROM audit ORDER BY old_v, new_v", Expected: []sql.Row{{10, 30}, {30, 70}, {30, 80}}},
 		},
 	},
 	{
@@ -4029,6 +4178,79 @@ end;
 			},
 		},
 	},
+	{
+		Name: "a statement fires only the triggers of the tables and events it writes",
+		SetUpScript: []string{
+			"create table a (id int primary key, v int)",
+			"create table b (id int primary key, v int)",
+			"create table c (id int primary key, v int)",
+			"create table log (n int primary key auto_increment, msg varchar(40))",
+			"create trigger a_bi before insert on A for each row insert into log (msg) values ('a before insert')",
+			"create trigger a_ai after insert on `a` for each row insert into log (msg) values ('a after insert')",
+			"create trigger a_au after update on a for each row insert into log (msg) values ('a after update')",
+			"create trigger a_ad after delete on a for each row insert into log (msg) values ('a after delete')",
+			"create trigger b_ai after insert on B for each row insert into log (msg) values ('b after insert')",
+			"create trigger b_au after update on b for each row insert into log (msg) values ('b after update')",
+			"create trigger b_ad after delete on b for each row insert into log (msg) values ('b after delete')",
+			"create trigger c_ai after insert on c for each row insert into log (msg) values ('c after insert')",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "insert into a values (1, 1), (2, 2)",
+				Expected: []sql.Row{{types.NewOkResult(2)}},
+			},
+			{
+				Query:    "insert into b values (1, 1)",
+				Expected: []sql.Row{{types.NewOkResult(1)}},
+			},
+			{
+				Query:            "insert into a values (1, 10) on duplicate key update v = 10",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "update a join b on a.id = b.id set a.v = 20, b.v = 20",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 2, Info: plan.UpdateInfo{Matched: 2, Updated: 2}}}},
+			},
+			{
+				Query:    "delete from b where id = 1",
+				Expected: []sql.Row{{types.NewOkResult(1)}},
+			},
+			{
+				Query:    "delete from a where id = 2",
+				Expected: []sql.Row{{types.NewOkResult(1)}},
+			},
+			{
+				Query: "select msg from log order by n",
+				Expected: []sql.Row{
+					{"a before insert"}, {"a after insert"}, {"a before insert"}, {"a after insert"},
+					{"b after insert"},
+					{"a before insert"}, {"a after update"},
+					{"a after update"}, {"b after update"},
+					{"b after delete"},
+					{"a after delete"},
+				},
+			},
+		},
+	},
+	{
+		Name: "a trigger recreated with the same text under another sql_mode",
+		SetUpScript: []string{
+			"create table t (pk int primary key, s varchar(10))",
+			"set @@sql_mode = 'PIPES_AS_CONCAT'",
+			"create trigger t_bi before insert on t for each row set new.s = '1' || '0'",
+			"insert into t values (1, '')",
+			"drop trigger t_bi",
+			"set @@sql_mode = ''",
+			"create trigger t_bi before insert on t for each row set new.s = '1' || '0'",
+			"insert into t values (2, '')",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "select pk, s from t order by pk",
+				Expected: []sql.Row{{1, "10"}, {2, "1"}},
+			},
+		},
+	},
 }
 
 var TriggerCreateInSubroutineTests = []ScriptTest{
@@ -4500,6 +4722,34 @@ var RollbackTriggerTests = []ScriptTest{
 					{1},
 				},
 			},
+		},
+	},
+	{
+		Name: "duplicate key trigger failure rolls back earlier duplicate updates",
+		SetUpScript: []string{
+			"CREATE TABLE h (id INT PRIMARY KEY, v INT)",
+			"INSERT INTO h VALUES (1, 10), (2, 20)",
+			"CREATE TRIGGER au AFTER UPDATE ON h FOR EACH ROW BEGIN IF NEW.v = 99 THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'blocked'; END IF; END",
+		},
+		Assertions: []ScriptTestAssertion{
+			{Query: "INSERT INTO h VALUES (1, 30), (3, 40), (2, 99) ON DUPLICATE KEY UPDATE v = VALUES(v)", ExpectedErrStr: "blocked (errno 1644) (sqlstate 45000)"},
+			{Query: "SELECT * FROM h ORDER BY id", Expected: []sql.Row{{1, 10}, {2, 20}}},
+		},
+	},
+	{
+		Name: "duplicate key update rolls back mixed batches on trigger failure",
+		SetUpScript: []string{
+			"CREATE TABLE h (id INT PRIMARY KEY, v INT)",
+			"INSERT INTO h VALUES (1, 10)",
+			"CREATE TRIGGER bu BEFORE UPDATE ON h FOR EACH ROW BEGIN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'blocked'; END",
+		},
+		Assertions: []ScriptTestAssertion{
+			{Query: "INSERT INTO h VALUES (2, 20), (1, 30) ON DUPLICATE KEY UPDATE v = VALUES(v)", ExpectedErrStr: "blocked (errno 1644) (sqlstate 45000)"},
+			{Query: "SELECT * FROM h", Expected: []sql.Row{{1, 10}}},
+			{Query: "DROP TRIGGER bu", Expected: []sql.Row{{types.NewOkResult(0)}}},
+			{Query: "CREATE TRIGGER au AFTER UPDATE ON h FOR EACH ROW BEGIN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'blocked'; END", Expected: []sql.Row{{types.NewOkResult(0)}}},
+			{Query: "INSERT INTO h VALUES (2, 20), (1, 30) ON DUPLICATE KEY UPDATE v = VALUES(v)", ExpectedErrStr: "blocked (errno 1644) (sqlstate 45000)"},
+			{Query: "SELECT * FROM h", Expected: []sql.Row{{1, 10}}},
 		},
 	},
 	{

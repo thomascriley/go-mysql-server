@@ -16361,7 +16361,7 @@ var IndexPlanTests = []QueryPlanTest{
 			"     └─ IndexedTableAccess(comp_vector_index_t0)\n" +
 			"         ├─ index: [comp_vector_index_t0.vector_column]\n" +
 			"         ├─ order: VEC_DISTANCE_L2_SQUARED('[50,50]', comp_vector_index_t0.vector_column) LIMIT 5 (bigint)\n" +
-			"         ├─ colSet: (1-4)\n" +
+			"         ├─ colSet: (1,4)\n" +
 			"         ├─ tableId: 1\n" +
 			"         └─ Table\n" +
 			"             ├─ name: comp_vector_index_t0\n" +
@@ -16369,7 +16369,7 @@ var IndexPlanTests = []QueryPlanTest{
 			"",
 		ExpectedEstimates: "Limit(5)\n" +
 			" └─ Project\n" +
-			"     ├─ columns: [(comp_vector_index_t0.pk + 1) as pk+1]\n" +
+			"     ├─ columns: [(comp_vector_index_t0.pk + 1) as `pk+1`]\n" +
 			"     └─ IndexedTableAccess(comp_vector_index_t0)\n" +
 			"         ├─ index: [comp_vector_index_t0.vector_column]\n" +
 			"         ├─ order: VEC_DISTANCE_L2_SQUARED('[50,50]', comp_vector_index_t0.vector_column) LIMIT 5 (bigint)\n" +
@@ -16377,7 +16377,7 @@ var IndexPlanTests = []QueryPlanTest{
 			"",
 		ExpectedAnalysis: "Limit(5)\n" +
 			" └─ Project\n" +
-			"     ├─ columns: [(comp_vector_index_t0.pk + 1) as pk+1]\n" +
+			"     ├─ columns: [(comp_vector_index_t0.pk + 1) as `pk+1`]\n" +
 			"     └─ IndexedTableAccess(comp_vector_index_t0)\n" +
 			"         ├─ index: [comp_vector_index_t0.vector_column]\n" +
 			"         ├─ order: VEC_DISTANCE_L2_SQUARED('[50,50]', comp_vector_index_t0.vector_column) LIMIT 5 (bigint)\n" +
@@ -16392,7 +16392,7 @@ var IndexPlanTests = []QueryPlanTest{
 			"     └─ IndexedTableAccess(comp_vector_index_t0)\n" +
 			"         ├─ index: [comp_vector_index_t0.vector_column]\n" +
 			"         ├─ order: VEC_DISTANCE_L2_SQUARED(comp_vector_index_t0.vector_column, '[50,50]') LIMIT 5 (bigint)\n" +
-			"         ├─ colSet: (1-4)\n" +
+			"         ├─ colSet: (2,4)\n" +
 			"         ├─ tableId: 1\n" +
 			"         └─ Table\n" +
 			"             ├─ name: comp_vector_index_t0\n" +
@@ -16400,7 +16400,7 @@ var IndexPlanTests = []QueryPlanTest{
 			"",
 		ExpectedEstimates: "Limit(5)\n" +
 			" └─ Project\n" +
-			"     ├─ columns: [(comp_vector_index_t0.v1 + 1) as v1+1]\n" +
+			"     ├─ columns: [(comp_vector_index_t0.v1 + 1) as `v1+1`]\n" +
 			"     └─ IndexedTableAccess(comp_vector_index_t0)\n" +
 			"         ├─ index: [comp_vector_index_t0.vector_column]\n" +
 			"         ├─ order: VEC_DISTANCE_L2_SQUARED(comp_vector_index_t0.vector_column, '[50,50]') LIMIT 5 (bigint)\n" +
@@ -16408,7 +16408,7 @@ var IndexPlanTests = []QueryPlanTest{
 			"",
 		ExpectedAnalysis: "Limit(5)\n" +
 			" └─ Project\n" +
-			"     ├─ columns: [(comp_vector_index_t0.v1 + 1) as v1+1]\n" +
+			"     ├─ columns: [(comp_vector_index_t0.v1 + 1) as `v1+1`]\n" +
 			"     └─ IndexedTableAccess(comp_vector_index_t0)\n" +
 			"         ├─ index: [comp_vector_index_t0.vector_column]\n" +
 			"         ├─ order: VEC_DISTANCE_L2_SQUARED(comp_vector_index_t0.vector_column, '[50,50]') LIMIT 5 (bigint)\n" +
@@ -16438,7 +16438,7 @@ var IndexPlanTests = []QueryPlanTest{
 			"             └─ IndexedTableAccess(three_pk)\n" +
 			"                 ├─ index: [three_pk.pk1,three_pk.pk2,three_pk.pk3]\n" +
 			"                 ├─ static: [{[0, 0], [0, 0], [0, 0]}]\n" +
-			"                 ├─ colSet: (1-8)\n" +
+			"                 ├─ colSet: (1-3)\n" +
 			"                 ├─ tableId: 1\n" +
 			"                 └─ Table\n" +
 			"                     ├─ name: three_pk\n" +
@@ -16499,7 +16499,7 @@ var IndexPlanTests = []QueryPlanTest{
 			" ├─ isLateral: false\n" +
 			" ├─ cacheable: true\n" +
 			" ├─ colSet: (4-6)\n" +
-			" ├─ tableId: 3\n" +
+			" ├─ tableId: 2\n" +
 			" └─ IndexedTableAccess(three_pks)\n" +
 			"     ├─ index: [three_pks.pk1,three_pks.pk2,three_pks.pk3]\n" +
 			"     ├─ static: [{[1, 1], [1, 1], [NULL, ∞)}]\n" +
@@ -16515,7 +16515,7 @@ var IndexPlanTests = []QueryPlanTest{
 			" ├─ isLateral: false\n" +
 			" ├─ cacheable: true\n" +
 			" ├─ colSet: (4-6)\n" +
-			" ├─ tableId: 3\n" +
+			" ├─ tableId: 2\n" +
 			" └─ IndexedTableAccess(three_pks)\n" +
 			"     ├─ index: [three_pks.pk1,three_pks.pk2,three_pks.pk3]\n" +
 			"     ├─ filters: [{[1, 1], [1, 1], [NULL, ∞)}]\n" +
@@ -16527,7 +16527,7 @@ var IndexPlanTests = []QueryPlanTest{
 			" ├─ isLateral: false\n" +
 			" ├─ cacheable: true\n" +
 			" ├─ colSet: (4-6)\n" +
-			" ├─ tableId: 3\n" +
+			" ├─ tableId: 2\n" +
 			" └─ IndexedTableAccess(three_pks)\n" +
 			"     ├─ index: [three_pks.pk1,three_pks.pk2,three_pks.pk3]\n" +
 			"     ├─ filters: [{[1, 1], [1, 1], [NULL, ∞)}]\n" +
@@ -16542,14 +16542,14 @@ var IndexPlanTests = []QueryPlanTest{
 			" ├─ isLateral: false\n" +
 			" ├─ cacheable: true\n" +
 			" ├─ colSet: (7-9)\n" +
-			" ├─ tableId: 5\n" +
+			" ├─ tableId: 3\n" +
 			" └─ SubqueryAlias\n" +
 			"     ├─ name: three_pks_view\n" +
 			"     ├─ outerVisibility: false\n" +
 			"     ├─ isLateral: false\n" +
 			"     ├─ cacheable: true\n" +
 			"     ├─ colSet: (4-6)\n" +
-			"     ├─ tableId: 3\n" +
+			"     ├─ tableId: 2\n" +
 			"     └─ IndexedTableAccess(three_pks)\n" +
 			"         ├─ index: [three_pks.pk1,three_pks.pk2,three_pks.pk3]\n" +
 			"         ├─ static: [{[1, 1], [1, 1], [1, 1]}]\n" +
@@ -16565,14 +16565,14 @@ var IndexPlanTests = []QueryPlanTest{
 			" ├─ isLateral: false\n" +
 			" ├─ cacheable: true\n" +
 			" ├─ colSet: (7-9)\n" +
-			" ├─ tableId: 5\n" +
+			" ├─ tableId: 3\n" +
 			" └─ SubqueryAlias\n" +
 			"     ├─ name: three_pks_view\n" +
 			"     ├─ outerVisibility: false\n" +
 			"     ├─ isLateral: false\n" +
 			"     ├─ cacheable: true\n" +
 			"     ├─ colSet: (4-6)\n" +
-			"     ├─ tableId: 3\n" +
+			"     ├─ tableId: 2\n" +
 			"     └─ IndexedTableAccess(three_pks)\n" +
 			"         ├─ index: [three_pks.pk1,three_pks.pk2,three_pks.pk3]\n" +
 			"         ├─ filters: [{[1, 1], [1, 1], [1, 1]}]\n" +
@@ -16584,14 +16584,14 @@ var IndexPlanTests = []QueryPlanTest{
 			" ├─ isLateral: false\n" +
 			" ├─ cacheable: true\n" +
 			" ├─ colSet: (7-9)\n" +
-			" ├─ tableId: 5\n" +
+			" ├─ tableId: 3\n" +
 			" └─ SubqueryAlias\n" +
 			"     ├─ name: three_pks_view\n" +
 			"     ├─ outerVisibility: false\n" +
 			"     ├─ isLateral: false\n" +
 			"     ├─ cacheable: true\n" +
 			"     ├─ colSet: (4-6)\n" +
-			"     ├─ tableId: 3\n" +
+			"     ├─ tableId: 2\n" +
 			"     └─ IndexedTableAccess(three_pks)\n" +
 			"         ├─ index: [three_pks.pk1,three_pks.pk2,three_pks.pk3]\n" +
 			"         ├─ filters: [{[1, 1], [1, 1], [1, 1]}]\n" +
@@ -16608,7 +16608,7 @@ var IndexPlanTests = []QueryPlanTest{
 			"     ├─ isLateral: false\n" +
 			"     ├─ cacheable: true\n" +
 			"     ├─ colSet: (9)\n" +
-			"     ├─ tableId: 5\n" +
+			"     ├─ tableId: 3\n" +
 			"     └─ Project\n" +
 			"         ├─ columns: [three_pks_projection_view.pk2:1!null->pk:0]\n" +
 			"         └─ SubqueryAlias\n" +
@@ -16617,7 +16617,7 @@ var IndexPlanTests = []QueryPlanTest{
 			"             ├─ isLateral: false\n" +
 			"             ├─ cacheable: true\n" +
 			"             ├─ colSet: (6,7)\n" +
-			"             ├─ tableId: 3\n" +
+			"             ├─ tableId: 2\n" +
 			"             └─ Project\n" +
 			"                 ├─ columns: [three_pks.pk2:1!null->pk1:0, three_pks.pk3:2!null->pk2:0]\n" +
 			"                 └─ IndexedTableAccess(three_pks)\n" +
@@ -16637,7 +16637,7 @@ var IndexPlanTests = []QueryPlanTest{
 			"     ├─ isLateral: false\n" +
 			"     ├─ cacheable: true\n" +
 			"     ├─ colSet: (9)\n" +
-			"     ├─ tableId: 5\n" +
+			"     ├─ tableId: 3\n" +
 			"     └─ Project\n" +
 			"         ├─ columns: [three_pks_projection_view.pk2 as pk]\n" +
 			"         └─ SubqueryAlias\n" +
@@ -16646,7 +16646,7 @@ var IndexPlanTests = []QueryPlanTest{
 			"             ├─ isLateral: false\n" +
 			"             ├─ cacheable: true\n" +
 			"             ├─ colSet: (6,7)\n" +
-			"             ├─ tableId: 3\n" +
+			"             ├─ tableId: 2\n" +
 			"             └─ Project\n" +
 			"                 ├─ columns: [three_pks.pk2 as pk1, three_pks.pk3 as pk2]\n" +
 			"                 └─ IndexedTableAccess(three_pks)\n" +
@@ -16662,7 +16662,7 @@ var IndexPlanTests = []QueryPlanTest{
 			"     ├─ isLateral: false\n" +
 			"     ├─ cacheable: true\n" +
 			"     ├─ colSet: (9)\n" +
-			"     ├─ tableId: 5\n" +
+			"     ├─ tableId: 3\n" +
 			"     └─ Project\n" +
 			"         ├─ columns: [three_pks_projection_view.pk2 as pk]\n" +
 			"         └─ SubqueryAlias\n" +
@@ -16671,7 +16671,7 @@ var IndexPlanTests = []QueryPlanTest{
 			"             ├─ isLateral: false\n" +
 			"             ├─ cacheable: true\n" +
 			"             ├─ colSet: (6,7)\n" +
-			"             ├─ tableId: 3\n" +
+			"             ├─ tableId: 2\n" +
 			"             └─ Project\n" +
 			"                 ├─ columns: [three_pks.pk2 as pk1, three_pks.pk3 as pk2]\n" +
 			"                 └─ IndexedTableAccess(three_pks)\n" +
@@ -16696,7 +16696,7 @@ var IndexPlanTests = []QueryPlanTest{
 			"         │   └─ IndexedTableAccess(three_pk)\n" +
 			"         │       ├─ index: [three_pk.pk1,three_pk.pk2,three_pk.pk3]\n" +
 			"         │       ├─ static: [{[2, 2], [NULL, ∞), [NULL, ∞)}]\n" +
-			"         │       ├─ colSet: (9-16)\n" +
+			"         │       ├─ colSet: (9)\n" +
 			"         │       ├─ tableId: 2\n" +
 			"         │       └─ Table\n" +
 			"         │           ├─ name: three_pk\n" +
@@ -16705,7 +16705,7 @@ var IndexPlanTests = []QueryPlanTest{
 			"             └─ IndexedTableAccess(three_pk)\n" +
 			"                 ├─ index: [three_pk.pk1,three_pk.pk2,three_pk.pk3]\n" +
 			"                 ├─ static: [{[1, 1], [NULL, ∞), [NULL, ∞)}]\n" +
-			"                 ├─ colSet: (1-8)\n" +
+			"                 ├─ colSet: (1)\n" +
 			"                 ├─ tableId: 1\n" +
 			"                 └─ Table\n" +
 			"                     ├─ name: three_pk\n" +
@@ -16762,7 +16762,7 @@ var IndexPlanTests = []QueryPlanTest{
 			" ├─ isLateral: false\n" +
 			" ├─ cacheable: true\n" +
 			" ├─ colSet: (25-28)\n" +
-			" ├─ tableId: 9\n" +
+			" ├─ tableId: 7\n" +
 			" └─ Project\n" +
 			"     ├─ columns: [l.left_pk:0!null->left_left:0, l.right_pk:1!null->left_right:0, r.left_pk:2!null->right_left:0, r.right_pk:3!null->right_right:0]\n" +
 			"     └─ CrossHashJoin\n" +
@@ -16772,7 +16772,7 @@ var IndexPlanTests = []QueryPlanTest{
 			"         │   ├─ isLateral: false\n" +
 			"         │   ├─ cacheable: true\n" +
 			"         │   ├─ colSet: (9,10)\n" +
-			"         │   ├─ tableId: 4\n" +
+			"         │   ├─ tableId: 3\n" +
 			"         │   └─ Project\n" +
 			"         │       ├─ columns: [l.pk1:2!null->left_pk:0, r.pk1:0!null->right_pk:0]\n" +
 			"         │       └─ InnerJoin\n" +
@@ -16783,7 +16783,7 @@ var IndexPlanTests = []QueryPlanTest{
 			"         │           │   └─ IndexedTableAccess(three_pks)\n" +
 			"         │           │       ├─ index: [three_pks.pk1,three_pks.pk2,three_pks.pk3]\n" +
 			"         │           │       ├─ static: [{[2, 2], [NULL, ∞), [NULL, ∞)}]\n" +
-			"         │           │       ├─ colSet: (4-6)\n" +
+			"         │           │       ├─ colSet: (4,5)\n" +
 			"         │           │       ├─ tableId: 2\n" +
 			"         │           │       └─ Table\n" +
 			"         │           │           ├─ name: three_pks\n" +
@@ -16792,7 +16792,7 @@ var IndexPlanTests = []QueryPlanTest{
 			"         │               └─ IndexedTableAccess(three_pks)\n" +
 			"         │                   ├─ index: [three_pks.pk1,three_pks.pk2,three_pks.pk3]\n" +
 			"         │                   ├─ static: [{[1, 1], [NULL, ∞), [NULL, ∞)}]\n" +
-			"         │                   ├─ colSet: (1-3)\n" +
+			"         │                   ├─ colSet: (1,2)\n" +
 			"         │                   ├─ tableId: 1\n" +
 			"         │                   └─ Table\n" +
 			"         │                       ├─ name: three_pks\n" +
@@ -16807,7 +16807,7 @@ var IndexPlanTests = []QueryPlanTest{
 			"                     ├─ isLateral: false\n" +
 			"                     ├─ cacheable: true\n" +
 			"                     ├─ colSet: (19,20)\n" +
-			"                     ├─ tableId: 8\n" +
+			"                     ├─ tableId: 6\n" +
 			"                     └─ Project\n" +
 			"                         ├─ columns: [l.pk1:2!null->left_pk:0, r.pk1:0!null->right_pk:0]\n" +
 			"                         └─ InnerJoin\n" +
@@ -16818,8 +16818,8 @@ var IndexPlanTests = []QueryPlanTest{
 			"                             │   └─ IndexedTableAccess(three_pks)\n" +
 			"                             │       ├─ index: [three_pks.pk1,three_pks.pk2,three_pks.pk3]\n" +
 			"                             │       ├─ static: [{[4, 4], [NULL, ∞), [NULL, ∞)}]\n" +
-			"                             │       ├─ colSet: (14-16)\n" +
-			"                             │       ├─ tableId: 6\n" +
+			"                             │       ├─ colSet: (14,15)\n" +
+			"                             │       ├─ tableId: 5\n" +
 			"                             │       └─ Table\n" +
 			"                             │           ├─ name: three_pks\n" +
 			"                             │           └─ columns: [pk1 pk2]\n" +
@@ -16827,8 +16827,8 @@ var IndexPlanTests = []QueryPlanTest{
 			"                                 └─ IndexedTableAccess(three_pks)\n" +
 			"                                     ├─ index: [three_pks.pk1,three_pks.pk2,three_pks.pk3]\n" +
 			"                                     ├─ static: [{[3, 3], [NULL, ∞), [NULL, ∞)}]\n" +
-			"                                     ├─ colSet: (11-13)\n" +
-			"                                     ├─ tableId: 5\n" +
+			"                                     ├─ colSet: (11,12)\n" +
+			"                                     ├─ tableId: 4\n" +
 			"                                     └─ Table\n" +
 			"                                         ├─ name: three_pks\n" +
 			"                                         └─ columns: [pk1 pk2]\n" +
@@ -16839,7 +16839,7 @@ var IndexPlanTests = []QueryPlanTest{
 			" ├─ isLateral: false\n" +
 			" ├─ cacheable: true\n" +
 			" ├─ colSet: (25-28)\n" +
-			" ├─ tableId: 9\n" +
+			" ├─ tableId: 7\n" +
 			" └─ Project\n" +
 			"     ├─ columns: [l.left_pk as left_left, l.right_pk as left_right, r.left_pk as right_left, r.right_pk as right_right]\n" +
 			"     └─ CrossHashJoin (estimated cost=402.250 rows=125)\n" +
@@ -16849,7 +16849,7 @@ var IndexPlanTests = []QueryPlanTest{
 			"         │   ├─ isLateral: false\n" +
 			"         │   ├─ cacheable: true\n" +
 			"         │   ├─ colSet: (9,10)\n" +
-			"         │   ├─ tableId: 4\n" +
+			"         │   ├─ tableId: 3\n" +
 			"         │   └─ Project\n" +
 			"         │       ├─ columns: [l.pk1 as left_pk, r.pk1 as right_pk]\n" +
 			"         │       └─ InnerJoin (estimated cost=2.010 rows=1)\n" +
@@ -16894,7 +16894,7 @@ var IndexPlanTests = []QueryPlanTest{
 			" ├─ isLateral: false\n" +
 			" ├─ cacheable: true\n" +
 			" ├─ colSet: (25-28)\n" +
-			" ├─ tableId: 9\n" +
+			" ├─ tableId: 7\n" +
 			" └─ Project\n" +
 			"     ├─ columns: [l.left_pk as left_left, l.right_pk as left_right, r.left_pk as right_left, r.right_pk as right_right]\n" +
 			"     └─ CrossHashJoin (estimated cost=402.250 rows=125) (actual rows=0 loops=1)\n" +
@@ -16904,7 +16904,7 @@ var IndexPlanTests = []QueryPlanTest{
 			"         │   ├─ isLateral: false\n" +
 			"         │   ├─ cacheable: true\n" +
 			"         │   ├─ colSet: (9,10)\n" +
-			"         │   ├─ tableId: 4\n" +
+			"         │   ├─ tableId: 3\n" +
 			"         │   └─ Project\n" +
 			"         │       ├─ columns: [l.pk1 as left_pk, r.pk1 as right_pk]\n" +
 			"         │       └─ InnerJoin (estimated cost=2.010 rows=1) (actual rows=0 loops=1)\n" +

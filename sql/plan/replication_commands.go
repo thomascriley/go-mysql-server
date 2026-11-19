@@ -109,12 +109,12 @@ func (c *ChangeReplicationSource) String() string {
 		if i > 0 {
 			sb.WriteString(", ")
 		}
-		sb.WriteString(fmt.Sprintf("%s = %s", option.Name, option.Value))
+		sb.WriteString(fmt.Sprintf("%s = %s", option.Name, formatReplicationOptionValue(option.Value)))
 	}
 	return sb.String()
 }
 
-func (c *ChangeReplicationSource) Schema() sql.Schema {
+func (c *ChangeReplicationSource) Schema(ctx *sql.Context) sql.Schema {
 	return nil
 }
 
@@ -122,7 +122,7 @@ func (c *ChangeReplicationSource) Children() []sql.Node {
 	return nil
 }
 
-func (c *ChangeReplicationSource) WithChildren(children ...sql.Node) (sql.Node, error) {
+func (c *ChangeReplicationSource) WithChildren(ctx *sql.Context, children ...sql.Node) (sql.Node, error) {
 	if len(children) != 0 {
 		return nil, sql.ErrInvalidChildrenNumber.New(c, len(children), 0)
 	}
@@ -177,13 +177,35 @@ func (c *ChangeReplicationFilter) String() string {
 		}
 		sb.WriteString(option.Name)
 		sb.WriteString(" = ")
-		// TODO: Fix this to use better typing
-		sb.WriteString(fmt.Sprintf("%s", option.Value))
+		sb.WriteString(formatReplicationOptionValue(option.Value))
 	}
 	return sb.String()
 }
 
-func (c *ChangeReplicationFilter) Schema() sql.Schema {
+// formatReplicationOptionValue formats the native value representations used by replication plan nodes.
+func formatReplicationOptionValue(value interface{}) string {
+	switch value := value.(type) {
+	case string:
+		return value
+	case int:
+		return fmt.Sprintf("%d", value)
+	case []sql.UnresolvedTable:
+		values := make([]string, len(value))
+		for i, table := range value {
+			values[i] = table.Name()
+			if database := table.Database().Name(); database != "" {
+				values[i] = database + "." + values[i]
+			}
+		}
+		return strings.Join(values, ", ")
+	case []string:
+		return strings.Join(value, ", ")
+	default:
+		return fmt.Sprint(value)
+	}
+}
+
+func (c *ChangeReplicationFilter) Schema(ctx *sql.Context) sql.Schema {
 	return nil
 }
 
@@ -191,7 +213,7 @@ func (c *ChangeReplicationFilter) Children() []sql.Node {
 	return nil
 }
 
-func (c *ChangeReplicationFilter) WithChildren(children ...sql.Node) (sql.Node, error) {
+func (c *ChangeReplicationFilter) WithChildren(ctx *sql.Context, children ...sql.Node) (sql.Node, error) {
 	if len(children) != 0 {
 		return nil, sql.ErrInvalidChildrenNumber.New(c, len(children), 0)
 	}
@@ -238,7 +260,7 @@ func (s *StartReplica) String() string {
 	return "START REPLICA"
 }
 
-func (s *StartReplica) Schema() sql.Schema {
+func (s *StartReplica) Schema(ctx *sql.Context) sql.Schema {
 	return nil
 }
 
@@ -246,7 +268,7 @@ func (s *StartReplica) Children() []sql.Node {
 	return nil
 }
 
-func (s *StartReplica) WithChildren(children ...sql.Node) (sql.Node, error) {
+func (s *StartReplica) WithChildren(ctx *sql.Context, children ...sql.Node) (sql.Node, error) {
 	if len(children) != 0 {
 		return nil, sql.ErrInvalidChildrenNumber.New(s, len(children), 0)
 	}
@@ -293,7 +315,7 @@ func (s *StopReplica) String() string {
 	return "STOP REPLICA"
 }
 
-func (s *StopReplica) Schema() sql.Schema {
+func (s *StopReplica) Schema(ctx *sql.Context) sql.Schema {
 	return nil
 }
 
@@ -301,7 +323,7 @@ func (s *StopReplica) Children() []sql.Node {
 	return nil
 }
 
-func (s *StopReplica) WithChildren(children ...sql.Node) (sql.Node, error) {
+func (s *StopReplica) WithChildren(ctx *sql.Context, children ...sql.Node) (sql.Node, error) {
 	if len(children) != 0 {
 		return nil, sql.ErrInvalidChildrenNumber.New(s, len(children), 0)
 	}
@@ -356,7 +378,7 @@ func (r *ResetReplica) String() string {
 	return sb.String()
 }
 
-func (r *ResetReplica) Schema() sql.Schema {
+func (r *ResetReplica) Schema(ctx *sql.Context) sql.Schema {
 	return nil
 }
 
@@ -364,7 +386,7 @@ func (r *ResetReplica) Children() []sql.Node {
 	return nil
 }
 
-func (r *ResetReplica) WithChildren(children ...sql.Node) (sql.Node, error) {
+func (r *ResetReplica) WithChildren(ctx *sql.Context, children ...sql.Node) (sql.Node, error) {
 	if len(children) != 0 {
 		return nil, sql.ErrInvalidChildrenNumber.New(r, len(children), 0)
 	}

@@ -17,12 +17,14 @@ package expression
 import (
 	"fmt"
 	"math"
-	"strconv"
+	"reflect"
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/apd/v3"
+	"github.com/dolthub/vitess/go/mysql"
+	"github.com/dolthub/vitess/go/sqltypes"
 	"github.com/dolthub/vitess/go/vt/sqlparser"
-	"github.com/shopspring/decimal"
 	"gopkg.in/src-d/go-errors.v1"
 
 	"github.com/dolthub/go-mysql-server/sql"
@@ -70,12 +72,12 @@ func (d *Div) String() string {
 	return fmt.Sprintf("(%s / %s)", d.LeftChild, d.RightChild)
 }
 
-func (d *Div) DebugString() string {
-	return fmt.Sprintf("(%s / %s)", sql.DebugString(d.LeftChild), sql.DebugString(d.RightChild))
+func (d *Div) DebugString(ctx *sql.Context) string {
+	return fmt.Sprintf("(%s / %s)", sql.DebugString(ctx, d.LeftChild), sql.DebugString(ctx, d.RightChild))
 }
 
 // IsNullable implements the sql.Expression interface.
-func (d *Div) IsNullable() bool {
+func (d *Div) IsNullable(ctx *sql.Context) bool {
 	return true
 }
 
@@ -83,15 +85,15 @@ func (d *Div) IsNullable() bool {
 // the result back as a float when possible, since division with floats is more efficient than division with Decimals.
 // However, if this is the outermost division expression in an expression tree, we must return the result as a
 // Decimal type in order to match MySQL's results exactly.
-func (d *Div) Type() sql.Type {
-	return d.determineResultType(isOutermostDiv(d, 0, d.divOps))
+func (d *Div) Type(ctx *sql.Context) sql.Type {
+	return d.determineResultType(ctx, isOutermostDiv(d, 0, d.divOps))
 }
 
 // internalType returns the internal result type for this division expression. For performance reasons, we prefer
 // to use floats internally in division operations wherever possible, since division operations on floats can be
 // orders of magnitude faster than division operations on Decimal types.
-func (d *Div) internalType() sql.Type {
-	return d.determineResultType(false)
+func (d *Div) internalType(ctx *sql.Context) sql.Type {
+	return d.determineResultType(ctx, false)
 }
 
 // CollationCoercibility implements the interface sql.CollationCoercible.
@@ -100,7 +102,7 @@ func (*Div) CollationCoercibility(ctx *sql.Context) (collation sql.CollationID, 
 }
 
 // WithChildren implements the Expression interface.
-func (d *Div) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (d *Div) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 2 {
 		return nil, sql.ErrInvalidChildrenNumber.New(d, len(children), 2)
 	}
@@ -126,10 +128,10 @@ func (d *Div) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 	}
 
 	// Decimals must be rounded
-	if res, ok := result.(decimal.Decimal); ok {
+	if res, ok := result.(*apd.Decimal); ok {
 		if isOutermostArithmeticOp(d, d.ops) {
 			finalScale, _ := getFinalScale(ctx, row, d, 0)
-			return res.Round(finalScale), nil
+			return sql.DecimalRound(res, finalScale)
 		}
 	}
 
@@ -149,11 +151,11 @@ func (d *Div) evalLeftRight(ctx *sql.Context, row sql.Row) (interface{}, interfa
 	// this operation is only done on the left value as the scale/fraction part of the leftmost value
 	// is used to calculate the scale of the final result. If the value is GetField of decimal type column
 	// the decimal value evaluated does not always match the scale of column type definition
-	if dt, ok := d.LeftChild.Type().(sql.DecimalType); ok {
-		if dVal, ok := lval.(decimal.Decimal); ok {
+	if dt, ok := d.LeftChild.Type(ctx).(sql.DecimalType); ok {
+		if dVal, ok := lval.(*apd.Decimal); ok {
 			ts := int32(dt.Scale())
-			if ts > dVal.Exponent()*-1 {
-				lval, err = decimal.NewFromString(dVal.StringFixed(ts))
+			if ts > dVal.Exponent*-1 {
+				lval, err = sql.DecimalRound(dVal, ts)
 				if err != nil {
 					return nil, nil, err
 				}
@@ -176,30 +178,29 @@ func (d *Div) evalLeftRight(ctx *sql.Context, row sql.Row) (interface{}, interfa
 // from the expression tree is converted to a Decimal in order to match MySQL's behavior.
 // The decimal types of left and right value does NOT need to be the same. Both the types
 // should be preserved.
-func (d *Div) convertLeftRight(ctx *sql.Context, left interface{}, right interface{}) (interface{}, interface{}) {
-	typ := d.internalType()
-	lIsTimeType := types.IsTime(d.LeftChild.Type())
-	rIsTimeType := types.IsTime(d.RightChild.Type())
+func (d *Div) convertLeftRight(ctx *sql.Context, lVal, rVal any) (any, any) {
+	typ := d.internalType(ctx)
+	lTyp, rTyp := d.LeftChild.Type(ctx), d.RightChild.Type(ctx)
 
 	if types.IsFloat(typ) {
-		left = convertValueToType(ctx, typ, left, lIsTimeType)
+		lVal = convertValueToType(ctx, lVal, lTyp, typ)
 	} else {
-		left = convertToDecimalValue(ctx, left, lIsTimeType)
+		lVal = convertToDecimalValue(ctx, lVal, lTyp, typ)
 	}
 
 	if types.IsFloat(typ) {
-		right = convertValueToType(ctx, typ, right, rIsTimeType)
+		rVal = convertValueToType(ctx, rVal, rTyp, typ)
 	} else {
-		right = convertToDecimalValue(ctx, right, rIsTimeType)
+		rVal = convertToDecimalValue(ctx, rVal, rTyp, typ)
 	}
 
-	return left, right
+	return lVal, rVal
 }
 
-func (d *Div) div(ctx *sql.Context, lval, rval interface{}) (interface{}, error) {
-	switch l := lval.(type) {
+func (d *Div) div(ctx *sql.Context, lVal, rVal any) (any, error) {
+	switch l := lVal.(type) {
 	case float32:
-		switch r := rval.(type) {
+		switch r := rVal.(type) {
 		case float32:
 			if r == 0 {
 				arithmeticWarning(ctx, ERDivisionByZero, "Division by 0")
@@ -208,7 +209,7 @@ func (d *Div) div(ctx *sql.Context, lval, rval interface{}) (interface{}, error)
 			return l / r, nil
 		}
 	case float64:
-		switch r := rval.(type) {
+		switch r := rVal.(type) {
 		case float64:
 			if r == 0 {
 				arithmeticWarning(ctx, ERDivisionByZero, "Division by 0")
@@ -216,15 +217,15 @@ func (d *Div) div(ctx *sql.Context, lval, rval interface{}) (interface{}, error)
 			}
 			return l / r, nil
 		}
-	case decimal.Decimal:
-		switch r := rval.(type) {
-		case decimal.Decimal:
-			if r.Equal(decimal.NewFromInt(0)) {
+	case *apd.Decimal:
+		switch r := rVal.(type) {
+		case *apd.Decimal:
+			if r.IsZero() {
 				arithmeticWarning(ctx, ERDivisionByZero, "Division by 0")
 				return nil, nil
 			}
 
-			lScale, rScale := -1*l.Exponent(), -1*r.Exponent()
+			lScale, rScale := -1*l.Exponent, -1*r.Exponent
 			inc := int32(math.Ceil(float64(lScale+rScale+divPrecInc) / divIntPrecInc))
 			if lScale != 0 && rScale != 0 {
 				lInc := int32(math.Ceil(float64(lScale) / divIntPrecInc))
@@ -235,17 +236,15 @@ func (d *Div) div(ctx *sql.Context, lval, rval interface{}) (interface{}, error)
 				}
 			}
 			scale := inc * divIntPrecInc
-			l = l.Truncate(scale)
-			r = r.Truncate(scale)
+			l = types.DecimalTruncate(l, scale)
+			r = types.DecimalTruncate(r, scale)
 
-			// give it buffer of 2 additional scale to avoid the result to be rounded
-			res := l.DivRound(r, scale+2)
-			res = res.Truncate(scale)
+			res := types.DecimalDiv(l, r, scale, true)
 			return res, nil
 		}
 	}
 
-	return nil, errUnableToCast.New(lval, rval)
+	return nil, errUnableToCast.New(lVal, rVal)
 }
 
 // determineResultType looks at the expressions in the expression tree with this division operation and determines
@@ -253,13 +252,13 @@ func (d *Div) div(ctx *sql.Context, lval, rval interface{}) (interface{}, error)
 // and looking for float types or Decimal types. If |outermostResult| is false, then we prefer to treat ints as floats
 // (instead of Decimals) for performance reasons, but when |outermostResult| is true, we must treat ints as Decimals
 // in order to match MySQL's behavior.
-func (d *Div) determineResultType(outermostResult bool) sql.Type {
+func (d *Div) determineResultType(ctx *sql.Context, outermostResult bool) sql.Type {
 	//TODO: what if both BindVars? should be constant folded
-	rTyp := d.RightChild.Type()
+	rTyp := d.RightChild.Type(ctx)
 	if types.IsDeferredType(rTyp) {
 		return rTyp
 	}
-	lTyp := d.LeftChild.Type()
+	lTyp := d.LeftChild.Type(ctx)
 	if types.IsDeferredType(lTyp) {
 		return lTyp
 	}
@@ -318,13 +317,13 @@ func (d *Div) determineResultType(outermostResult bool) sql.Type {
 // getFloatOrMaxDecimalType returns either Float64 or Decimal type with max precision and scale
 // depending on column reference, expression types and evaluated value types. Otherwise, the return
 // type is always max decimal type. |treatIntsAsFloats| is used for division operation optimization.
-func getFloatOrMaxDecimalType(e sql.Expression, treatIntsAsFloats bool) sql.Type {
+func getFloatOrMaxDecimalType(ctx *sql.Context, e sql.Expression, treatIntsAsFloats bool) sql.Type {
 	var resType sql.Type
 	var maxWhole, maxFrac uint8
-	sql.Inspect(e, func(expr sql.Expression) bool {
+	sql.Inspect(ctx, e, func(ctx *sql.Context, expr sql.Expression) bool {
 		switch c := expr.(type) {
 		case *GetField:
-			ct := c.Type()
+			ct := c.Type(ctx)
 			if treatIntsAsFloats && types.IsInteger(ct) {
 				resType = types.Float64
 				return false
@@ -345,8 +344,8 @@ func getFloatOrMaxDecimalType(e sql.Expression, treatIntsAsFloats bool) sql.Type
 				}
 			}
 		case *Convert:
-			if c.cachedDecimalType != nil {
-				p, s := GetPrecisionAndScale(c.cachedDecimalType)
+			if c.convType != nil {
+				p, s := GetPrecisionAndScale(c.convType)
 				if whole := p - s; whole > maxWhole {
 					maxWhole = whole
 				}
@@ -355,22 +354,27 @@ func getFloatOrMaxDecimalType(e sql.Expression, treatIntsAsFloats bool) sql.Type
 				}
 			}
 		case *Literal:
-			if types.IsNumber(c.Type()) {
+			if types.IsNumber(c.Type(ctx)) {
 				l, err := c.Eval(nil, nil)
 				if err == nil {
 					p, s := GetPrecisionAndScale(l)
-					if whole := p - s; whole > maxWhole {
-						maxWhole = whole
-					}
-					if s > maxFrac {
-						maxFrac = s
-					}
+					maxWhole = max(maxWhole, p-s)
+					maxFrac = max(maxFrac, s)
 				}
 			}
 		case sql.FunctionExpression:
-			// Mod.Type() calls this, so ignore it for infinite loop
+			// Mod.Type(ctx) calls this, so ignore it for infinite loop
 			if c.FunctionName() != "mod" {
-				resType = c.Type()
+				resType = c.Type(ctx)
+				if dtTyp, ok := resType.(sql.DatetimeType); ok {
+					switch dtTyp.Type() {
+					case sqltypes.Date:
+						maxWhole = max(maxWhole, uint8(types.MaxDateWholeScale))
+					case sqltypes.Datetime, sqltypes.Timestamp:
+						maxWhole = max(maxWhole, uint8(types.MaxDatetimeWholeScale))
+					}
+					maxFrac = max(maxFrac, uint8(dtTyp.Precision()))
+				}
 			}
 		}
 		return true
@@ -392,38 +396,48 @@ func getFloatOrMaxDecimalType(e sql.Expression, treatIntsAsFloats bool) sql.Type
 // If the value is invalid, it returns decimal 0. This function
 // is used for 'div' or 'mod' arithmetic operation, which requires
 // the result value to have precise precision and scale.
-func convertToDecimalValue(ctx *sql.Context, val interface{}, isTimeType bool) interface{} {
-	if isTimeType {
-		val = convertTimeTypeToString(val)
+func convertToDecimalValue(ctx *sql.Context, val any, origType, convType sql.Type) *apd.Decimal {
+	if dtTyp, ok := origType.(sql.DatetimeType); ok && !types.IsTime(convType) {
+		var err error
+		val, _, err = types.TypeAwareConversion(ctx, val, origType, convType)
+		if err != nil {
+			ctx.Warn(mysql.ERTruncatedWrongValue, "%s", sql.ErrTruncatedIncorrect.New(dtTyp.String(), val).Error())
+		}
 	}
+
 	switch v := val.(type) {
 	case bool:
-		val = 0
 		if v {
 			val = 1
+		} else {
+			val = 0
 		}
 	default:
 	}
 
-	if _, ok := val.(decimal.Decimal); !ok {
-		p, s := GetPrecisionAndScale(val)
-		if p > types.DecimalTypeMaxPrecision {
-			p = types.DecimalTypeMaxPrecision
-		}
-		if s > types.DecimalTypeMaxScale {
-			s = types.DecimalTypeMaxScale
-		}
-		dtyp, err := types.CreateDecimalType(p, s)
-		if err != nil {
-			val = decimal.Zero
-		}
-		val, _, err = dtyp.Convert(ctx, val)
-		if err != nil {
-			val = decimal.Zero
-		}
+	if decimalVal, ok := val.(*apd.Decimal); ok {
+		return decimalVal
 	}
 
-	return val
+	p, s := GetPrecisionAndScale(val)
+	if p > types.DecimalTypeMaxPrecision {
+		p = types.DecimalTypeMaxPrecision
+	}
+	if s > types.DecimalTypeMaxScale {
+		s = types.DecimalTypeMaxScale
+	}
+	dtyp, err := types.CreateDecimalType(p, s)
+	if err != nil {
+		val = apd.New(0, 0)
+	}
+	convertedVal, _, err := dtyp.Convert(ctx, val)
+	if err != nil {
+		arithmeticWarning(ctx, mysql.ERTruncatedWrongValue, fmt.Sprintf("Truncated incorrect DECIMAL value: '%v'", val))
+	}
+	if convertedDecimal, ok := convertedVal.(*apd.Decimal); ok {
+		return convertedDecimal
+	}
+	return apd.New(0, 0)
 }
 
 // countDivs returns the number of division operators in order on the left child node of the current node.
@@ -515,14 +529,22 @@ func getFinalScale(ctx *sql.Context, row sql.Row, expr sql.Expression, divOpCnt 
 		divOpCnt = divOpCnt + 1
 		if divOpCnt == div.divOps {
 			// TODO: redundant call to Eval for LeftChild
+			// TODO: this is whole process is hacky. string conversions should be unnecessary for datetime types
+			// Tracking issue: https://github.com/dolthub/dolt/issues/10278
 			lval, err := div.LeftChild.Eval(ctx, row)
 			if err != nil {
 				return 0, false
 			}
 			_, s := GetPrecisionAndScale(lval)
-			typ := div.LeftChild.Type()
-			if dt, dok := typ.(sql.DecimalType); dok {
+			typ := div.LeftChild.Type(ctx)
+			switch dt := typ.(type) {
+			case sql.DecimalType:
 				ts := dt.Scale()
+				if ts > s {
+					s = ts
+				}
+			case sql.DatetimeType:
+				ts := uint8(dt.Precision())
 				if ts > s {
 					s = ts
 				}
@@ -579,7 +601,7 @@ func getFinalScale(ctx *sql.Context, row sql.Row, expr sql.Expression, divOpCnt 
 	if lit, isLit := expr.(*Literal); isLit {
 		_, fScale = GetPrecisionAndScale(lit.Val)
 	}
-	typ := expr.Type()
+	typ := expr.Type(ctx)
 	if dt, dok := typ.(sql.DecimalType); dok {
 		ts := dt.Scale()
 		if ts > fScale {
@@ -607,14 +629,14 @@ func GetPrecisionAndScale(val interface{}) (uint8, uint8) {
 	switch v := val.(type) {
 	case time.Time:
 		str = fmt.Sprintf("%v", v.In(time.UTC).Format("2006-01-02 15:04:05"))
-	case decimal.Decimal:
-		str = v.StringFixed(v.Exponent() * -1)
+	case *apd.Decimal:
+		str = v.Text('f')
 	case float32:
-		d := decimal.NewFromFloat32(v)
-		str = d.StringFixed(d.Exponent() * -1)
+		d := types.DecimalFromFloat64(float64(v))
+		str = d.Text('f')
 	case float64:
-		d := decimal.NewFromFloat(v)
-		str = d.StringFixed(d.Exponent() * -1)
+		d := types.DecimalFromFloat64(v)
+		str = d.Text('f')
 	default:
 		str = fmt.Sprintf("%v", v)
 	}
@@ -650,19 +672,19 @@ func (i *IntDiv) String() string {
 	return fmt.Sprintf("(%s div %s)", i.LeftChild, i.RightChild)
 }
 
-func (i *IntDiv) DebugString() string {
-	return fmt.Sprintf("(%s div %s)", sql.DebugString(i.LeftChild), sql.DebugString(i.RightChild))
+func (i *IntDiv) DebugString(ctx *sql.Context) string {
+	return fmt.Sprintf("(%s div %s)", sql.DebugString(ctx, i.LeftChild), sql.DebugString(ctx, i.RightChild))
 }
 
 // IsNullable implements the sql.Expression interface.
-func (i *IntDiv) IsNullable() bool {
+func (i *IntDiv) IsNullable(ctx *sql.Context) bool {
 	return true
 }
 
 // Type returns the greatest type for given operation.
-func (i *IntDiv) Type() sql.Type {
-	lTyp := i.LeftChild.Type()
-	rTyp := i.RightChild.Type()
+func (i *IntDiv) Type(ctx *sql.Context) sql.Type {
+	lTyp := i.LeftChild.Type(ctx)
+	rTyp := i.RightChild.Type(ctx)
 
 	if types.IsUnsigned(lTyp) || types.IsUnsigned(rTyp) {
 		return types.Uint64
@@ -677,7 +699,7 @@ func (*IntDiv) CollationCoercibility(ctx *sql.Context) (collation sql.CollationI
 }
 
 // WithChildren implements the Expression interface.
-func (i *IntDiv) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (i *IntDiv) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 2 {
 		return nil, sql.ErrInvalidChildrenNumber.New(i, len(children), 2)
 	}
@@ -695,9 +717,8 @@ func (i *IntDiv) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 		return nil, nil
 	}
 
-	lval, rval = i.convertLeftRight(ctx, lval, rval)
-
-	return intDiv(ctx, lval, rval)
+	lval, rval, unsigned := i.convertLeftRight(ctx, lval, rval)
+	return i.intDiv(ctx, lval, rval, unsigned)
 }
 
 func (i *IntDiv) evalLeftRight(ctx *sql.Context, row sql.Row) (interface{}, interface{}, error) {
@@ -724,34 +745,44 @@ func (i *IntDiv) evalLeftRight(ctx *sql.Context, row sql.Row) (interface{}, inte
 // If there is no float type column reference, both values should be handled as decimal type
 // The decimal types of left and right value does NOT need to be the same. Both the types
 // should be preserved.
-func (i *IntDiv) convertLeftRight(ctx *sql.Context, left interface{}, right interface{}) (interface{}, interface{}) {
+func (i *IntDiv) convertLeftRight(ctx *sql.Context, lVal, rVal any) (left any, right any, unsigned bool) {
 	var typ sql.Type
-	lTyp, rTyp := i.LeftChild.Type(), i.RightChild.Type()
-	lIsTimeType := types.IsTime(lTyp)
-	rIsTimeType := types.IsTime(rTyp)
-
-	if types.IsText(lTyp) || types.IsText(rTyp) {
-		typ = types.Float64
-	} else if types.IsUnsigned(lTyp) && types.IsUnsigned(rTyp) {
+	lTyp, rTyp := i.LeftChild.Type(ctx), i.RightChild.Type(ctx)
+	lUnsigned := types.IsUnsigned(lTyp)
+	switch {
+	case lUnsigned && types.IsUnsigned(rTyp):
 		typ = types.Uint64
-	} else if (lIsTimeType && rIsTimeType) || (types.IsSigned(lTyp) && types.IsSigned(rTyp)) {
+	case (types.IsTime(lTyp) && types.IsTime(rTyp)) || (types.IsSigned(lTyp) && types.IsSigned(rTyp)):
 		typ = types.Int64
-	} else {
-		typ = types.MustCreateDecimalType(types.DecimalTypeMaxPrecision, 0)
+	default:
+		rUnsigned := types.IsUnsigned(rTyp)
+		// Skip DECIMAL conversion for mixed signedness when both Go values match their SQL types
+		if ((lUnsigned && types.IsSigned(rTyp)) || (rUnsigned && types.IsSigned(lTyp))) &&
+			isNativeIntDivOperand(lTyp, lVal) && isNativeIntDivOperand(rTyp, rVal) {
+			lTarget, rTarget := types.Int64, types.Uint64
+			if lUnsigned {
+				lTarget, rTarget = rTarget, lTarget
+			}
+			return convertValueToType(ctx, lVal, lTyp, lTarget), convertValueToType(ctx, rVal, rTyp, rTarget), true
+		}
+		lVal = convertToDecimalValue(ctx, lVal, lTyp, types.InternalDecimalType)
+		rVal = convertToDecimalValue(ctx, rVal, rTyp, types.InternalDecimalType)
+		return lVal, rVal, lUnsigned || rUnsigned
 	}
 
-	if types.IsInteger(typ) || types.IsFloat(typ) {
-		left = convertValueToType(ctx, typ, left, lIsTimeType)
-		right = convertValueToType(ctx, typ, right, rIsTimeType)
-	} else {
-		left = convertToDecimalValue(ctx, left, lIsTimeType)
-		right = convertToDecimalValue(ctx, right, rIsTimeType)
-	}
-
-	return left, right
+	lVal = convertValueToType(ctx, lVal, lTyp, typ)
+	rVal = convertValueToType(ctx, rVal, rTyp, typ)
+	return lVal, rVal, lUnsigned
 }
 
-func intDiv(ctx *sql.Context, lval, rval interface{}) (interface{}, error) {
+// isNativeIntDivOperand checks that the value can be converted without coercion.
+func isNativeIntDivOperand(typ sql.Type, value any) bool {
+	integer, ok := typ.(types.NumberTypeImpl_)
+	return ok && integer.ValueType() == reflect.TypeOf(value)
+}
+
+// intDiv evaluates operands that have already been converted.
+func (i *IntDiv) intDiv(ctx *sql.Context, lval, rval any, unsigned bool) (any, error) {
 	switch l := lval.(type) {
 	case uint64:
 		switch r := rval.(type) {
@@ -761,6 +792,8 @@ func intDiv(ctx *sql.Context, lval, rval interface{}) (interface{}, error) {
 				return nil, nil
 			}
 			return l / r, nil
+		case int64:
+			return i.intDivMixed(ctx, r, l, false)
 		}
 	case int64:
 		switch r := rval.(type) {
@@ -770,6 +803,8 @@ func intDiv(ctx *sql.Context, lval, rval interface{}) (interface{}, error) {
 				return nil, nil
 			}
 			return l / r, nil
+		case uint64:
+			return i.intDivMixed(ctx, l, r, true)
 		}
 	case float64:
 		switch r := rval.(type) {
@@ -781,29 +816,58 @@ func intDiv(ctx *sql.Context, lval, rval interface{}) (interface{}, error) {
 			res := l / r
 			return int64(math.Floor(res)), nil
 		}
-	case decimal.Decimal:
+	case *apd.Decimal:
 		switch r := rval.(type) {
-		case decimal.Decimal:
-			if r.Equal(decimal.NewFromInt(0)) {
+		case *apd.Decimal:
+			if r.IsZero() {
 				arithmeticWarning(ctx, ERDivisionByZero, "Division by 0")
 				return nil, nil
 			}
 
 			// intDiv operation gets the integer part of the divided value without rounding the result with 0 precision
 			// We get division result with non-zero precision and then truncate it to get integer part without it being rounded
-			divRes := l.DivRound(r, 2).Truncate(0)
-
-			// cannot use IntPart() function of decimal.Decimal package as it returns 0 as undefined value for out of range value
-			// it causes valid result value of 0 to be the same as invalid out of range value of 0. The fraction part
-			// should not be rounded, so truncate the result wih 0 precision.
-			intPart, err := strconv.ParseInt(divRes.String(), 10, 64)
-			if err != nil {
-				return nil, ErrIntDivDataOutOfRange.New(l.StringFixed(l.Exponent()), r.StringFixed(r.Exponent()))
+			divRes := types.DecimalDiv(l, r, 0, true)
+			if unsigned {
+				// MySQL range-checks the truncated quotient, so -1 DIV 2 is 0 but -1 DIV 1 is out of range.
+				if divRes.Negative {
+					return nil, sql.ErrIntegerOutOfRange.New("BIGINT UNSIGNED", i.String())
+				}
+				if !divRes.Coeff.IsUint64() {
+					return nil, ErrIntDivDataOutOfRange.New(l.Text('f'), r.Text('f'))
+				}
+				return divRes.Coeff.Uint64(), nil
 			}
-
-			return intPart, nil
+			// The fraction part should not be rounded, so truncate the result wih 0 precision.
+			res, err := divRes.Int64()
+			if err != nil {
+				return nil, ErrIntDivDataOutOfRange.New(l.Text('f'), r.Text('f'))
+			}
+			return res, nil
 		}
 	}
 
 	return nil, errUnableToCast.New(lval, rval)
+}
+
+// intDivMixed divides magnitudes before checking whether a nonzero quotient is negative.
+func (i *IntDiv) intDivMixed(ctx *sql.Context, signed int64, unsigned uint64, signedDividend bool) (any, error) {
+	magnitude := uint64(signed)
+	if signed < 0 {
+		// Negating in uint64 also represents the magnitude of MinInt64.
+		magnitude = -magnitude
+	}
+
+	dividend, divisor := unsigned, magnitude
+	if signedDividend {
+		dividend, divisor = magnitude, unsigned
+	}
+	if divisor == 0 {
+		arithmeticWarning(ctx, ERDivisionByZero, "Division by 0")
+		return nil, nil
+	}
+	quotient := dividend / divisor
+	if signed < 0 && quotient != 0 {
+		return nil, sql.ErrIntegerOutOfRange.New("BIGINT UNSIGNED", i.String())
+	}
+	return quotient, nil
 }

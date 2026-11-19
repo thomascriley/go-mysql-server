@@ -15,6 +15,10 @@
 package expression
 
 import (
+	"fmt"
+
+	"github.com/dolthub/vitess/go/vt/sqlparser"
+
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/types"
 )
@@ -26,6 +30,7 @@ type SystemVar struct {
 	Name           string
 	SpecifiedScope string
 	Collation      sql.CollationID
+	displayString  string
 }
 
 var _ sql.Expression = (*SystemVar)(nil)
@@ -35,9 +40,14 @@ var _ sql.CollationCoercible = (*SystemVar)(nil)
 // The |specifiedScope| parameter indicates the exact scope that was specified in the original reference to this
 // system variable, and is used to ensure we output a column name in a result set that exactly matches how the
 // system variable was originally referenced. If the |specifiedScope| parameter is empty, then the scope was not
-// originally specified and any scope has been inferred.
-func NewSystemVar(name string, scope sql.SystemVariableScope, specifiedScope string) *SystemVar {
-	return &SystemVar{Scope: scope, Name: name, SpecifiedScope: specifiedScope}
+// originally specified and any scope has been inferred. The display string is bound at construction time from the
+// variable registry associated with |ctx|.
+func NewSystemVar(ctx *sql.Context, name string, scope sql.SystemVariableScope, specifiedScope string) *SystemVar {
+	v := &SystemVar{Scope: scope, Name: name, SpecifiedScope: specifiedScope}
+	if sysVar, _, ok := ctx.SystemVariables().GetGlobal(name); ok && sysVar != nil {
+		v.displayString = sysVar.DisplayString(specifiedScope)
+	}
+	return v
 }
 
 // Children implements the sql.Expression interface.
@@ -50,8 +60,8 @@ func (v *SystemVar) Eval(ctx *sql.Context, _ sql.Row) (interface{}, error) {
 }
 
 // Type implements the sql.Expression interface.
-func (v *SystemVar) Type() sql.Type {
-	if sysVar, _, ok := sql.SystemVariables.GetGlobal(v.Name); ok {
+func (v *SystemVar) Type(ctx *sql.Context) sql.Type {
+	if sysVar, _, ok := ctx.SystemVariables().GetGlobal(v.Name); ok && sysVar != nil {
 		return sysVar.GetType()
 	}
 	return types.Null
@@ -59,7 +69,7 @@ func (v *SystemVar) Type() sql.Type {
 
 // CollationCoercibility implements the interface sql.CollationCoercible.
 func (v *SystemVar) CollationCoercibility(ctx *sql.Context) (collation sql.CollationID, coercibility byte) {
-	typ := v.Type()
+	typ := v.Type(ctx)
 	if types.IsText(typ) {
 		collation, _ = typ.CollationCoercibility(ctx)
 		return collation, 3
@@ -68,7 +78,7 @@ func (v *SystemVar) CollationCoercibility(ctx *sql.Context) (collation sql.Colla
 }
 
 // IsNullable implements the sql.Expression interface.
-func (v *SystemVar) IsNullable() bool {
+func (v *SystemVar) IsNullable(ctx *sql.Context) bool {
 	return true
 }
 
@@ -77,14 +87,17 @@ func (v *SystemVar) Resolved() bool { return true }
 
 // String implements the sql.Expression interface.
 func (v *SystemVar) String() string {
-	if sysVar, _, ok := sql.SystemVariables.GetGlobal(v.Name); ok {
-		return sysVar.DisplayString(v.SpecifiedScope)
+	if v.displayString != "" {
+		return v.displayString
 	}
-	return ""
+	if v.SpecifiedScope == "" {
+		return "@@" + v.Name
+	}
+	return fmt.Sprintf("@@%s.%s", v.SpecifiedScope, v.Name)
 }
 
 // WithChildren implements the Expression interface.
-func (v *SystemVar) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (v *SystemVar) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 0 {
 		return nil, sql.ErrInvalidChildrenNumber.New(v, len(children), 0)
 	}
@@ -128,7 +141,7 @@ func (v *UserVar) Eval(ctx *sql.Context, _ sql.Row) (interface{}, error) {
 }
 
 // Type implements the sql.Expression interface.
-func (v *UserVar) Type() sql.Type {
+func (v *UserVar) Type(ctx *sql.Context) sql.Type {
 	return v.exprType
 }
 
@@ -139,16 +152,18 @@ func (v *UserVar) CollationCoercibility(ctx *sql.Context) (collation sql.Collati
 }
 
 // IsNullable implements the sql.Expression interface.
-func (v *UserVar) IsNullable() bool { return true }
+func (v *UserVar) IsNullable(ctx *sql.Context) bool { return true }
 
 // Resolved implements the sql.Expression interface.
 func (v *UserVar) Resolved() bool { return true }
 
 // String implements the sql.Expression interface.
-func (v *UserVar) String() string { return "@" + v.Name }
+func (v *UserVar) String() string {
+	return "@" + sqlparser.String(sqlparser.NewColIdent(v.Name))
+}
 
 // WithChildren implements the Expression interface.
-func (v *UserVar) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (v *UserVar) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 0 {
 		return nil, sql.ErrInvalidChildrenNumber.New(v, len(children), 0)
 	}

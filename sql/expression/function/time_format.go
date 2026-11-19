@@ -16,6 +16,7 @@ package function
 
 import (
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/lestrrat-go/strftime"
@@ -29,6 +30,7 @@ var mysqlTimeFormatSpec = strftime.NewSpecificationSet()
 var timeFormatSpecifierToFunc = map[byte]func(time.Time) string{
 	'f': microsecondsStr,
 	'H': nil,
+	'k': nil,
 	'h': twelveHourPadded,
 	'I': twelveHourPadded,
 	'i': minutesStr,
@@ -71,6 +73,40 @@ func formatTime(format string, t time.Time) (string, error) {
 	return formatter.FormatString(t), nil
 }
 
+func formatTimeDuration(format string, t time.Time, hours int) (string, error) {
+	spec := strftime.NewSpecificationSet()
+	for specifier, fn := range timeFormatSpecifierToFunc {
+		if fn != nil {
+			if err := spec.Set(specifier, wrap(fn)); err != nil {
+				return "", err
+			}
+		}
+	}
+	if err := spec.Set('H', wrap(func(time.Time) string { return fmt.Sprintf("%02d", hours) })); err != nil {
+		return "", err
+	}
+	if err := spec.Set('k', wrap(func(time.Time) string { return strconv.Itoa(hours) })); err != nil {
+		return "", err
+	}
+
+	for i := byte('A'); i <= 'Z'; i++ {
+		for _, specifier := range []byte{i, i + byte('a'-'A')} {
+			if _, ok := timeFormatSpecifierToFunc[specifier]; !ok {
+				b := specifier
+				if err := spec.Set(b, wrap(func(time.Time) string { return string(b) })); err != nil {
+					return "", err
+				}
+			}
+		}
+	}
+
+	formatter, err := strftime.New(format, strftime.WithSpecificationSet(spec))
+	if err != nil {
+		return "", err
+	}
+	return formatter.FormatString(t), nil
+}
+
 // TimeFormat function returns a string representation of the date specified in the format specified
 type TimeFormat struct {
 	expression.BinaryExpressionStub
@@ -90,7 +126,7 @@ func (f *TimeFormat) Description() string {
 }
 
 // NewTimeFormat returns a new TimeFormat UDF
-func NewTimeFormat(ex, value sql.Expression) sql.Expression {
+func NewTimeFormat(ctx *sql.Context, ex, value sql.Expression) sql.Expression {
 	return &TimeFormat{
 		expression.BinaryExpressionStub{
 			LeftChild:  ex,
@@ -133,14 +169,15 @@ func (f *TimeFormat) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 		return nil, sql.ErrInvalidArgumentDetails.New("time_format", "format must be a string")
 	}
 
-	return formatTime(
+	return formatTimeDuration(
 		formatStr,
 		time.Date(1980, time.January, 1, int(d.Hours())%24, int(d.Minutes())%60, int(d.Seconds())%60, int(d.Nanoseconds())%1e9, time.UTC),
+		int(d.Hours()),
 	)
 }
 
 // Type implements the Expression interface.
-func (f *TimeFormat) Type() sql.Type {
+func (f *TimeFormat) Type(ctx *sql.Context) sql.Type {
 	return types.Text
 }
 
@@ -150,8 +187,8 @@ func (*TimeFormat) CollationCoercibility(ctx *sql.Context) (collation sql.Collat
 }
 
 // IsNullable implements the Expression interface.
-func (f *TimeFormat) IsNullable() bool {
-	return f.LeftChild.IsNullable() || f.RightChild.IsNullable()
+func (f *TimeFormat) IsNullable(ctx *sql.Context) bool {
+	return f.LeftChild.IsNullable(ctx) || f.RightChild.IsNullable(ctx)
 }
 
 func (f *TimeFormat) String() string {
@@ -159,9 +196,9 @@ func (f *TimeFormat) String() string {
 }
 
 // WithChildren implements the Expression interface.
-func (f *TimeFormat) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (f *TimeFormat) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 2 {
 		return nil, sql.ErrInvalidChildrenNumber.New(f, len(children), 2)
 	}
-	return NewTimeFormat(children[0], children[1]), nil
+	return NewTimeFormat(ctx, children[0], children[1]), nil
 }

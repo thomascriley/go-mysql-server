@@ -15,6 +15,7 @@
 package planbuilder
 
 import (
+	"github.com/dolthub/vitess/go/mysql"
 	"gopkg.in/src-d/go-errors.v1"
 )
 
@@ -25,10 +26,10 @@ var (
 
 	ErrPrimaryKeyOnNullField = errors.NewKind("All parts of PRIMARY KEY must be NOT NULL")
 
-	// ErrUnionSchemasDifferentLength is returned when the two sides of a
+	// ErrSelectsDifferentLength is returned when the two sides of a
 	// UNION do not have the same number of columns in their schemas.
-	ErrUnionSchemasDifferentLength = errors.NewKind(
-		"cannot union two queries whose schemas are different lengths; left has %d column(s) right has %d column(s).",
+	ErrSelectsDifferentLength = errors.NewKind(
+		"the used SELECT statements have a different number of columns; left has %d column(s) right has %d column(s).",
 	)
 
 	ErrQualifiedOrderBy = errors.NewKind("Table '%s' from one of the SELECTs cannot be used in global ORDER clause")
@@ -36,4 +37,12 @@ var (
 	ErrOrderByBinding = errors.NewKind("bindings in sort clauses not supported yet")
 
 	ErrFailedToParseStats = errors.NewKind("failed to parse data: %s\n%s")
+
+	// errMySQLDistinctWindow is returned for DISTINCT aggregate windows unsupported by MySQL.
+	errMySQLDistinctWindow = mysql.NewSQLError(mysql.ERNotSupportedYet, mysql.SSClientError,
+		"This version of MySQL doesn't yet support '<window function>(DISTINCT ..)'")
+
+	// errMySQLDistinctStarWindow is returned for COUNT(DISTINCT *) windows, which are invalid MySQL syntax.
+	errMySQLDistinctStarWindow = mysql.NewSQLError(mysql.ERParseError, mysql.SSClientError,
+		"You have an error in your SQL syntax")
 )

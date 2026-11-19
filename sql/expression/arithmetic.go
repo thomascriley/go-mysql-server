@@ -23,9 +23,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/apd/v3"
 	"github.com/dolthub/vitess/go/mysql"
 	"github.com/dolthub/vitess/go/vt/sqlparser"
-	"github.com/shopspring/decimal"
 	"gopkg.in/src-d/go-errors.v1"
 
 	"github.com/dolthub/go-mysql-server/sql"
@@ -71,11 +71,18 @@ type Arithmetic struct {
 	BinaryExpressionStub
 	Op  string
 	ops int32
+	typ sql.Type
 }
 
 // NewArithmetic creates a new Arithmetic sql.Expression.
 func NewArithmetic(left, right sql.Expression, op string) *Arithmetic {
-	a := &Arithmetic{BinaryExpressionStub{LeftChild: left, RightChild: right}, op, 0}
+	a := &Arithmetic{
+		BinaryExpressionStub: BinaryExpressionStub{
+			LeftChild:  left,
+			RightChild: right,
+		},
+		Op: op,
+	}
 	ops := countArithmeticOps(a)
 	setArithmeticOps(a, ops)
 	return a
@@ -108,37 +115,54 @@ func (a *Arithmetic) String() string {
 	return fmt.Sprintf("(%s %s %s)", a.LeftChild.String(), a.Op, a.RightChild.String())
 }
 
-func (a *Arithmetic) DebugString() string {
-	return fmt.Sprintf("(%s %s %s)", sql.DebugString(a.LeftChild), a.Op, sql.DebugString(a.RightChild))
+func (a *Arithmetic) DebugString(ctx *sql.Context) string {
+	return fmt.Sprintf("(%s %s %s)", sql.DebugString(ctx, a.LeftChild), a.Op, sql.DebugString(ctx, a.RightChild))
 }
 
 // IsNullable implements the sql.Expression interface.
-func (a *Arithmetic) IsNullable() bool {
-	typ := a.Type()
+func (a *Arithmetic) IsNullable(ctx *sql.Context) bool {
+	typ := a.Type(ctx)
 	if types.IsDatetimeType(typ) || types.IsTimestampType(typ) {
 		return true
 	}
 
-	return a.BinaryExpressionStub.IsNullable()
+	return a.BinaryExpressionStub.IsNullable(ctx)
 }
 
-// Type returns the greatest type for given operation.
-func (a *Arithmetic) Type() sql.Type {
-	//TODO: what if both BindVars? should be constant folded
-	rTyp := a.RightChild.Type()
+// getReturnType returns the greatest type for given operation.
+func (a *Arithmetic) getReturnType(ctx *sql.Context) sql.Type {
+	// TODO: what if both BindVars? should be constant folded
+	rTyp := a.RightChild.Type(ctx)
 	if types.IsDeferredType(rTyp) {
 		return rTyp
 	}
-	lTyp := a.LeftChild.Type()
+	lTyp := a.LeftChild.Type(ctx)
 	if types.IsDeferredType(lTyp) {
 		return lTyp
 	}
 
 	// applies for + and - ops
 	if isInterval(a.LeftChild) || isInterval(a.RightChild) {
-		// TODO: need to use the precision stored in datetimeType; something like
-		//   return types.MustCreateDatetimeType(sqltypes.Datetime, 0)
-		return types.Datetime
+		inputType, interval := lTyp, a.RightChild
+		if isInterval(a.LeftChild) {
+			inputType, interval = rTyp, a.LeftChild
+		}
+		// Conversion to the result type happens before applying the interval.
+		// Preserve the operand's fractional seconds as well as any precision
+		// introduced by the interval.
+		precision := 0
+		if dt, ok := inputType.(sql.DatetimeType); ok {
+			precision = dt.Precision()
+		}
+		if i, ok := interval.(*Interval); ok {
+			if strings.HasSuffix(i.Unit, "MICROSECOND") {
+				precision = 6
+			}
+		} else {
+			// External TimeDeltaExpression implementations can supply microseconds.
+			precision = 6
+		}
+		return types.MustCreateDatetimeType(types.Datetime.Type(), precision)
 	}
 
 	if types.IsText(lTyp) || types.IsText(rTyp) {
@@ -196,11 +220,13 @@ func (a *Arithmetic) Type() sql.Type {
 		}
 	}
 
-	if types.IsUnsigned(lTyp) && types.IsUnsigned(rTyp) {
-		return types.Uint64
-	}
-
 	if types.IsInteger(lTyp) && types.IsInteger(rTyp) {
+		if types.IsUnsigned(lTyp) || types.IsUnsigned(rTyp) {
+			if a.Op == sqlparser.MinusStr && sql.LoadSqlMode(ctx).ModeEnabled(sql.NO_UNSIGNED_SUBTRACTION) {
+				return types.Int64
+			}
+			return types.Uint64
+		}
 		return types.Int64
 	}
 
@@ -252,13 +278,23 @@ func (a *Arithmetic) Type() sql.Type {
 	return types.Float64
 }
 
+// Type implements the Expression interface
+func (a *Arithmetic) Type(ctx *sql.Context) sql.Type {
+	// Cache the return type for Arithmetic functions for performance.
+	// We this here instead of NewArithmeticExpression because of placeholder expressions.
+	if a.typ == nil {
+		a.typ = a.getReturnType(ctx)
+	}
+	return a.typ
+}
+
 // CollationCoercibility implements the interface sql.CollationCoercible.
 func (*Arithmetic) CollationCoercibility(ctx *sql.Context) (collation sql.CollationID, coercibility byte) {
 	return sql.Collation_binary, 5
 }
 
 // WithChildren implements the Expression interface.
-func (a *Arithmetic) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (a *Arithmetic) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 2 {
 		return nil, sql.ErrInvalidChildrenNumber.New(a, len(children), 2)
 	}
@@ -274,16 +310,19 @@ func (a *Arithmetic) WithChildren(children ...sql.Expression) (sql.Expression, e
 
 // Eval implements the Expression interface.
 func (a *Arithmetic) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
-	lval, rval, err := a.evalLeftRight(ctx, row)
+	lVal, rVal, err := a.evalLeftRight(ctx, row)
 	if err != nil {
 		return nil, err
 	}
 
-	if lval == nil || rval == nil {
+	if lVal == nil || rVal == nil {
 		return nil, nil
 	}
+	if types.IsInteger(a.Type(ctx)) {
+		return a.evalInteger(ctx, lVal, rVal)
+	}
 
-	lval, rval, err = a.convertLeftRight(ctx, lval, rval)
+	lVal, rVal, err = a.convertLeftRight(ctx, lVal, rVal)
 	if err != nil {
 		return nil, err
 	}
@@ -291,24 +330,23 @@ func (a *Arithmetic) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 	var result interface{}
 	switch strings.ToLower(a.Op) {
 	case sqlparser.PlusStr:
-		result, err = plus(lval, rval)
+		result, err = plus(lVal, rVal)
 	case sqlparser.MinusStr:
-		result, err = minus(lval, rval)
+		result, err = minus(lVal, rVal)
 	case sqlparser.MultStr:
-		result, err = mult(lval, rval)
+		result, err = mult(lVal, rVal)
 	}
-
 	if err != nil {
 		return nil, err
 	}
 
 	// Decimals must be rounded
-	if res, ok := result.(decimal.Decimal); ok {
+	if res, ok := result.(*apd.Decimal); ok {
 		if isOutermostArithmeticOp(a, a.ops) {
 			finalScale, hasDiv := getFinalScale(ctx, row, a, 0)
 			if hasDiv {
 				// TODO: should always round regardless; we have bad Decimal defaults
-				return res.Round(finalScale), nil
+				return sql.DecimalRound(res, finalScale)
 			}
 		}
 	}
@@ -316,11 +354,255 @@ func (a *Arithmetic) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 	return result, nil
 }
 
+// evalInteger evaluates integer arithmetic exactly and rejects results outside the signed or unsigned BIGINT range.
+func (a *Arithmetic) evalInteger(ctx *sql.Context, lval, rval interface{}) (interface{}, error) {
+	typ := a.Type(ctx)
+	leftUnsigned := types.IsUnsigned(a.LeftChild.Type(ctx))
+	rightUnsigned := types.IsUnsigned(a.RightChild.Type(ctx))
+	if leftUnsigned != rightUnsigned || (!types.IsUnsigned(typ) && (leftUnsigned || rightUnsigned)) {
+		return a.evalMixedInteger(ctx, typ, lval, rval)
+	}
+
+	lval, rval, err := a.convertLeftRight(ctx, lval, rval)
+	if err != nil {
+		return nil, err
+	}
+
+	switch left := lval.(type) {
+	case uint64:
+		right, ok := rval.(uint64)
+		if !ok {
+			return nil, errUnableToCast.New(lval, rval)
+		}
+		var result uint64
+		switch strings.ToLower(a.Op) {
+		case sqlparser.PlusStr:
+			if right > math.MaxUint64-left {
+				return nil, a.integerOutOfRange(typ)
+			}
+			result = left + right
+		case sqlparser.MinusStr:
+			if left < right {
+				return nil, a.integerOutOfRange(typ)
+			}
+			result = left - right
+		case sqlparser.MultStr:
+			if right != 0 && left > math.MaxUint64/right {
+				return nil, a.integerOutOfRange(typ)
+			}
+			result = left * right
+		default:
+			return nil, errUnableToEval.New(lval, a.Op, rval)
+		}
+		return result, nil
+	case int64:
+		right, ok := rval.(int64)
+		if !ok {
+			return nil, errUnableToCast.New(lval, rval)
+		}
+		var result int64
+		switch strings.ToLower(a.Op) {
+		case sqlparser.PlusStr:
+			if (right > 0 && left > math.MaxInt64-right) || (right < 0 && left < math.MinInt64-right) {
+				return nil, a.integerOutOfRange(typ)
+			}
+			result = left + right
+		case sqlparser.MinusStr:
+			if (right > 0 && left < math.MinInt64+right) || (right < 0 && left > math.MaxInt64+right) {
+				return nil, a.integerOutOfRange(typ)
+			}
+			result = left - right
+		case sqlparser.MultStr:
+			if (left == math.MinInt64 && right == -1) || (right == math.MinInt64 && left == -1) ||
+				(right != 0 && (left*right)/right != left) {
+				return nil, a.integerOutOfRange(typ)
+			}
+			result = left * right
+		default:
+			return nil, errUnableToEval.New(lval, a.Op, rval)
+		}
+		return result, nil
+	default:
+		return nil, errUnableToCast.New(lval, rval)
+	}
+}
+
+// integerMagnitude stores an integer as a sign and an unsigned magnitude.
+type integerMagnitude struct {
+	magnitude uint64
+	negative  bool
+}
+
+// evalMixedInteger evaluates mixed signed and unsigned operands without decimal conversion.
+func (a *Arithmetic) evalMixedInteger(ctx *sql.Context, typ sql.Type, lval, rval interface{}) (interface{}, error) {
+	if types.IsUnsigned(typ) {
+		return a.evalMixedUnsignedInteger(ctx, lval, rval)
+	}
+
+	left := integerMagnitudeFromValue(ctx, a.LeftChild.Type(ctx), lval)
+	right := integerMagnitudeFromValue(ctx, a.RightChild.Type(ctx), rval)
+	if strings.ToLower(a.Op) != sqlparser.MinusStr {
+		return nil, errUnableToEval.New(lval, a.Op, rval)
+	}
+	if right.magnitude != 0 {
+		right.negative = !right.negative
+	}
+	result, overflow := addIntegerMagnitudes(left, right)
+	if overflow {
+		return nil, a.integerOutOfRange(typ)
+	}
+
+	if result.negative {
+		const minInt64Magnitude = uint64(math.MaxInt64) + 1
+		if result.magnitude > minInt64Magnitude {
+			return nil, a.integerOutOfRange(typ)
+		}
+		if result.magnitude == minInt64Magnitude {
+			return int64(math.MinInt64), nil
+		}
+		return -int64(result.magnitude), nil
+	}
+	if result.magnitude > math.MaxInt64 {
+		return nil, a.integerOutOfRange(typ)
+	}
+	return int64(result.magnitude), nil
+}
+
+// evalMixedUnsignedInteger evaluates an unsigned result without constructing intermediate signed magnitudes.
+func (a *Arithmetic) evalMixedUnsignedInteger(ctx *sql.Context, lVal, rVal any) (any, error) {
+	leftUnsigned := types.IsUnsigned(a.LeftChild.Type(ctx))
+	var unsignedValue uint64
+	var signedValue int64
+	if leftUnsigned {
+		if converted := convertValueToType(ctx, lVal, a.LeftChild.Type(ctx), types.Uint64); converted != nil {
+			unsignedValue = converted.(uint64)
+		}
+		if converted := convertValueToType(ctx, rVal, a.RightChild.Type(ctx), types.Int64); converted != nil {
+			signedValue = converted.(int64)
+		}
+	} else {
+		if converted := convertValueToType(ctx, lVal, a.LeftChild.Type(ctx), types.Int64); converted != nil {
+			signedValue = converted.(int64)
+		}
+		if converted := convertValueToType(ctx, rVal, a.RightChild.Type(ctx), types.Uint64); converted != nil {
+			unsignedValue = converted.(uint64)
+		}
+	}
+
+	negativeMagnitude := uint64(0)
+	if signedValue < 0 {
+		negativeMagnitude = uint64(-(signedValue + 1)) + 1
+	}
+
+	switch strings.ToLower(a.Op) {
+	case sqlparser.PlusStr:
+		if signedValue < 0 {
+			if unsignedValue < negativeMagnitude {
+				return nil, a.integerOutOfRange(types.Uint64)
+			}
+			return unsignedValue - negativeMagnitude, nil
+		}
+		positive := uint64(signedValue)
+		if unsignedValue > math.MaxUint64-positive {
+			return nil, a.integerOutOfRange(types.Uint64)
+		}
+		return unsignedValue + positive, nil
+	case sqlparser.MinusStr:
+		if leftUnsigned {
+			if signedValue < 0 {
+				if unsignedValue > math.MaxUint64-negativeMagnitude {
+					return nil, a.integerOutOfRange(types.Uint64)
+				}
+				return unsignedValue + negativeMagnitude, nil
+			}
+			positive := uint64(signedValue)
+			if unsignedValue < positive {
+				return nil, a.integerOutOfRange(types.Uint64)
+			}
+			return unsignedValue - positive, nil
+		}
+		if signedValue < 0 || uint64(signedValue) < unsignedValue {
+			return nil, a.integerOutOfRange(types.Uint64)
+		}
+		return uint64(signedValue) - unsignedValue, nil
+	case sqlparser.MultStr:
+		if signedValue == 0 || unsignedValue == 0 {
+			return uint64(0), nil
+		}
+		if signedValue < 0 {
+			return nil, a.integerOutOfRange(types.Uint64)
+		}
+		positive := uint64(signedValue)
+		if unsignedValue > math.MaxUint64/positive {
+			return nil, a.integerOutOfRange(types.Uint64)
+		}
+		return unsignedValue * positive, nil
+	default:
+		return nil, errUnableToEval.New(lVal, a.Op, rVal)
+	}
+}
+
+// integerMagnitudeFromValue converts an integer operand without losing a signed value's sign.
+func integerMagnitudeFromValue(ctx *sql.Context, typ sql.Type, val any) integerMagnitude {
+	if types.IsUnsigned(typ) {
+		converted := convertValueToType(ctx, val, typ, types.Uint64)
+		if converted == nil {
+			return integerMagnitude{}
+		}
+		return integerMagnitude{magnitude: converted.(uint64)}
+	}
+
+	converted := convertValueToType(ctx, val, typ, types.Int64)
+	if converted == nil {
+		return integerMagnitude{}
+	}
+	signed := converted.(int64)
+	if signed >= 0 {
+		return integerMagnitude{magnitude: uint64(signed)}
+	}
+	return integerMagnitude{
+		magnitude: uint64(-(signed + 1)) + 1,
+		negative:  true,
+	}
+}
+
+// addIntegerMagnitudes adds two signed magnitudes and reports uint64 magnitude overflow.
+func addIntegerMagnitudes(left, right integerMagnitude) (integerMagnitude, bool) {
+	if left.negative == right.negative {
+		if left.magnitude > math.MaxUint64-right.magnitude {
+			return integerMagnitude{}, true
+		}
+		return integerMagnitude{
+			magnitude: left.magnitude + right.magnitude,
+			negative:  left.negative,
+		}, false
+	}
+	if left.magnitude >= right.magnitude {
+		return integerMagnitude{
+			magnitude: left.magnitude - right.magnitude,
+			negative:  left.negative && left.magnitude != right.magnitude,
+		}, false
+	}
+	return integerMagnitude{
+		magnitude: right.magnitude - left.magnitude,
+		negative:  right.negative,
+	}, false
+}
+
+// integerOutOfRange returns MySQL's BIGINT range error for this arithmetic expression.
+func (a *Arithmetic) integerOutOfRange(typ sql.Type) error {
+	typeName := "BIGINT"
+	if types.IsUnsigned(typ) {
+		typeName = "BIGINT UNSIGNED"
+	}
+	return sql.ErrIntegerOutOfRange.New(typeName, a.String())
+}
+
 func (a *Arithmetic) evalLeftRight(ctx *sql.Context, row sql.Row) (interface{}, interface{}, error) {
 	var lval, rval interface{}
 	var err error
 
-	if i, ok := a.LeftChild.(*Interval); ok {
+	if i, ok := a.LeftChild.(TimeDeltaExpression); ok {
 		lval, err = i.EvalDelta(ctx, row)
 		if err != nil {
 			return nil, nil, err
@@ -332,7 +614,7 @@ func (a *Arithmetic) evalLeftRight(ctx *sql.Context, row sql.Row) (interface{}, 
 		}
 	}
 
-	if i, ok := a.RightChild.(*Interval); ok {
+	if i, ok := a.RightChild.(TimeDeltaExpression); ok {
 		rval, err = i.EvalDelta(ctx, row)
 		if err != nil {
 			return nil, nil, err
@@ -347,39 +629,35 @@ func (a *Arithmetic) evalLeftRight(ctx *sql.Context, row sql.Row) (interface{}, 
 	return lval, rval, nil
 }
 
-func (a *Arithmetic) convertLeftRight(ctx *sql.Context, left interface{}, right interface{}) (interface{}, interface{}, error) {
-	typ := a.Type()
-
-	lIsTimeType := types.IsTime(a.LeftChild.Type())
-	rIsTimeType := types.IsTime(a.RightChild.Type())
-
-	if i, ok := left.(*TimeDelta); ok {
-		left = i
+func (a *Arithmetic) convertLeftRight(ctx *sql.Context, lVal, rVal any) (any, any, error) {
+	typ, lTyp, rTyp := a.Type(ctx), a.LeftChild.Type(ctx), a.RightChild.Type(ctx)
+	if i, ok := lVal.(*TimeDelta); ok {
+		lVal = i
 	} else {
 		// these are the types we specifically want to capture from we get from Type()
 		if types.IsInteger(typ) || types.IsFloat(typ) || types.IsTime(typ) {
-			left = convertValueToType(ctx, typ, left, lIsTimeType)
+			lVal = convertValueToType(ctx, lVal, lTyp, typ)
 		} else {
-			left = convertToDecimalValue(ctx, left, lIsTimeType)
+			lVal = convertToDecimalValue(ctx, lVal, lTyp, typ)
 		}
 	}
 
-	if i, ok := right.(*TimeDelta); ok {
-		right = i
+	if i, ok := rVal.(*TimeDelta); ok {
+		rVal = i
 	} else {
 		// these are the types we specifically want to capture from we get from Type()
 		if types.IsInteger(typ) || types.IsFloat(typ) || types.IsTime(typ) {
-			right = convertValueToType(ctx, typ, right, rIsTimeType)
+			rVal = convertValueToType(ctx, rVal, rTyp, typ)
 		} else {
-			right = convertToDecimalValue(ctx, right, rIsTimeType)
+			rVal = convertToDecimalValue(ctx, rVal, rTyp, typ)
 		}
 	}
 
-	return left, right, nil
+	return lVal, rVal, nil
 }
 
 func isInterval(expr sql.Expression) bool {
-	_, ok := expr.(*Interval)
+	_, ok := expr.(TimeDeltaExpression)
 	return ok
 }
 
@@ -425,48 +703,37 @@ func isOutermostArithmeticOp(e sql.Expression, opScale int32) bool {
 	return opScale == countArithmeticOps(e)
 }
 
-// convertValueToType returns |val| converted into type |typ|. If the value is
-// invalid and cannot be converted to the given type, it returns nil, and it should be
-// interpreted as value of 0. For time types, all the numbers are parsed up to seconds only.
-// E.g: `2022-11-10 12:14:36` is parsed into `20221110121436` and `2022-03-24` is parsed into `20220324`.
-func convertValueToType(ctx *sql.Context, typ sql.Type, val interface{}, isTimeType bool) interface{} {
-	var cval interface{}
-	if isTimeType {
-		val = convertTimeTypeToString(val)
-	}
-
-	cval, _, err := typ.Convert(ctx, val)
-	if err != nil {
-		arithmeticWarning(ctx, mysql.ERTruncatedWrongValue, fmt.Sprintf("Truncated incorrect %s value: '%v'", typ.String(), val))
-		// the value is interpreted as 0, but we need to match the type of the other valid value
-		// to avoid additional conversion, the nil value is handled in each operation
-	}
-	if types.IsTime(typ) {
-		time, ok := cval.(time.Time)
-		if !ok || time.Equal(types.ZeroTime) {
-			ctx.Warn(1292, "Incorrect datetime value: '%s'", val)
-			return nil
+// convertValueToType returns |val| converted into type |typ|.
+// TODO: Simplify this and convertValueToDecimal to just use types.TypeAwareConversion
+func convertValueToType(ctx *sql.Context, val any, origType, convType sql.Type) (res any) {
+	if dtTyp, ok := origType.(sql.DatetimeType); ok && !types.IsTime(convType) {
+		var err error
+		val, _, err = types.TypeAwareConversion(ctx, val, dtTyp, convType)
+		if err != nil {
+			ctx.Warn(mysql.ERTruncatedWrongValue, "%s", sql.ErrTruncatedIncorrect.New(dtTyp.String(), val).Error())
 		}
 	}
-	return cval
-}
-
-// convertTimeTypeToString returns string value parsed from either time.Time or string
-// representation. all the numbers are parsed up to seconds only. The location can be
-// different between two time.Time values, so we set it to default UTC location before
-// parsing. E.g:
-// `2022-11-10 12:14:36` is parsed into `20221110121436`
-// `2022-03-24` is parsed into `20220324`.
-func convertTimeTypeToString(val interface{}) interface{} {
-	if t, ok := val.(time.Time); ok {
-		val = t.In(time.UTC).Format("2006-01-02 15:04:05")
+	var cVal any
+	var err error
+	switch t := convType.(type) {
+	case sql.DatetimeType:
+		// TODO: is this still necessary?
+		cVal, _, err = t.Convert(ctx, val)
+		if err == nil {
+			if timeVal, ok := cVal.(time.Time); ok && types.ZeroTime.Equal(timeVal) {
+				ctx.Warn(mysql.ERTruncatedWrongValue, "%s", sql.ErrTruncatedIncorrect.New(convType.String(), val).Error())
+				return nil
+			}
+		}
+	default:
+		cVal, _, err = convType.Convert(ctx, val)
 	}
-	if t, ok := val.(string); ok {
-		nums := timeTypeRegex.FindAllString(t, -1)
-		val = strings.Join(nums, "")
+	if err != nil {
+		// the value is interpreted as 0, but we need to match the type of the other valid value
+		// to avoid additional conversion, the nil value is handled in each operation
+		ctx.Warn(mysql.ERTruncatedWrongValue, "%s", sql.ErrTruncatedIncorrect.New(convType.String(), val).Error())
 	}
-
-	return val
+	return cVal
 }
 
 func plus(lval, rval interface{}) (interface{}, error) {
@@ -524,10 +791,12 @@ func plus(lval, rval interface{}) (interface{}, error) {
 		case float64:
 			return l + r, nil
 		}
-	case decimal.Decimal:
+	case *apd.Decimal:
 		switch r := rval.(type) {
-		case decimal.Decimal:
-			return l.Add(r), nil
+		case *apd.Decimal:
+			res := new(apd.Decimal)
+			_, err := sql.DecimalCtx.Add(res, l, r)
+			return res, err
 		}
 	case time.Time:
 		switch r := rval.(type) {
@@ -601,10 +870,12 @@ func minus(lval, rval interface{}) (interface{}, error) {
 		case float64:
 			return l - r, nil
 		}
-	case decimal.Decimal:
+	case *apd.Decimal:
 		switch r := rval.(type) {
-		case decimal.Decimal:
-			return l.Sub(r), nil
+		case *apd.Decimal:
+			res := new(apd.Decimal)
+			_, err := sql.DecimalCtx.Sub(res, l, r)
+			return res, err
 		}
 	case time.Time:
 		switch r := rval.(type) {
@@ -670,10 +941,12 @@ func mult(lval, rval interface{}) (interface{}, error) {
 		case float64:
 			return l * r, nil
 		}
-	case decimal.Decimal:
+	case *apd.Decimal:
 		switch r := rval.(type) {
-		case decimal.Decimal:
-			return l.Mul(r), nil
+		case *apd.Decimal:
+			res := new(apd.Decimal)
+			_, err := sql.DecimalCtx.Mul(res, l, r)
+			return res, err
 		}
 	}
 
@@ -704,7 +977,7 @@ func (e *UnaryMinus) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 		return nil, nil
 	}
 
-	if !types.IsNumber(e.Child.Type()) {
+	if !types.IsNumber(e.Child.Type(ctx)) {
 		child, _, err = types.InternalDecimalType.Convert(ctx, child)
 		if err != nil {
 			if !sql.ErrTruncatedIncorrect.Is(err) {
@@ -728,7 +1001,8 @@ func (e *UnaryMinus) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 	case int64:
 		if n == math.MinInt64 {
 			if _, ok := e.Child.(*Literal); ok {
-				return decimal.NewFromInt(n).Neg(), nil
+				dec := types.DecimalFromInt64(n)
+				return dec.Neg(dec), nil
 			}
 			return nil, sql.ErrValueOutOfRange.New("BIGINT", fmt.Sprintf("%d", n))
 		}
@@ -743,8 +1017,9 @@ func (e *UnaryMinus) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 		return -int32(n), nil
 	case uint64:
 		return -int64(n), nil
-	case decimal.Decimal:
-		return n.Neg(), nil
+	case *apd.Decimal:
+		res := new(apd.Decimal)
+		return res.Neg(n), nil
 	case string:
 		// try getting int out of string value
 		i, iErr := strconv.ParseInt(n, 10, 64)
@@ -764,8 +1039,8 @@ func (e *UnaryMinus) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 }
 
 // Type implements the sql.Expression interface.
-func (e *UnaryMinus) Type() sql.Type {
-	typ := e.Child.Type()
+func (e *UnaryMinus) Type(ctx *sql.Context) sql.Type {
+	typ := e.Child.Type(ctx)
 	switch typ {
 	case types.Int8, types.Int16, types.Int32:
 		typ = types.Int64
@@ -803,7 +1078,7 @@ func (e *UnaryMinus) String() string {
 }
 
 // WithChildren implements the Expression interface.
-func (e *UnaryMinus) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (e *UnaryMinus) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 1 {
 		return nil, sql.ErrInvalidChildrenNumber.New(e, len(children), 1)
 	}

@@ -26,8 +26,11 @@ type ForeignKeyHandler struct {
 	Table        sql.ForeignKeyTable
 	Sch          sql.Schema
 	OriginalNode sql.Node
-	Editor       *ForeignKeyEditor
-	AllUpdaters  []sql.ForeignKeyEditor
+	// Editor describes the foreign key graph. The handler holds no table editors: each execution opens one for every
+	// table in Tables, which is indexed by ForeignKeyEditor.Slot and is nil for slots the graph doesn't use.
+	Editor                     *ForeignKeyEditor
+	Tables                     []sql.ForeignKeyTable
+	CheckReferencesAfterInsert bool // allows a duplicate-key error to take precedence over FK validation
 }
 
 func (n *ForeignKeyHandler) Underlying() sql.Table {
@@ -41,10 +44,6 @@ var _ sql.InsertableTable = (*ForeignKeyHandler)(nil)
 var _ sql.ReplaceableTable = (*ForeignKeyHandler)(nil)
 var _ sql.UpdatableTable = (*ForeignKeyHandler)(nil)
 var _ sql.DeletableTable = (*ForeignKeyHandler)(nil)
-var _ sql.TableEditor = (*ForeignKeyHandler)(nil)
-var _ sql.RowInserter = (*ForeignKeyHandler)(nil)
-var _ sql.RowUpdater = (*ForeignKeyHandler)(nil)
-var _ sql.RowDeleter = (*ForeignKeyHandler)(nil)
 var _ sql.TableWrapper = (*ForeignKeyHandler)(nil)
 
 // Resolved implements the interface sql.Node.
@@ -57,13 +56,13 @@ func (n *ForeignKeyHandler) String() string {
 	return n.OriginalNode.String()
 }
 
-func (n *ForeignKeyHandler) DebugString() string {
-	return sql.DebugString(n.OriginalNode)
+func (n *ForeignKeyHandler) DebugString(ctx *sql.Context) string {
+	return sql.DebugString(ctx, n.OriginalNode)
 }
 
 // Schema implements the interface sql.Node.
-func (n *ForeignKeyHandler) Schema() sql.Schema {
-	return n.OriginalNode.Schema()
+func (n *ForeignKeyHandler) Schema(ctx *sql.Context) sql.Schema {
+	return n.OriginalNode.Schema(ctx)
 }
 
 func (n *ForeignKeyHandler) IsReadOnly() bool {
@@ -86,7 +85,7 @@ func (n *ForeignKeyHandler) Children() []sql.Node {
 }
 
 // WithChildren implements the interface sql.Node.
-func (n *ForeignKeyHandler) WithChildren(children ...sql.Node) (sql.Node, error) {
+func (n *ForeignKeyHandler) WithChildren(ctx *sql.Context, children ...sql.Node) (sql.Node, error) {
 	if len(children) != 1 {
 		return nil, sql.ErrInvalidChildrenNumber.New(n, len(children), 1)
 	}
@@ -124,36 +123,68 @@ func (n *ForeignKeyHandler) PartitionRows(ctx *sql.Context, partition sql.Partit
 }
 
 // Inserter implements the interface sql.InsertableTable.
-func (n *ForeignKeyHandler) Inserter(context *sql.Context) sql.RowInserter {
-	return n
+func (n *ForeignKeyHandler) Inserter(ctx *sql.Context) sql.RowInserter {
+	return n.open(ctx)
 }
 
 // Replacer implements the interface sql.ReplaceableTable.
 func (n *ForeignKeyHandler) Replacer(ctx *sql.Context) sql.RowReplacer {
-	return n
+	return n.open(ctx)
 }
 
 // Updater implements the interface sql.UpdatableTable.
 func (n *ForeignKeyHandler) Updater(ctx *sql.Context) sql.RowUpdater {
-	return n
+	return n.open(ctx)
 }
 
 // Deleter implements the interface sql.DeletableTable.
-func (n *ForeignKeyHandler) Deleter(context *sql.Context) sql.RowDeleter {
-	return n
+func (n *ForeignKeyHandler) Deleter(ctx *sql.Context) sql.RowDeleter {
+	return n.open(ctx)
 }
 
+// open opens an editor for each of Tables and returns the editor that runs this handler's foreign key graph through
+// them. Closing it closes them.
+func (n *ForeignKeyHandler) open(ctx *sql.Context) *ForeignKeyHandlerEditor {
+	bySlot := make([]sql.ForeignKeyEditor, len(n.Tables))
+	editors := make([]sql.ForeignKeyEditor, 0, len(n.Tables))
+	for i, tbl := range n.Tables {
+		if tbl != nil {
+			bySlot[i] = tbl.GetForeignKeyEditor(ctx)
+			editors = append(editors, bySlot[i])
+		}
+	}
+	return &ForeignKeyHandlerEditor{
+		Handler: n,
+		editor:  n.Editor.Instantiate(bySlot),
+		editors: editors,
+	}
+}
+
+// ForeignKeyHandlerEditor is the editor for one execution of a ForeignKeyHandler. It owns an editor for each of the
+// handler's Tables, from when the handler hands it out until it's closed.
+type ForeignKeyHandlerEditor struct {
+	Handler *ForeignKeyHandler
+	editor  *ForeignKeyEditor
+	editors []sql.ForeignKeyEditor
+}
+
+var _ sql.TableEditor = (*ForeignKeyHandlerEditor)(nil)
+var _ sql.RowInserter = (*ForeignKeyHandlerEditor)(nil)
+var _ sql.RowUpdater = (*ForeignKeyHandlerEditor)(nil)
+var _ sql.RowDeleter = (*ForeignKeyHandlerEditor)(nil)
+var _ sql.RowReplacer = (*ForeignKeyHandlerEditor)(nil)
+
 // StatementBegin implements the interface sql.TableEditor.
-func (n *ForeignKeyHandler) StatementBegin(ctx *sql.Context) {
-	for _, updater := range n.AllUpdaters {
+func (e *ForeignKeyHandlerEditor) StatementBegin(ctx *sql.Context) {
+	for _, updater := range e.editors {
 		updater.StatementBegin(ctx)
 	}
 }
 
 // DiscardChanges implements the interface sql.TableEditor.
-func (n *ForeignKeyHandler) DiscardChanges(ctx *sql.Context, errorEncountered error) error {
+func (e *ForeignKeyHandlerEditor) DiscardChanges(ctx *sql.Context, errorEncountered error) error {
 	var err error
-	for _, updater := range n.AllUpdaters {
+	for _, updater := range e.editors {
 		nErr := updater.DiscardChanges(ctx, errorEncountered)
 		if err == nil {
 			err = nErr
@@ -163,9 +194,9 @@ func (n *ForeignKeyHandler) DiscardChanges(ctx *sql.Context, errorEncountered er
 }
 
 // StatementComplete implements the interface sql.TableEditor.
-func (n *ForeignKeyHandler) StatementComplete(ctx *sql.Context) error {
+func (e *ForeignKeyHandlerEditor) StatementComplete(ctx *sql.Context) error {
 	var err error
-	for _, updater := range n.AllUpdaters {
+	for _, updater := range e.editors {
 		nErr := updater.StatementComplete(ctx)
 		if err == nil {
 			err = nErr
@@ -175,29 +206,50 @@ func (n *ForeignKeyHandler) StatementComplete(ctx *sql.Context) error {
 }
 
 // Insert implements the interface sql.RowInserter.
-func (n *ForeignKeyHandler) Insert(ctx *sql.Context, row sql.Row) error {
-	for _, reference := range n.Editor.References {
-		if err := reference.CheckReference(ctx, row); err != nil {
-			return err
+func (e *ForeignKeyHandlerEditor) Insert(ctx *sql.Context, row sql.Row) error {
+	if !e.Handler.CheckReferencesAfterInsert {
+		for _, reference := range e.editor.References {
+			if err := reference.CheckReference(ctx, row); err != nil {
+				return err
+			}
 		}
 	}
-	return n.Editor.Editor.Insert(ctx, row)
+	if err := e.editor.Editor.Insert(ctx, row); err != nil {
+		return err
+	}
+	if e.Handler.CheckReferencesAfterInsert {
+		for _, reference := range e.editor.References {
+			if err := reference.CheckReference(ctx, row); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// HasUniqueKeyConflict implements sql.UniqueKeyConflictCheckingRowInserter.
+func (e *ForeignKeyHandlerEditor) HasUniqueKeyConflict(ctx *sql.Context, row sql.Row, columns []string) (bool, error) {
+	checker, ok := e.editor.Editor.(sql.UniqueKeyConflictCheckingRowInserter)
+	if !ok {
+		return false, nil
+	}
+	return checker.HasUniqueKeyConflict(ctx, row, columns)
 }
 
 // Update implements the interface sql.RowUpdater.
-func (n *ForeignKeyHandler) Update(ctx *sql.Context, old sql.Row, new sql.Row) error {
-	return n.Editor.Update(ctx, old, new, 1)
+func (e *ForeignKeyHandlerEditor) Update(ctx *sql.Context, old sql.Row, new sql.Row) error {
+	return e.editor.Update(ctx, old, new, 1)
 }
 
 // Delete implements the interface sql.RowDeleter.
-func (n *ForeignKeyHandler) Delete(ctx *sql.Context, row sql.Row) error {
-	return n.Editor.Delete(ctx, row, 1)
+func (e *ForeignKeyHandlerEditor) Delete(ctx *sql.Context, row sql.Row) error {
+	return e.editor.Delete(ctx, row, 1)
 }
 
 // Close implements the interface sql.Closer.
-func (n *ForeignKeyHandler) Close(ctx *sql.Context) error {
+func (e *ForeignKeyHandlerEditor) Close(ctx *sql.Context) error {
 	var err error
-	for _, updater := range n.AllUpdaters {
+	for _, updater := range e.editors {
 		nErr := updater.Close(ctx)
 		if err == nil {
 			err = nErr

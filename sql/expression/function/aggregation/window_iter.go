@@ -49,8 +49,8 @@ var _ sql.Disposable = (*WindowIter)(nil)
 
 // Close implements sql.RowIter
 func (i *WindowIter) Close(ctx *sql.Context) error {
-	i.Dispose()
-	var err error
+	i.Dispose(ctx)
+	err := i.iter.Close(ctx)
 	for _, p := range i.partitionIters {
 		e := p.Close(ctx)
 		if err == nil && e != nil {
@@ -61,9 +61,9 @@ func (i *WindowIter) Close(ctx *sql.Context) error {
 }
 
 // Dispose implements sql.Disposable
-func (i *WindowIter) Dispose() {
+func (i *WindowIter) Dispose(ctx *sql.Context) {
 	for _, p := range i.partitionIters {
-		p.Dispose()
+		p.Dispose(ctx)
 	}
 	return
 }

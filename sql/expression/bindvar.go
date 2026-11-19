@@ -36,10 +36,10 @@ func (bv *BindVar) Resolved() bool {
 }
 
 func (bv *BindVar) String() string {
-	return "BindVar(" + bv.Name + ")"
+	return ":" + bv.Name
 }
 
-func (bv *BindVar) Type() sql.Type {
+func (bv *BindVar) Type(ctx *sql.Context) sql.Type {
 	return bv.Typ
 }
 
@@ -48,7 +48,7 @@ func (bv *BindVar) CollationCoercibility(ctx *sql.Context) (collation sql.Collat
 	return bv.Typ.CollationCoercibility(ctx)
 }
 
-func (bv *BindVar) IsNullable() bool {
+func (bv *BindVar) IsNullable(ctx *sql.Context) bool {
 	return true
 }
 
@@ -60,7 +60,7 @@ func (bv *BindVar) Children() []sql.Expression {
 	return nil
 }
 
-func (bv *BindVar) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (bv *BindVar) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 0 {
 		return nil, sql.ErrInvalidChildrenNumber.New(bv, len(children), 0)
 

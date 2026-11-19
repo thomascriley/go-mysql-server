@@ -9,6 +9,7 @@ import (
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/expression"
 	"github.com/dolthub/go-mysql-server/sql/plan"
+	"github.com/dolthub/go-mysql-server/sql/stats"
 	"github.com/dolthub/go-mysql-server/sql/types"
 )
 
@@ -87,7 +88,7 @@ func TestPopulateFDs(t *testing.T) {
 			name: "max1Row",
 			in: &Max1Row{
 				relBase: &relBase{},
-				Child: newExprGroup(NewMemo(nil, nil, nil, nil, nil), 0, &TableScan{
+				Child: newExprGroup(sql.NewEmptyContext(), NewMemo(nil, nil, nil, nil, nil), 0, &TableScan{
 					sourceBase: &sourceBase{relBase: &relBase{}},
 					Table: plan.NewResolvedTable(
 						&dummyTable{
@@ -108,7 +109,7 @@ func TestPopulateFDs(t *testing.T) {
 			name: "values",
 			in: &Values{
 				sourceBase: &sourceBase{relBase: &relBase{}},
-				Table:      plan.NewValueDerivedTable(plan.NewValues([][]sql.Expression{{expression.NewLiteral(1, types.Int64)}}), "values").WithId(1).WithColumns(sql.NewColSet(1)).(*plan.ValueDerivedTable),
+				Table:      plan.NewValueDerivedTable(sql.NewEmptyContext(), plan.NewValues([][]sql.Expression{{expression.NewLiteral(1, types.Int64)}}), "values").WithId(1).WithColumns(sql.NewColSet(1)).(*plan.ValueDerivedTable),
 			},
 			all:     sql.NewColSet(1),
 			notNull: sql.NewColSet(1),
@@ -118,7 +119,7 @@ func TestPopulateFDs(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tt.in.SetGroup(&ExprGroup{First: tt.in, m: NewMemo(nil, nil, nil, nil, nil)})
-			props := newRelProps(tt.in)
+			props := newRelProps(sql.NewEmptyContext(), tt.in)
 			require.Equal(t, tt.all, props.fds.All())
 			require.Equal(t, tt.notNull, props.fds.NotNull())
 
@@ -167,7 +168,7 @@ func (t *dummyTable) GetIndexes(*sql.Context) ([]sql.Index, error) {
 	return []sql.Index{dummyIndex{cols: exprs}}, nil
 }
 
-func (t *dummyTable) PrimaryKeySchema() sql.PrimaryKeySchema {
+func (t *dummyTable) PrimaryKeySchema(ctx *sql.Context) sql.PrimaryKeySchema {
 	return t.schema
 }
 
@@ -181,7 +182,7 @@ func (*dummyTable) Insert(*sql.Context, sql.Row) error {
 	panic("not implemented")
 }
 
-func (t *dummyTable) Schema() sql.Schema { return t.schema.Schema }
+func (t *dummyTable) Schema(ctx *sql.Context) sql.Schema { return t.schema.Schema }
 
 func (t *dummyTable) Collation() sql.CollationID { return sql.Collation_Default }
 
@@ -245,11 +246,15 @@ func (dummyIndex) IndexType() string {
 	return "FAKE"
 }
 
+func (dummyIndex) CoversColumns([]string) bool {
+	return false
+}
+
 func (dummyIndex) IsGenerated() bool {
 	return false
 }
 
-func (i dummyIndex) ColumnExpressionTypes() []sql.ColumnExpressionType {
+func (i dummyIndex) ColumnExpressionTypes(ctx *sql.Context) []sql.ColumnExpressionType {
 	es := i.Expressions()
 	res := make([]sql.ColumnExpressionType, len(es))
 	for i := range es {
@@ -263,3 +268,29 @@ func (dummyIndex) PrefixLengths() []uint16 {
 }
 
 var _ sql.Index = dummyIndex{}
+
+// TestJoinOfTwoEmptyEstimatesIsEmpty pins the cardinality of a join whose
+// sides are both estimated at no rows, as a filtered read of a table without
+// statistics is. A zero distinct count used to make the selectivity +Inf and
+// the cardinality NaN, which converts to 0 on arm64 but to 1<<63 on amd64, so
+// the join was priced as enormous on one architecture only.
+func TestJoinOfTwoEmptyEstimatesIsEmpty(t *testing.T) {
+	ctx := sql.NewEmptyContext()
+	m := NewMemo(ctx, nil, nil, nil, nil)
+	empty := func() *ExprGroup {
+		return &ExprGroup{RelProps: &relProps{stat: &stats.Statistic{RowCnt: 0}}}
+	}
+	for _, op := range []plan.JoinType{plan.JoinTypeInner, plan.JoinTypeLeftOuter, plan.JoinTypeFullOuter} {
+		jb := &JoinBase{relBase: &relBase{}, Left: empty(), Right: empty(), Op: op}
+		var rel RelExpr
+		switch {
+		case op.IsLeftOuter():
+			rel = &LeftJoin{JoinBase: jb}
+		case op.IsFullOuter():
+			rel = &FullOuterJoin{JoinBase: jb}
+		default:
+			rel = &InnerJoin{JoinBase: jb}
+		}
+		require.Equal(t, uint64(0), m.statsForRel(ctx, rel).RowCount(), op.String())
+	}
+}

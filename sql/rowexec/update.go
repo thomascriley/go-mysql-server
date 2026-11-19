@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"strings"
 
+	go_errors "gopkg.in/src-d/go-errors.v1"
+
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/hash"
 	"github.com/dolthub/go-mysql-server/sql/plan"
@@ -38,6 +40,9 @@ type updateIter struct {
 func (u *updateIter) Next(ctx *sql.Context) (sql.Row, error) {
 	oldAndNewRow, err := u.childIter.Next(ctx)
 	if err != nil {
+		if go_errors.Is(err, sql.ErrRowEditCanceled) {
+			return u.Next(ctx)
+		}
 		return nil, err
 	}
 
@@ -89,23 +94,23 @@ func (u *updateIter) Next(ctx *sql.Context) (sql.Row, error) {
 	return oldAndNewRow, nil
 }
 
-// Applies the update expressions given to the row given, returning the new resultant row. In the case that ignore is
-// provided and there is a type conversion error, this function sets the value to the zero value as per the MySQL standard.
-// TODO: This can probably be combined with insertIter.handleOnDuplicateKeyUpdate or insertIter.applyUpdates
-func applyUpdateExpressionsWithIgnore(ctx *sql.Context, updateExprs *plan.UpdateExprs, tableSchema sql.Schema, row sql.Row, ignore bool) (sql.Row, error) {
+// mysqlUpdateExpressionApplier implements MySQL's sequential UPDATE assignments.
+type mysqlUpdateExpressionApplier struct{}
+
+var _ sql.UpdateExpressionApplier = mysqlUpdateExpressionApplier{}
+
+// ApplyRowUpdate evaluates explicit assignments sequentially, recovers conversion
+// errors for IGNORE, and then applies derived updates when the row changed.
+func (mysqlUpdateExpressionApplier) ApplyRowUpdate(ctx *sql.Context, updateExprs *sql.UpdateExprs, tableSchema sql.Schema, row sql.Row, ignore bool) (sql.Row, error) {
 	oldRow := row
 	for _, updateExpr := range updateExprs.ExplicitUpdateExprs() {
 		val, err := updateExpr.Eval(ctx, row)
 		if err != nil {
 			var wtce sql.WrappedTypeConversionError
-			isTypeConversionError := errors.As(err, &wtce)
-			if !isTypeConversionError || !ignore {
+			if !ignore || !errors.As(err, &wtce) {
 				return nil, err
 			}
-
-			cpy := row.Copy()
-			cpy[wtce.OffendingIdx] = wtce.OffendingVal // Needed for strings
-			val = convertDataAndWarn(ctx, tableSchema, cpy, wtce.OffendingIdx, wtce.Err)
+			val = convertDataAndWarn(ctx, tableSchema, row.Copy(), wtce.OffendingIdx, wtce.OffendingVal, wtce.Err)
 		}
 		var ok bool
 		row, ok = val.(sql.Row)
@@ -209,12 +214,12 @@ type updateJoinIter struct {
 	updateSourceIter sql.RowIter
 	// TODO: naming this joinNode is confusing. It's not always a join node because it could be wrapped inside another
 	//  node
-	joinNode    sql.Node
-	updaters    map[string]sql.RowUpdater
-	caches      map[string]sql.KeyValueCache
-	disposals   map[string]sql.DisposeFunc
-	accumulator *updateJoinRowHandler
-	joinSchema  sql.Schema
+	joinNode      sql.Node
+	updateTargets map[string]sql.Node
+	caches        map[string]sql.KeyValueCache
+	disposals     map[string]sql.DisposeFunc
+	accumulator   *updateJoinRowHandler
+	joinSchema    sql.Schema
 }
 
 var _ sql.RowIter = (*updateJoinIter)(nil)
@@ -230,8 +235,10 @@ func (u *updateJoinIter) Next(ctx *sql.Context) (sql.Row, error) {
 
 		tableToOldRowMap := plan.SplitRowIntoTableRowMap(oldJoinRow, u.joinSchema)
 		tableToNewRowMap := plan.SplitRowIntoTableRowMap(newJoinRow, u.joinSchema)
+		// RETURNING needs the first match for each target, even if its values do not change.
+		returnUnchangedRow := false
 
-		for tableName, _ := range u.updaters {
+		for tableName := range u.updateTargets {
 			tableName = strings.ToLower(tableName)
 			oldTableRow := tableToOldRowMap[tableName]
 
@@ -259,6 +266,10 @@ func (u *updateJoinIter) Next(ctx *sql.Context) (sql.Row, error) {
 			_, err = cache.Get(hash)
 			if errors.Is(err, sql.ErrKeyNotFound) {
 				cache.Put(hash, struct{}{})
+				// No accumulator means RETURNING needs row data instead of an affected-row count.
+				if u.accumulator == nil {
+					returnUnchangedRow = true
+				}
 
 				// updateJoin counts matched rows from join output, unless a RETURNING clause
 				// is in use, in which case there will not be an accumulator assigned, since we
@@ -282,9 +293,10 @@ func (u *updateJoinIter) Next(ctx *sql.Context) (sql.Row, error) {
 		if err != nil {
 			return nil, err
 		}
-		if !equals {
-			return append(oldJoinRow, newJoinRow...), nil
+		if equals && !returnUnchangedRow {
+			continue
 		}
+		return append(oldJoinRow, newJoinRow...), nil
 	}
 }
 
@@ -386,7 +398,7 @@ func (u *updateJoinIter) getOrCreateCache(ctx *sql.Context, tableName string) sq
 		return potential
 	}
 
-	cache, disposal := ctx.Memory.NewHistoryCache()
+	cache, disposal := ctx.Memory.NewHistoryCache(ctx)
 	u.caches[tableName] = cache
 	u.disposals[tableName] = disposal
 

@@ -30,7 +30,7 @@ import (
 // BenchmarkRegexpInStr-14    	     100	  97313270 ns/op
 // BenchmarkRegexpInStr-14    	   10000	   1001064 ns/op
 func BenchmarkRegexpInStr(b *testing.B) {
-	ctx := sql.NewEmptyContext()
+	ctx := newRegexpTestContext()
 	data := make([]sql.Row, 100)
 	for i := range data {
 		data[i] = sql.Row{fmt.Sprintf("test%d", i)}
@@ -38,6 +38,7 @@ func BenchmarkRegexpInStr(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		f, err := NewRegexpInstr(
+			ctx,
 			expression.NewGetField(0, types.LongText, "text", false),
 			expression.NewLiteral("^test[0-9]$", types.LongText),
 		)
@@ -49,6 +50,6 @@ func BenchmarkRegexpInStr(b *testing.B) {
 			total += int(res.(int32))
 		}
 		require.Equal(b, 10, total)
-		f.(*RegexpInstr).Dispose()
+		f.(*RegexpInstr).Dispose(ctx)
 	}
 }

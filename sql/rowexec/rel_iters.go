@@ -16,6 +16,7 @@ package rowexec
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 
@@ -29,11 +30,21 @@ import (
 	"github.com/dolthub/go-mysql-server/sql/types"
 )
 
+const (
+	// MissingNoDateInSQLModeWarningMessage is thrown when users remove NO_ZERO_IN_DATE from SQL_MODE.
+	// The Golang Time library does not properly support 0 month and 0 day.
+	// Users are still able to remove the mode, but it will still behave as if the mode is enabled.
+	MissingNoDateInSQLModeWarningMessage = "Removing NO_ZERO_IN_DATE mode is not supported. " +
+		"DATEs with zero month or zero day will be treated as if NO_ZERO_IN_DATE is enabled."
+	MissingStrictModeWarningMessage = "'NO_ZERO_DATE', 'NO_ZERO_IN_DATE' and 'ERROR_FOR_DIVISION_BY_ZERO' sql modes should be used with strict mode. " +
+		"They will be merged with strict mode in a future release."
+)
+
 // windowToIter transforms a plan.Window into a series
 // of aggregation.WindowPartitionIter and a list of output projection indexes
 // for each window partition.
 // TODO: make partition ordering deterministic
-func windowToIter(w *plan.Window) ([]*aggregation.WindowPartitionIter, [][]int, error) {
+func windowToIter(ctx *sql.Context, w *plan.Window) ([]*aggregation.WindowPartitionIter, [][]int, error) {
 	partIdToOutputIdxs := make(map[uint64][]int, 0)
 	partIdToBlock := make(map[uint64]*aggregation.WindowPartition, 0)
 	var window *sql.WindowDefinition
@@ -48,14 +59,14 @@ func windowToIter(w *plan.Window) ([]*aggregation.WindowPartitionIter, [][]int, 
 		switch e := expr.(type) {
 		case sql.Aggregation:
 			window = e.Window()
-			fn, err = e.NewWindowFunction()
+			fn, err = e.NewWindowFunction(ctx)
 		case sql.WindowAggregation:
 			window = e.Window()
-			fn, err = e.NewWindowFunction()
+			fn, err = e.NewWindowFunction(ctx)
 		default:
 			// non window aggregates resolve to LastAgg with empty over clause
 			window = sql.NewWindowDefinition(nil, nil, nil, "", "")
-			fn, err = aggregation.NewLast(e).NewWindowFunction()
+			fn, err = aggregation.NewLast(e).NewWindowFunction(ctx)
 		}
 		if err != nil {
 			return nil, nil, err
@@ -101,6 +112,32 @@ type offsetIter struct {
 	skip      int64
 }
 
+var _ sql.ValueRowWriter = (*offsetIter)(nil)
+
+// WriteNextValueRow implements the sql.ValueRowWriter interface.
+func (i *offsetIter) WriteNextValueRow(ctx *sql.Context, row sql.ValueRow) error {
+	childWriter := i.childIter.(sql.ValueRowWriter)
+	for i.skip > 0 {
+		err := childWriter.WriteNextValueRow(ctx, row)
+		if err != nil {
+			return err
+		}
+		i.skip--
+	}
+	return childWriter.WriteNextValueRow(ctx, row)
+}
+
+// IsValueRowWriter implements the sql.ValueRowWriter interface.
+func (i *offsetIter) IsValueRowWriter(ctx *sql.Context) bool {
+	childWriter, ok := i.childIter.(sql.ValueRowWriter)
+	return ok && childWriter.IsValueRowWriter(ctx)
+}
+
+// Columns implements the sql.ValueRowWriter interface.
+func (i *offsetIter) Columns() sql.ColSet {
+	return i.childIter.(sql.ValueRowWriter).Columns()
+}
+
 func (i *offsetIter) Next(ctx *sql.Context) (sql.Row, error) {
 	if i.skip > 0 {
 		for i.skip > 0 {
@@ -132,6 +169,45 @@ type ProjectIter struct {
 	projs          []sql.Expression
 	canDefer       bool
 	hasNestedIters bool
+	childValueRow  sql.ValueRow
+}
+
+var _ sql.RowIter = &ProjectIter{}
+var _ sql.ValueRowIter = &ProjectIter{}
+
+func NewProjectIter(ctx *sql.Context, projections []sql.Expression, childIter sql.RowIter, canDefer bool, hasNestedIters bool) *ProjectIter {
+	iter := &ProjectIter{
+		projs:          projections,
+		canDefer:       canDefer,
+		hasNestedIters: hasNestedIters,
+		childIter:      childIter,
+	}
+	if childValueRowWriter, ok := childIter.(sql.ValueRowWriter); ok && childValueRowWriter.IsValueRowWriter(ctx) {
+		iter.childValueRow = make(sql.ValueRow, childValueRowWriter.Columns().Max()+1)
+	}
+	return iter
+}
+
+func (i *ProjectIter) NextValueRow(ctx *sql.Context) (sql.ValueRow, error) {
+	childValueRowWriter := i.childIter.(sql.ValueRowWriter)
+	err := childValueRowWriter.WriteNextValueRow(ctx, i.childValueRow)
+	if err != nil {
+		return nil, err
+	}
+	return ProjectValueRow(ctx, i.projs, i.childValueRow)
+}
+
+func (i *ProjectIter) IsValueRowIter(ctx *sql.Context) bool {
+	if i.hasNestedIters {
+		return false
+	}
+	for _, proj := range i.projs {
+		if _, ok := proj.(sql.ValueExpression); !ok {
+			return false
+		}
+	}
+	childValueRowWriter, ok := i.childIter.(sql.ValueRowWriter)
+	return ok && childValueRowWriter.IsValueRowWriter(ctx)
 }
 
 type nestedIterState struct {
@@ -214,7 +290,7 @@ func (i *ProjectIter) ProjectRowWithNestedIters(
 	var rowIterEvaluators []*RowIterEvaluator
 	newProjs := make([]sql.Expression, len(i.projs))
 	for i, proj := range i.projs {
-		p, _, err := transform.Expr(proj, func(e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
+		p, _, err := transform.Expr(ctx, proj, func(ctx *sql.Context, e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
 			if rie, ok := e.(sql.RowIterExpression); ok && rie.ReturnsRowIter() {
 				ri, err := rie.EvalRowIter(ctx, row)
 				if err != nil {
@@ -223,7 +299,7 @@ func (i *ProjectIter) ProjectRowWithNestedIters(
 
 				evaluator := &RowIterEvaluator{
 					iter: ri,
-					typ:  rie.Type(),
+					typ:  rie.Type(ctx),
 				}
 				rowIterEvaluators = append(rowIterEvaluators, evaluator)
 				return evaluator, transform.NewTree, nil
@@ -262,11 +338,11 @@ func (r RowIterEvaluator) String() string {
 	return "RowIterEvaluator"
 }
 
-func (r RowIterEvaluator) Type() sql.Type {
+func (r RowIterEvaluator) Type(ctx *sql.Context) sql.Type {
 	return r.typ
 }
 
-func (r RowIterEvaluator) IsNullable() bool {
+func (r RowIterEvaluator) IsNullable(ctx *sql.Context) bool {
 	return true
 }
 
@@ -292,7 +368,7 @@ func (r RowIterEvaluator) Children() []sql.Expression {
 	return nil
 }
 
-func (r RowIterEvaluator) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (r RowIterEvaluator) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 0 {
 		return nil, sql.ErrInvalidChildrenNumber.New(r, len(children), 0)
 	}
@@ -330,6 +406,40 @@ func ProjectRow(
 			return nil, err
 		}
 		field = normalizeNegativeZeros(field)
+		fields[index] = field
+	}
+	return fields, nil
+}
+
+func ProjectValueRow(
+	ctx *sql.Context,
+	projections []sql.Expression,
+	row sql.ValueRow,
+) (sql.ValueRow, error) {
+	var fields = make(sql.ValueRow, len(projections))
+	var secondPass []int
+	for i, expr := range projections {
+		valueExpr := expr.(sql.ValueExpression)
+		// Default values that are expressions may reference other fields, thus they must evaluate after all other exprs.
+		// Also default expressions may not refer to other columns that come after them if they also have a default expr.
+		// This ensures that all columns referenced by expressions will have already been evaluated.
+		// Since literals do not reference other columns, they're evaluated on the first pass.
+		defaultVal, isDefaultVal := defaultValFromProjectExpr(expr)
+		if isDefaultVal && !defaultVal.IsLiteral() {
+			secondPass = append(secondPass, i)
+			continue
+		}
+		field, fErr := valueExpr.EvalValue(ctx, row)
+		if fErr != nil {
+			return nil, fErr
+		}
+		fields[i] = field
+	}
+	for _, index := range secondPass {
+		field, err := projections[index].(sql.ValueExpression).EvalValue(ctx, fields)
+		if err != nil {
+			return nil, err
+		}
 		fields[index] = field
 	}
 	return fields, nil
@@ -392,7 +502,7 @@ func setSystemVar(ctx *sql.Context, sysVar *expression.SystemVar, right sql.Expr
 	if err != nil {
 		return err
 	}
-	err = validateSystemVariableValue(sysVar.Name, val)
+	err = validateSystemVariableValue(ctx, sysVar.Name, val)
 	if err != nil {
 		return err
 	}
@@ -468,7 +578,7 @@ func setSystemVar(ctx *sql.Context, sysVar *expression.SystemVar, right sql.Expr
 	return nil
 }
 
-func validateSystemVariableValue(sysVarName string, val interface{}) error {
+func validateSystemVariableValue(ctx *sql.Context, sysVarName string, val any) error {
 	switch strings.ToLower(sysVarName) {
 	case "time_zone":
 		valStr, ok := val.(string)
@@ -477,6 +587,42 @@ func validateSystemVariableValue(sysVarName string, val interface{}) error {
 		}
 		if !sql.ValidTimeZone(valStr) {
 			return sql.ErrInvalidTimeZone.New(valStr)
+		}
+	case "sql_mode":
+		switch v := val.(type) {
+		case uint64:
+			// If the assigned SQL_MODE contains any one of these "strict" modes, it should contain every one of
+			// the strict modes. Throw a warning if any of them are missing.
+			hasStrictTransTables := v&sql.MODE_STRICT_TRANS_TABLES != 0
+			hasStrictAllTables := v&sql.MODE_STRICT_ALL_TABLES != 0
+			hasStrict := hasStrictTransTables || hasStrictAllTables
+			hasErrorForDivisionByZero := v&sql.MODE_ERROR_FOR_DIVISION_BY_ZERO != 0
+			hasNoZeroDate := v&sql.MODE_NO_ZERO_DATE != 0
+			hasNoZeroInDate := v&sql.MODE_NO_ZERO_IN_DATE != 0
+			if !hasNoZeroInDate {
+				ctx.Warn(3135, MissingNoDateInSQLModeWarningMessage)
+			}
+			if (hasStrict || hasErrorForDivisionByZero || hasNoZeroDate || hasNoZeroInDate) &&
+				!(hasStrict && hasErrorForDivisionByZero && hasNoZeroDate && hasNoZeroInDate) {
+				ctx.Warn(3135, MissingStrictModeWarningMessage)
+			}
+		case string:
+			v = strings.ToUpper(v)
+			// If the assigned SQL_MODE contains any one of these "strict" modes, it should contain every one of
+			// the strict modes. Throw a warning if any of them are missing.
+			hasStrictTransTables := strings.Contains(v, sql.STRICT_TRANS_TABLES)
+			hasStrictAllTables := strings.Contains(v, sql.STRICT_ALL_TABLES)
+			hasStrict := hasStrictTransTables || hasStrictAllTables
+			hasErrorForDivisionByZero := strings.Contains(v, sql.ERROR_FOR_DIVISION_BY_ZERO)
+			hasNoZeroDate := strings.Contains(v, sql.NO_ZERO_DATE)
+			hasNoZeroInDate := strings.Contains(v, sql.NO_ZERO_IN_DATE)
+			if !hasNoZeroInDate {
+				ctx.Warn(3135, MissingNoDateInSQLModeWarningMessage)
+			}
+			if (hasStrict || hasErrorForDivisionByZero || hasNoZeroDate || hasNoZeroInDate) &&
+				!(hasStrict && hasErrorForDivisionByZero && hasNoZeroDate && hasNoZeroInDate) {
+				ctx.Warn(3135, MissingStrictModeWarningMessage)
+			}
 		}
 	}
 	return nil
@@ -572,6 +718,8 @@ type recursiveCteIter struct {
 	cycle int
 	// true if UNION, false if UNION ALL
 	deduplicate bool
+	// output schema inherited from the non-recursive term
+	schema sql.Schema
 }
 
 var _ sql.RowIter = (*recursiveCteIter)(nil)
@@ -606,6 +754,10 @@ func (r *recursiveCteIter) Next(ctx *sql.Context) (sql.Row, error) {
 		} else if err != nil {
 			return nil, err
 		}
+		row, err = r.convertRow(ctx, row)
+		if err != nil {
+			return nil, err
+		}
 
 		var key uint64
 		if r.deduplicate {
@@ -616,12 +768,27 @@ func (r *recursiveCteIter) Next(ctx *sql.Context) (sql.Row, error) {
 			}
 		}
 		r.store(row, key)
-		if err != nil {
-			return nil, err
-		}
 		break
 	}
 	return row, nil
+}
+
+// convertRow coerces recursive results to the CTE's established column types.
+func (r *recursiveCteIter) convertRow(ctx *sql.Context, row sql.Row) (sql.Row, error) {
+	start := len(row) - len(r.schema)
+	if start < 0 {
+		return nil, fmt.Errorf("recursive CTE row has %d columns, expected at least %d", len(row), len(r.schema))
+	}
+	converted := make(sql.Row, len(row))
+	copy(converted, row[:start])
+	for i, column := range r.schema {
+		var err error
+		converted[start+i], _, err = column.Type.Convert(ctx, row[start+i])
+		if err != nil {
+			return nil, err
+		}
+	}
+	return converted, nil
 }
 
 // store saves a row to the [temp] buffer, and hashes if [deduplicated] = true

@@ -17,11 +17,11 @@ package queries
 import (
 	"time"
 
+	"github.com/dolthub/vitess/go/mysql"
+
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/plan"
 	"github.com/dolthub/go-mysql-server/sql/types"
-
-	"github.com/dolthub/vitess/go/mysql"
 )
 
 var UpdateWriteQueryTests = []WriteQueryTest{
@@ -56,6 +56,7 @@ var UpdateWriteQueryTests = []WriteQueryTest{
 		ExpectedSelect:      []sql.Row{{int64(1), "updated"}, {int64(2), "updated"}, {int64(3), "updated"}},
 	},
 	{
+		Dialect:             "mysql", // The second assignment reads the updated f32 value.
 		WriteQuery:          "UPDATE floattable SET f32 = f32 + f32, f64 = f32 * f64 WHERE i = 2;",
 		ExpectedWriteResult: []sql.Row{{NewUpdateResult(1, 1)}},
 		SelectQuery:         "SELECT * FROM floattable WHERE i = 2;",
@@ -159,7 +160,7 @@ var UpdateWriteQueryTests = []WriteQueryTest{
 	},
 	{
 		SkipServerEngine:    true, // datetime returned is non-zero over the wire
-		WriteQuery:          "UPDATE typestable SET da = '0000-00-00', ti = '0000-00-00 00:00:00';",
+		WriteQuery:          "UPDATE typestable SET da = '0000-01-01', ti = '1970-01-01 00:00:01';",
 		ExpectedWriteResult: []sql.Row{{NewUpdateResult(1, 1)}},
 		SelectQuery:         "SELECT * FROM typestable;",
 		ExpectedSelect: []sql.Row{{
@@ -174,8 +175,8 @@ var UpdateWriteQueryTests = []WriteQueryTest{
 			uint64(9),
 			float32(10),
 			float64(11),
-			types.Timestamp.Zero(),
-			types.Date.Zero(),
+			time.Date(1970, 1, 1, 0, 0, 1, 0, time.UTC),
+			time.Date(0, 1, 1, 0, 0, 0, 0, time.UTC),
 			"fourteen",
 			0,
 			nil,
@@ -472,207 +473,22 @@ var UpdateWriteQueryTests = []WriteQueryTest{
 
 var UpdateScriptTests = []ScriptTest{
 	{
-		Dialect: "mysql",
-		Name:    "UPDATE join – single table, with FK constraint",
+		Name: "empty table update",
 		SetUpScript: []string{
-			"CREATE TABLE customers (id INT PRIMARY KEY, name TEXT);",
-			"CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT, amount INT, FOREIGN KEY (customer_id) REFERENCES customers(id));",
-			"INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob');",
-			"INSERT INTO orders VALUES (101, 1, 50), (102, 2, 75);",
+			"create table t (i int primary key)",
+			"insert into t values (1), (2), (3)",
 		},
 		Assertions: []ScriptTestAssertion{
 			{
-				Query:       "UPDATE orders o JOIN customers c ON o.customer_id = c.id SET o.customer_id = 123 where o.customer_id != 1;",
-				ExpectedErr: sql.ErrForeignKeyChildViolation,
+				Query:    "update t set i = 0 where false",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 0, InsertID: 0, Info: plan.UpdateInfo{Matched: 0}}}},
 			},
 			{
-				Query: "SELECT * FROM orders;",
+				Query: "select * from t",
 				Expected: []sql.Row{
-					{101, 1, 50}, {102, 2, 75},
-				},
-			},
-		},
-	},
-	{
-		Dialect: "mysql",
-		Name:    "UPDATE join – multiple tables, with FK constraint",
-		SetUpScript: []string{
-			"CREATE TABLE parent1 (id INT PRIMARY KEY);",
-			"CREATE TABLE parent2 (id INT PRIMARY KEY);",
-			"CREATE TABLE child1 (id INT PRIMARY KEY, p1_id INT, FOREIGN KEY (p1_id) REFERENCES parent1(id));",
-			"CREATE TABLE child2 (id INT PRIMARY KEY, p2_id INT, FOREIGN KEY (p2_id) REFERENCES parent2(id));",
-			"INSERT INTO parent1 VALUES (1), (3);",
-			"INSERT INTO parent2 VALUES (1), (3);",
-			"INSERT INTO child1 VALUES (10, 1);",
-			"INSERT INTO child2 VALUES (20, 1);",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: `UPDATE child1 c1
-						JOIN child2 c2 ON c1.id = 10 AND c2.id = 20
-						SET c1.p1_id = 999, c2.p2_id = 3;`,
-				ExpectedErr: sql.ErrForeignKeyChildViolation,
-			},
-			{
-				Query: `UPDATE child1 c1
-						JOIN child2 c2 ON c1.id = 10 AND c2.id = 20
-						SET c1.p1_id = 3, c2.p2_id = 999;`,
-				ExpectedErr: sql.ErrForeignKeyChildViolation,
-			},
-			{
-				Query:    "SELECT * FROM child1;",
-				Expected: []sql.Row{{10, 1}},
-			},
-			{
-				Query:    "SELECT * FROM child2;",
-				Expected: []sql.Row{{20, 1}},
-			},
-		},
-	},
-	{
-		Dialect: "mysql",
-		Name:    "UPDATE join – multiple tables, with trigger",
-		SetUpScript: []string{
-			"CREATE TABLE a (id INT PRIMARY KEY, x INT);",
-			"CREATE TABLE b (pk INT PRIMARY KEY, y INT);",
-			"CREATE TABLE logbook (entry TEXT);",
-			`CREATE TRIGGER trig_a AFTER UPDATE ON a FOR EACH ROW
-		 BEGIN
-		   INSERT INTO logbook VALUES ('a updated');
-		 END;`,
-			`CREATE TRIGGER trig_b AFTER UPDATE ON b FOR EACH ROW
-		 BEGIN
-		   INSERT INTO logbook VALUES ('b updated');
-		 END;`,
-			"INSERT INTO a VALUES (5, 100);",
-			"INSERT INTO b VALUES (6, 200);",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: `UPDATE a
-					JOIN b ON a.id = 5 AND b.pk = 6
-					SET a.x = 101, b.y = 201;`,
-			},
-			{
-				Query: "SELECT * FROM logbook ORDER BY entry;",
-				Expected: []sql.Row{
-					{"a updated"},
-					{"b updated"},
-				},
-			},
-		},
-	},
-	{
-		Dialect: "mysql",
-		Name:    "UPDATE join – multiple tables with triggers that reference row values",
-		SetUpScript: []string{
-			"create table customers (id int primary key, name text, tier text)",
-			"create table orders (order_id int primary key, customer_id int, status text)",
-			"create table trigger_log (msg text)",
-			`CREATE TRIGGER after_orders_update after update on orders for each row
-				begin
-					insert into trigger_log (msg) values(
-						concat('Order ', OLD.order_id, ' status changed from ', OLD.status, ' to ', NEW.status));
-				end;`,
-			`Create trigger after_customers_update after update on customers for each row
-					begin
-						insert into trigger_log (msg) values(
-							concat('Customer ', OLD.id, ' tier changed from ', OLD.tier, ' to ', NEW.tier));
-					end;`,
-			"insert into customers values(1, 'Alice', 'silver'), (2, 'Bob', 'gold');",
-			"insert into orders values (101, 1, 'pending'), (102, 2, 'pending');",
-			"update customers c join orders o on c.id = o.customer_id " +
-				"set c.tier = 'platinum', o.status = 'shipped' where o.status = 'pending'",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: "SELECT * FROM trigger_log order by msg;",
-				Expected: []sql.Row{
-					{"Customer 1 tier changed from silver to platinum"},
-					{"Customer 2 tier changed from gold to platinum"},
-					{"Order 101 status changed from pending to shipped"},
-					{"Order 102 status changed from pending to shipped"},
-				},
-			},
-		},
-	},
-	{
-		// https://github.com/dolthub/dolt/issues/9403
-		Dialect: "mysql",
-		Name:    "UPDATE join – multiple tables with same column names with triggers",
-		SetUpScript: []string{
-			"create table customers (id int primary key, name text, tier text)",
-			"create table orders (id int primary key, customer_id int, status text)",
-			"create table trigger_log (msg text)",
-			`CREATE TRIGGER after_orders_update after update on orders for each row
-				begin
-					insert into trigger_log (msg) values(
-						concat('Order ', OLD.id, ' status changed from ', OLD.status, ' to ', NEW.status));
-				end;`,
-			`Create trigger after_customers_update after update on customers for each row
-					begin
-						insert into trigger_log (msg) values(
-							concat('Customer ', OLD.id, ' tier changed from ', OLD.tier, ' to ', NEW.tier));
-					end;`,
-			"insert into customers values(1, 'Alice', 'silver'), (2, 'Bob', 'gold');",
-			"insert into orders values (101, 1, 'pending'), (102, 2, 'pending');",
-			"update customers c join orders o on c.id = o.customer_id " +
-				"set c.tier = 'platinum', o.status = 'shipped' where o.status = 'pending'",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: "SELECT * FROM trigger_log order by msg;",
-				Expected: []sql.Row{
-					{"Customer 1 tier changed from silver to platinum"},
-					{"Customer 2 tier changed from gold to platinum"},
-					{"Order 101 status changed from pending to shipped"},
-					{"Order 102 status changed from pending to shipped"},
-				},
-			},
-		},
-	},
-	{
-		Dialect: "mysql",
-		Name:    "UPDATE join - conflicting alias in Subquery Alias",
-		SetUpScript: []string{
-			"create table parent (id int primary key);",
-			"insert into parent values (1), (2), (3);",
-			"create table child (id int primary key, pid int, foreign key (pid) references parent(id), oid int);",
-			"insert into child values (1, 1, 0), (2, 2, 0), (3, 3, 0);",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: `
-update child t1
-left join 
-(
-    select
-        t1.id
-    from
-        child t1
-) sqa
-on
-    t1.id = sqa.id
-join
-    child t2
-set
-t1.oid = t2.pid;`,
-				Expected: []sql.Row{
-					{types.OkResult{
-						RowsAffected: 3,
-						Info: plan.UpdateInfo{
-							Matched: 3,
-							Updated: 3,
-						},
-					}},
-				},
-			},
-			{
-				Query: "select * from child;",
-				Expected: []sql.Row{
-					{1, 1, 1},
-					{2, 2, 1},
-					{3, 3, 1},
+					{1},
+					{2},
+					{3},
 				},
 			},
 		},
@@ -693,20 +509,266 @@ t1.oid = t2.pid;`,
 		},
 	},
 	{
-		// https://github.com/dolthub/dolt/issues/10385
-		Name:    "UPDATE JOIN - tables with capitalized names",
+		// This is a script test here because every table in the harness setup data is in all lowercase
+		Name:    "case insensitive update with insubqueries and update joins",
 		Dialect: "mysql",
 		SetUpScript: []string{
-			"create table Items(ItemID char(38) NOT NULL primary key, Version int)",
-			"insert into Items values ('1234', 1)",
-			"create table Items2(ItemID char(38) NOT NULL primary key, Version int)",
-			"insert into Items2 values ('1234', 2)",
-			"UPDATE Items INNER JOIN Items2 ON (Items.ItemID = Items2.ItemID) SET Items.Version = Items2.Version WHERE Items.Version != Items2.Version",
+			"create table MiXeDcAsE (i int primary key, j int)",
+			"insert into mixedcase values (1, 1);",
+			"insert into mixedcase values (2, 2);",
 		},
 		Assertions: []ScriptTestAssertion{
 			{
-				Query:    "select * from Items",
-				Expected: []sql.Row{{"1234", 2}},
+				Query: "update mixedcase set j = 999 where i in (select 1)",
+				Expected: []sql.Row{
+					{types.OkResult{
+						RowsAffected: 1,
+						Info: plan.UpdateInfo{
+							Matched: 1,
+							Updated: 1,
+						},
+					}},
+				},
+			},
+			{
+				Query: "select * from mixedcase;",
+				Expected: []sql.Row{
+					{1, 999},
+					{2, 2},
+				},
+			},
+			{
+				Query: " with cte(x) as (select 2) update mixedcase set j = 999 where i in (select x from cte)",
+				Expected: []sql.Row{
+					{types.OkResult{
+						RowsAffected: 1,
+						Info: plan.UpdateInfo{
+							Matched: 1,
+							Updated: 1,
+						},
+					}},
+				},
+			},
+			{
+				Query: "select * from mixedcase;",
+				Expected: []sql.Row{
+					{1, 999},
+					{2, 999},
+				},
+			},
+		},
+	},
+	{
+		// https://github.com/dolthub/doltgresql/issues/3092
+		Name:    "UPDATE assignment customer CASE",
+		Dialect: "mysql",
+		SetUpScript: []string{
+			"CREATE TABLE t_seq (a int, b int)",
+			"INSERT INTO t_seq VALUES (1, 0)",
+			"UPDATE t_seq SET a = 2, b = CASE WHEN a = 1 THEN 100 ELSE -1 END",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "SELECT a, b FROM t_seq",
+				Expected: []sql.Row{{2, -1}},
+			},
+		},
+	},
+	{
+		Name:    "UPDATE assignment reversed CASE",
+		Dialect: "mysql",
+		SetUpScript: []string{
+			"CREATE TABLE t_seq (a int, b int)",
+			"INSERT INTO t_seq VALUES (1, 0)",
+			"UPDATE t_seq SET b = CASE WHEN a = 1 THEN 100 ELSE -1 END, a = 2",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "SELECT a, b FROM t_seq",
+				Expected: []sql.Row{{2, 100}},
+			},
+		},
+	},
+	{
+		Name:    "UPDATE assignment swap",
+		Dialect: "mysql",
+		SetUpScript: []string{
+			"CREATE TABLE t_seq (a int, b int)",
+			"INSERT INTO t_seq VALUES (1, 0)",
+			"UPDATE t_seq SET a = b, b = a",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "SELECT a, b FROM t_seq",
+				Expected: []sql.Row{{0, 0}},
+			},
+		},
+	},
+	{
+		Name:    "UPDATE assignment reversed swap",
+		Dialect: "mysql",
+		SetUpScript: []string{
+			"CREATE TABLE t_seq (a int, b int)",
+			"INSERT INTO t_seq VALUES (1, 0)",
+			"UPDATE t_seq SET b = a, a = b",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "SELECT a, b FROM t_seq",
+				Expected: []sql.Row{{1, 1}},
+			},
+		},
+	},
+	{
+		Name:    "UPDATE assignment arithmetic chain",
+		Dialect: "mysql",
+		SetUpScript: []string{
+			"CREATE TABLE t_seq (a int, b int)",
+			"INSERT INTO t_seq VALUES (1, 0)",
+			"UPDATE t_seq SET a = a + 1, b = a + 10",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "SELECT a, b FROM t_seq",
+				Expected: []sql.Row{{2, 12}},
+			},
+		},
+	},
+	{
+		Name:    "UPDATE assignment NULL propagation",
+		Dialect: "mysql",
+		SetUpScript: []string{
+			"CREATE TABLE t_seq (a int, b int)",
+			"INSERT INTO t_seq VALUES (1, 0)",
+			"UPDATE t_seq SET a = NULL, b = CASE WHEN a IS NULL THEN 100 ELSE -1 END",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "SELECT a, b FROM t_seq",
+				Expected: []sql.Row{{nil, 100}},
+			},
+		},
+	},
+	{
+		Name:    "UPDATE assignment multiple rows",
+		Dialect: "mysql",
+		SetUpScript: []string{
+			"CREATE TABLE t_seq (a int, b int)",
+			"INSERT INTO t_seq VALUES (1, 0)",
+			"INSERT INTO t_seq VALUES (3, 9)",
+			"UPDATE t_seq SET a = a + 1, b = a",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "SELECT a, b FROM t_seq ORDER BY a",
+				Expected: []sql.Row{{2, 2}, {4, 4}},
+			},
+		},
+	},
+	{
+		Name:    "UPDATE assignment scalar correlated subquery",
+		Dialect: "mysql",
+		SetUpScript: []string{
+			"CREATE TABLE t_seq (a int, b int)",
+			"INSERT INTO t_seq VALUES (1, 0)",
+			"UPDATE t_seq SET a = 2, b = (SELECT a + 10)",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "SELECT a, b FROM t_seq",
+				Expected: []sql.Row{{2, 12}},
+			},
+		},
+	},
+	{
+		Name:    "UPDATE assignment WHERE subquery",
+		Dialect: "mysql",
+		SetUpScript: []string{
+			"CREATE TABLE t_seq (a int, b int)",
+			"INSERT INTO t_seq VALUES (1, 0)",
+			"CREATE TABLE src (x int PRIMARY KEY)",
+			"INSERT INTO src VALUES (1)",
+			"UPDATE t_seq SET a = 2, b = a WHERE a IN (SELECT x FROM src)",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "SELECT a, b FROM t_seq",
+				Expected: []sql.Row{{2, 2}},
+			},
+		},
+	},
+	{
+		Name:    "UPDATE assignment assignment conversion",
+		Dialect: "mysql",
+		SetUpScript: []string{
+			"CREATE TABLE t_seq (a int, b int)",
+			"INSERT INTO t_seq VALUES (1, 0)",
+			"UPDATE t_seq SET a = 1.6, b = a",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "SELECT a, b FROM t_seq",
+				Expected: []sql.Row{{2, 2}},
+			},
+		},
+	},
+	{
+		// An explicit decimal cast also preserves rounding when the server harness
+		// replaces literals with string parameters. The second assignment must
+		// observe the converted INT value, rather than the decimal source.
+		Name:    "UPDATE assignment conversion with decimal cast",
+		Dialect: "mysql",
+		SetUpScript: []string{
+			"CREATE TABLE t_seq (a int, b int)",
+			"INSERT INTO t_seq VALUES (1, 0)",
+			"UPDATE t_seq SET a = CAST('1.6' AS DECIMAL(2,1)), b = a",
+		},
+		Assertions: []ScriptTestAssertion{
+			{Query: "SELECT a, b FROM t_seq", Expected: []sql.Row{{2, 2}}},
+		},
+	},
+	{
+		Name:    "UPDATE assignment generated stored column",
+		Dialect: "mysql",
+		SetUpScript: []string{
+			"CREATE TABLE t_seq (a int, b int, c int GENERATED ALWAYS AS (a+b) STORED)",
+			"INSERT INTO t_seq (a,b) VALUES (1,0)",
+			"UPDATE t_seq SET a = 2, b = a",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "SELECT a,b,c FROM t_seq",
+				Expected: []sql.Row{{2, 2, 4}},
+			},
+		},
+	},
+	{
+		Name:    "UPDATE assignment repeated target",
+		Dialect: "mysql",
+		SetUpScript: []string{
+			"CREATE TABLE t_seq (a int, b int)",
+			"INSERT INTO t_seq VALUES (1, 0)",
+			"UPDATE t_seq SET a = a + 1, a = a + 10, b = a",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "SELECT a, b FROM t_seq",
+				Expected: []sql.Row{{12, 12}},
+			},
+		},
+	},
+	{
+		Name:    "UPDATE assignment IGNORE conversion",
+		Dialect: "mysql",
+		SetUpScript: []string{
+			"CREATE TABLE t_seq (a int, b int)",
+			"INSERT INTO t_seq VALUES (1, 0)",
+			"UPDATE IGNORE t_seq SET a = 'bad', b = a",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "SELECT a, b FROM t_seq",
+				Expected: []sql.Row{{0, 0}},
 			},
 		},
 	},
@@ -992,6 +1054,97 @@ var UpdateIgnoreScripts = []ScriptTest{
 			},
 		},
 	},
+	{
+		// https://github.com/dolthub/dolt/issues/12218
+		Name:    "UPDATE IGNORE truncates VARCHAR by character count for string, datetime, integer and binary values",
+		Dialect: "mysql",
+		SetUpScript: []string{
+			"CREATE TABLE v (b VARCHAR(4))",
+			"INSERT INTO v VALUES ('abcd')",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:                 "UPDATE IGNORE v SET b = 'éééééé'",
+				Expected:              []sql.Row{{NewUpdateResult(1, 1)}},
+				ExpectedWarning:       mysql.ERWarnDataTruncated,
+				ExpectedWarningsCount: 1,
+			},
+			{
+				Query:    "SELECT b, CHAR_LENGTH(b) FROM v",
+				Expected: []sql.Row{{"éééé", 4}},
+			},
+			{
+				Query:                 "UPDATE IGNORE v SET b = CAST('2020-01-01' AS DATETIME)",
+				Expected:              []sql.Row{{NewUpdateResult(1, 1)}},
+				ExpectedWarning:       mysql.ERWarnDataTruncated,
+				ExpectedWarningsCount: 1,
+			},
+			{
+				Query:    "SELECT b FROM v",
+				Expected: []sql.Row{{"2020"}},
+			},
+			{
+				Query:                 "UPDATE IGNORE v SET b = 123456",
+				Expected:              []sql.Row{{NewUpdateResult(1, 1)}},
+				ExpectedWarning:       mysql.ERWarnDataTruncated,
+				ExpectedWarningsCount: 1,
+			},
+			{
+				Query:    "SELECT b FROM v",
+				Expected: []sql.Row{{"1234"}},
+			},
+			{
+				Query:                 "UPDATE IGNORE v SET b = X'616263646566'",
+				Expected:              []sql.Row{{NewUpdateResult(1, 1)}},
+				ExpectedWarning:       mysql.ERWarnDataTruncated,
+				ExpectedWarningsCount: 1,
+			},
+			{
+				Query:    "SELECT b FROM v",
+				Expected: []sql.Row{{"abcd"}},
+			},
+		},
+	},
+	{
+		// https://github.com/dolthub/dolt/issues/12218
+		Name:    "UPDATE IGNORE reports each truncated column",
+		Dialect: "mysql",
+		SetUpScript: []string{
+			"CREATE TABLE u (a VARCHAR(2), b VARCHAR(2))",
+			"INSERT INTO u VALUES ('x', 'y')",
+			"CREATE TABLE m (id INT PRIMARY KEY, b VARCHAR(2))",
+			"INSERT INTO m VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:                 "UPDATE IGNORE u SET a = 'aaa', b = 'bbb'",
+				Expected:              []sql.Row{{NewUpdateResult(1, 1)}},
+				ExpectedWarning:       mysql.ERWarnDataTruncated,
+				ExpectedWarningsCount: 2,
+			},
+			{
+				Query:    "SELECT a, b FROM u",
+				Expected: []sql.Row{{"aa", "bb"}},
+			},
+			{
+				Query:                           "UPDATE IGNORE m SET b = 'xyz' WHERE id = 2",
+				Expected:                        []sql.Row{{NewUpdateResult(1, 1)}},
+				ExpectedWarning:                 mysql.ERWarnDataTruncated,
+				ExpectedWarningsCount:           1,
+				ExpectedWarningMessageSubstring: "Data truncated for column 'b'",
+			},
+			{
+				Query:                 "UPDATE IGNORE m SET b = 'xyz'",
+				Expected:              []sql.Row{{NewUpdateResult(3, 2)}},
+				ExpectedWarning:       mysql.ERWarnDataTruncated,
+				ExpectedWarningsCount: 3,
+			},
+			{
+				Query:    "SELECT id, b FROM m ORDER BY id",
+				Expected: []sql.Row{{1, "xy"}, {2, "xy"}, {3, "xy"}},
+			},
+		},
+	},
 }
 
 var UpdateErrorTests = []QueryErrorTest{
@@ -1101,7 +1254,7 @@ var OnUpdateExprScripts = []ScriptTest{
 	{
 		Name: "basic case",
 		SetUpScript: []string{
-			"create table t (i int, ts timestamp default 0 on update current_timestamp);",
+			"create table t (i int, ts timestamp default null on update current_timestamp);",
 			"insert into t(i) values (1), (2), (3);",
 		},
 		Assertions: []ScriptTestAssertion{
@@ -1110,7 +1263,7 @@ var OnUpdateExprScripts = []ScriptTest{
 				Expected: []sql.Row{
 					{"t", "CREATE TABLE `t` (\n" +
 						"  `i` int,\n" +
-						"  `ts` timestamp DEFAULT 0 ON UPDATE CURRENT_TIMESTAMP\n" +
+						"  `ts` timestamp DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP\n" +
 						") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"},
 				},
 			},
@@ -1118,9 +1271,9 @@ var OnUpdateExprScripts = []ScriptTest{
 				SkipResultCheckOnServerEngine: true,
 				Query:                         "select * from t order by i;",
 				Expected: []sql.Row{
-					{1, ZeroTime},
-					{2, ZeroTime},
-					{3, ZeroTime},
+					{1, nil},
+					{2, nil},
+					{3, nil},
 				},
 			},
 			{
@@ -1141,8 +1294,8 @@ var OnUpdateExprScripts = []ScriptTest{
 				SkipResultCheckOnServerEngine: true,
 				Query:                         "select * from t order by i;",
 				Expected: []sql.Row{
-					{2, ZeroTime},
-					{3, ZeroTime},
+					{2, nil},
+					{3, nil},
 					{10, Dec15_1_30},
 				},
 			},
@@ -1180,7 +1333,7 @@ var OnUpdateExprScripts = []ScriptTest{
 	{
 		Name: "precision 3",
 		SetUpScript: []string{
-			"create table t (i int, ts timestamp(3) default 0 on update current_timestamp(3));",
+			"create table t (i int, ts timestamp(3) default null on update current_timestamp(3));",
 			"insert into t(i) values (1), (2), (3);",
 		},
 		Assertions: []ScriptTestAssertion{
@@ -1189,7 +1342,7 @@ var OnUpdateExprScripts = []ScriptTest{
 				Expected: []sql.Row{
 					{"t", "CREATE TABLE `t` (\n" +
 						"  `i` int,\n" +
-						"  `ts` timestamp(3) DEFAULT 0 ON UPDATE CURRENT_TIMESTAMP(3)\n" +
+						"  `ts` timestamp(3) DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP(3)\n" +
 						") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"},
 				},
 			},
@@ -1197,9 +1350,9 @@ var OnUpdateExprScripts = []ScriptTest{
 				SkipResultCheckOnServerEngine: true,
 				Query:                         "select * from t order by i;",
 				Expected: []sql.Row{
-					{1, ZeroTime},
-					{2, ZeroTime},
-					{3, ZeroTime},
+					{1, nil},
+					{2, nil},
+					{3, nil},
 				},
 			},
 			{
@@ -1212,8 +1365,8 @@ var OnUpdateExprScripts = []ScriptTest{
 				SkipResultCheckOnServerEngine: true,
 				Query:                         "select * from t order by i;",
 				Expected: []sql.Row{
-					{2, ZeroTime},
-					{3, ZeroTime},
+					{2, nil},
+					{3, nil},
 					{10, Dec15_1_30},
 				},
 			},
@@ -1251,7 +1404,7 @@ var OnUpdateExprScripts = []ScriptTest{
 	{
 		Name: "precision 6",
 		SetUpScript: []string{
-			"create table t (i int, ts timestamp(6) default 0 on update current_timestamp(6));",
+			"create table t (i int, ts timestamp(6) default null on update current_timestamp(6));",
 			"insert into t(i) values (1), (2), (3);",
 		},
 		Assertions: []ScriptTestAssertion{
@@ -1260,7 +1413,7 @@ var OnUpdateExprScripts = []ScriptTest{
 				Expected: []sql.Row{
 					{"t", "CREATE TABLE `t` (\n" +
 						"  `i` int,\n" +
-						"  `ts` timestamp(6) DEFAULT 0 ON UPDATE CURRENT_TIMESTAMP(6)\n" +
+						"  `ts` timestamp(6) DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP(6)\n" +
 						") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"},
 				},
 			},
@@ -1268,9 +1421,9 @@ var OnUpdateExprScripts = []ScriptTest{
 				SkipResultCheckOnServerEngine: true,
 				Query:                         "select * from t order by i;",
 				Expected: []sql.Row{
-					{1, ZeroTime},
-					{2, ZeroTime},
-					{3, ZeroTime},
+					{1, nil},
+					{2, nil},
+					{3, nil},
 				},
 			},
 			{
@@ -1283,8 +1436,8 @@ var OnUpdateExprScripts = []ScriptTest{
 				SkipResultCheckOnServerEngine: true,
 				Query:                         "select * from t order by i;",
 				Expected: []sql.Row{
-					{2, ZeroTime},
-					{3, ZeroTime},
+					{2, nil},
+					{3, nil},
 					{10, Dec15_1_30},
 				},
 			},
@@ -1474,7 +1627,7 @@ var OnUpdateExprScripts = []ScriptTest{
 	{
 		Name: "multiple columns case",
 		SetUpScript: []string{
-			"create table t (i int primary key, ts timestamp default 0 on update current_timestamp, dt datetime default 0 on update current_timestamp);",
+			"create table t (i int primary key, ts timestamp default null on update current_timestamp, dt datetime default null on update current_timestamp);",
 			"insert into t(i) values (1), (2), (3);",
 		},
 		Assertions: []ScriptTestAssertion{
@@ -1483,8 +1636,8 @@ var OnUpdateExprScripts = []ScriptTest{
 				Expected: []sql.Row{
 					{"t", "CREATE TABLE `t` (\n" +
 						"  `i` int NOT NULL,\n" +
-						"  `ts` timestamp DEFAULT 0 ON UPDATE CURRENT_TIMESTAMP,\n" +
-						"  `dt` datetime DEFAULT 0 ON UPDATE CURRENT_TIMESTAMP,\n" +
+						"  `ts` timestamp DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,\n" +
+						"  `dt` datetime DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,\n" +
 						"  PRIMARY KEY (`i`)\n" +
 						") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"},
 				},
@@ -1493,9 +1646,9 @@ var OnUpdateExprScripts = []ScriptTest{
 				SkipResultCheckOnServerEngine: true,
 				Query:                         "select * from t order by i;",
 				Expected: []sql.Row{
-					{1, ZeroTime, ZeroTime},
-					{2, ZeroTime, ZeroTime},
-					{3, ZeroTime, ZeroTime},
+					{1, nil, nil},
+					{2, nil, nil},
+					{3, nil, nil},
 				},
 			},
 			{
@@ -1508,8 +1661,8 @@ var OnUpdateExprScripts = []ScriptTest{
 				SkipResultCheckOnServerEngine: true,
 				Query:                         "select * from t order by i;",
 				Expected: []sql.Row{
-					{2, ZeroTime, ZeroTime},
-					{3, ZeroTime, ZeroTime},
+					{2, nil, nil},
+					{3, nil, nil},
 					{10, Dec15_1_30, Dec15_1_30},
 				},
 			},
@@ -1524,8 +1677,144 @@ var OnUpdateExprScripts = []ScriptTest{
 				Query:                         "select * from t order by i;",
 				Expected: []sql.Row{
 					{2, Oct2Midnight, Dec15_1_30},
-					{3, ZeroTime, ZeroTime},
+					{3, nil, nil},
 					{10, Dec15_1_30, Dec15_1_30},
+				},
+			},
+		},
+	},
+	{
+		// https://github.com/dolthub/dolt/issues/11774
+		Name: "on update synonyms case",
+		SetUpScript: []string{
+			`create table t (
+				i int primary key,
+				ts1 timestamp default null on update now(),
+				ts2 timestamp(3) default null on update localtime(3),
+				ts3 datetime(6) default null on update localtimestamp(6),
+				ts4 timestamp(3) default null on update current_timestamp(3)
+			);`,
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query: "describe t;",
+				Expected: []sql.Row{
+					{"i", "int", "NO", "PRI", nil, ""},
+					{"ts1", "timestamp", "YES", "", "NULL", "on update CURRENT_TIMESTAMP"},
+					{"ts2", "timestamp(3)", "YES", "", "NULL", "on update CURRENT_TIMESTAMP(3)"},
+					{"ts3", "datetime(6)", "YES", "", "NULL", "on update CURRENT_TIMESTAMP(6)"},
+					{"ts4", "timestamp(3)", "YES", "", "NULL", "on update CURRENT_TIMESTAMP(3)"},
+				},
+			},
+			{
+				Query: "show columns from t;",
+				Expected: []sql.Row{
+					{"i", "int", "NO", "PRI", nil, ""},
+					{"ts1", "timestamp", "YES", "", "NULL", "on update CURRENT_TIMESTAMP"},
+					{"ts2", "timestamp(3)", "YES", "", "NULL", "on update CURRENT_TIMESTAMP(3)"},
+					{"ts3", "datetime(6)", "YES", "", "NULL", "on update CURRENT_TIMESTAMP(6)"},
+					{"ts4", "timestamp(3)", "YES", "", "NULL", "on update CURRENT_TIMESTAMP(3)"},
+				},
+			},
+			{
+				Query: "show full columns from t;",
+				Expected: []sql.Row{
+					{"i", "int", nil, "NO", "PRI", nil, "", "", ""},
+					{"ts1", "timestamp", nil, "YES", "", "NULL", "on update CURRENT_TIMESTAMP", "", ""},
+					{"ts2", "timestamp(3)", nil, "YES", "", "NULL", "on update CURRENT_TIMESTAMP(3)", "", ""},
+					{"ts3", "datetime(6)", nil, "YES", "", "NULL", "on update CURRENT_TIMESTAMP(6)", "", ""},
+					{"ts4", "timestamp(3)", nil, "YES", "", "NULL", "on update CURRENT_TIMESTAMP(3)", "", ""},
+				},
+			},
+			{
+				Query: "select column_name, extra from information_schema.columns where table_name = 't' order by ordinal_position;",
+				Expected: []sql.Row{
+					{"i", ""},
+					{"ts1", "on update CURRENT_TIMESTAMP"},
+					{"ts2", "on update CURRENT_TIMESTAMP(3)"},
+					{"ts3", "on update CURRENT_TIMESTAMP(6)"},
+					{"ts4", "on update CURRENT_TIMESTAMP(3)"},
+				},
+			},
+		},
+	},
+	{
+		Name: "dynamic extra column modifications",
+		SetUpScript: []string{
+			"create table t (id int primary key, ts timestamp);",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query: "describe t;",
+				Expected: []sql.Row{
+					{"id", "int", "NO", "PRI", nil, ""},
+					{"ts", "timestamp", "YES", "", nil, ""},
+				},
+			},
+			{
+				Query: "alter table t modify column ts timestamp on update current_timestamp;",
+			},
+			{
+				Query: "describe t;",
+				Expected: []sql.Row{
+					{"id", "int", "NO", "PRI", nil, ""},
+					{"ts", "timestamp", "YES", "", nil, "on update CURRENT_TIMESTAMP"},
+				},
+			},
+			{
+				Query: "alter table t modify column ts timestamp(3) default current_timestamp(3) on update current_timestamp(3);",
+			},
+			{
+				Query: "describe t;",
+				Expected: []sql.Row{
+					{"id", "int", "NO", "PRI", nil, ""},
+					{"ts", "timestamp(3)", "YES", "", "CURRENT_TIMESTAMP(3)", "DEFAULT_GENERATED on update CURRENT_TIMESTAMP(3)"},
+				},
+			},
+			{
+				Query: "select extra from information_schema.columns where table_name = 't' and column_name = 'ts';",
+				Expected: []sql.Row{
+					{"DEFAULT_GENERATED on update CURRENT_TIMESTAMP(3)"},
+				},
+			},
+			{
+				Query: "alter table t modify column ts timestamp(3) default null on update current_timestamp(3);",
+			},
+			{
+				Query: "describe t;",
+				Expected: []sql.Row{
+					{"id", "int", "NO", "PRI", nil, ""},
+					{"ts", "timestamp(3)", "YES", "", "NULL", "on update CURRENT_TIMESTAMP(3)"},
+				},
+			},
+			{
+				Query: "alter table t modify column ts timestamp(3) default current_timestamp(3);",
+			},
+			{
+				Query: "describe t;",
+				Expected: []sql.Row{
+					{"id", "int", "NO", "PRI", nil, ""},
+					{"ts", "timestamp(3)", "YES", "", "CURRENT_TIMESTAMP(3)", "DEFAULT_GENERATED"},
+				},
+			},
+			{
+				Query: "alter table t modify column ts timestamp(3) default '2020-01-01 00:00:00';",
+			},
+			{
+				Query: "describe t;",
+				Expected: []sql.Row{
+					{"id", "int", "NO", "PRI", nil, ""},
+					{"ts", "timestamp(3)", "YES", "", "'2020-01-01 00:00:00'", ""},
+				},
+			},
+			{
+				Query: "alter table t modify column ts timestamp(3) default null;",
+			},
+			{
+				Query: "describe t;",
+				Expected: []sql.Row{
+					{"id", "int", "NO", "PRI", nil, ""},
+					{"ts", "timestamp(3)", "YES", "", "NULL", ""},
 				},
 			},
 		},
@@ -1534,7 +1823,7 @@ var OnUpdateExprScripts = []ScriptTest{
 		// before update triggers that update the timestamp column block the on update
 		Name: "before update trigger",
 		SetUpScript: []string{
-			"create table t (i int primary key, ts timestamp default 0 on update current_timestamp, dt datetime default 0 on update current_timestamp);",
+			"create table t (i int primary key, ts timestamp default null on update current_timestamp, dt datetime default null on update current_timestamp);",
 			"create trigger trig before update on t for each row set new.ts = timestamp('2020-10-2');",
 			"insert into t(i) values (1), (2), (3);",
 		},
@@ -1549,8 +1838,8 @@ var OnUpdateExprScripts = []ScriptTest{
 				SkipResultCheckOnServerEngine: true,
 				Query:                         "select * from t order by i;",
 				Expected: []sql.Row{
-					{2, ZeroTime, ZeroTime},
-					{3, ZeroTime, ZeroTime},
+					{2, nil, nil},
+					{3, nil, nil},
 					{10, Oct2Midnight, Dec15_1_30},
 				},
 			},
@@ -1561,7 +1850,7 @@ var OnUpdateExprScripts = []ScriptTest{
 		Name: "after update trigger",
 		SetUpScript: []string{
 			"create table a (i int primary key);",
-			"create table b (i int, ts timestamp default 0 on update current_timestamp, dt datetime default 0 on update current_timestamp);",
+			"create table b (i int, ts timestamp default null on update current_timestamp, dt datetime default null on update current_timestamp);",
 			"create trigger trig after update on a for each row update b set i = i + 1;",
 			"insert into a values (0);",
 			"insert into b(i) values (0);",
@@ -1571,7 +1860,7 @@ var OnUpdateExprScripts = []ScriptTest{
 				SkipResultCheckOnServerEngine: true,
 				Query:                         "select * from b order by i;",
 				Expected: []sql.Row{
-					{0, ZeroTime, ZeroTime},
+					{0, nil, nil},
 				},
 			},
 			{
@@ -1592,8 +1881,8 @@ var OnUpdateExprScripts = []ScriptTest{
 		Name: "insert triggers",
 		SetUpScript: []string{
 			"create table t (i int primary key);",
-			"create table a (i int, ts timestamp default 0 on update current_timestamp, dt datetime default 0 on update current_timestamp);",
-			"create table b (i int, ts timestamp default 0 on update current_timestamp, dt datetime default 0 on update current_timestamp);",
+			"create table a (i int, ts timestamp default null on update current_timestamp, dt datetime default null on update current_timestamp);",
+			"create table b (i int, ts timestamp default null on update current_timestamp, dt datetime default null on update current_timestamp);",
 			"create trigger trigA after insert on t for each row update a set i = i + 1;",
 			"create trigger trigB before insert on t for each row update b set i = i + 1;",
 			"insert into a(i) values (0);",
@@ -1625,7 +1914,7 @@ var OnUpdateExprScripts = []ScriptTest{
 		Name: "foreign key tests",
 		SetUpScript: []string{
 			"create table parent (i int primary key);",
-			"create table child (i int primary key, ts timestamp default 0 on update current_timestamp, foreign key (i) references parent(i) on update cascade);",
+			"create table child (i int primary key, ts timestamp default null on update current_timestamp, foreign key (i) references parent(i) on update cascade);",
 			"insert into parent values (1);",
 			"insert into child(i) values (1);",
 		},
@@ -1640,7 +1929,7 @@ var OnUpdateExprScripts = []ScriptTest{
 				SkipResultCheckOnServerEngine: true,
 				Query:                         "select * from child;",
 				Expected: []sql.Row{
-					{10, ZeroTime},
+					{10, nil},
 				},
 			},
 		},
@@ -1648,7 +1937,7 @@ var OnUpdateExprScripts = []ScriptTest{
 	{
 		Name: "stored procedure tests",
 		SetUpScript: []string{
-			"create table t (i int, ts timestamp default 0 on update current_timestamp);",
+			"create table t (i int, ts timestamp default null on update current_timestamp);",
 			"insert into t(i) values (0);",
 			"create procedure p() update t set i = i + 1;",
 		},
@@ -1921,7 +2210,7 @@ var OnUpdateExprScripts = []ScriptTest{
 		// https://github.com/dolthub/dolt/issues/10627
 		Name: "ON UPDATE works with INSERT...ON DUPLICATE KEY UPDATE",
 		SetUpScript: []string{
-			"CREATE TABLE test (pk INT PRIMARY KEY, v1 int, dt datetime default 0 on update current_timestamp);",
+			"CREATE TABLE test (pk INT PRIMARY KEY, v1 int, dt datetime default null on update current_timestamp);",
 			"INSERT INTO test (pk, v1) VALUES (1, 1), (2, 2), (3, 3);",
 		},
 		Assertions: []ScriptTestAssertion{
@@ -1939,9 +2228,33 @@ var OnUpdateExprScripts = []ScriptTest{
 				Query: "select * from test",
 				Expected: []sql.Row{
 					{1, 2, Dec15_1_30},
-					{2, 2, ZeroTime},
-					{3, 3, ZeroTime},
+					{2, 2, nil},
+					{3, 3, nil},
 				},
+			},
+		},
+	},
+	{
+		// https://github.com/dolthub/dolt/issues/11346
+		Name: "ON UPDATE works with CTE",
+		SetUpScript: []string{
+			"CREATE TABLE t2 (id VARCHAR(64) PRIMARY KEY, val INT, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP);",
+			"INSERT INTO t2 (id,val) VALUES ('a',1);",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "select * from t2",
+				Expected: []sql.Row{{"a", 1, Jan1Noon}},
+			},
+			{
+				Query: "WITH r(id) AS (SELECT 'a') UPDATE t2 SET val=2 WHERE id IN (SELECT id FROM r);",
+				Expected: []sql.Row{
+					{types.OkResult{RowsAffected: 1, Info: plan.UpdateInfo{Matched: 1, Updated: 1}}},
+				},
+			},
+			{
+				Query:    "select * from t2",
+				Expected: []sql.Row{{"a", 2, Dec15_1_30}},
 			},
 		},
 	},

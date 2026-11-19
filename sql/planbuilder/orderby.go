@@ -22,6 +22,8 @@ import (
 
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/expression"
+	"github.com/dolthub/go-mysql-server/sql/expression/function/aggregation"
+	"github.com/dolthub/go-mysql-server/sql/plan"
 	"github.com/dolthub/go-mysql-server/sql/transform"
 	"github.com/dolthub/go-mysql-server/sql/types"
 )
@@ -46,6 +48,7 @@ func (b *Builder) analyzeOrderBy(fromScope, projScope *scope, order ast.OrderBy)
 		case ast.DescScr:
 			descending = true
 		}
+		nullsLast := sortNullsLast(o, descending)
 		expr := unwrapExpression(o.Expr)
 		switch e := expr.(type) {
 		case *ast.ColName:
@@ -60,6 +63,7 @@ func (b *Builder) analyzeOrderBy(fromScope, projScope *scope, order ast.OrderBy)
 					c.scalar = nil
 				}
 				c.descending = descending
+				c.nullsLast = nullsLast
 				outScope.addColumn(c)
 				continue
 			}
@@ -71,6 +75,7 @@ func (b *Builder) analyzeOrderBy(fromScope, projScope *scope, order ast.OrderBy)
 				b.handleErr(err)
 			}
 			c.descending = descending
+			c.nullsLast = nullsLast
 			c.scalar = c.scalarGf()
 			outScope.addColumn(c)
 			fromScope.addExtraColumn(c)
@@ -119,6 +124,7 @@ func (b *Builder) analyzeOrderBy(fromScope, projScope *scope, order ast.OrderBy)
 					typ:        target.typ,
 					nullable:   target.nullable,
 					descending: descending,
+					nullsLast:  nullsLast,
 					id:         target.id,
 				})
 			}
@@ -133,14 +139,17 @@ func (b *Builder) analyzeOrderBy(fromScope, projScope *scope, order ast.OrderBy)
 			}
 			// aggregate ref -> expr.String() in
 			// or compound expression
-			expr, _, _ = transform.Expr(expr, func(e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
+			expr, _, _ = transform.Expr(b.ctx, expr, func(ctx *sql.Context, e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
 				//  get fields outside of aggs need to be in extra cols
 				switch e := e.(type) {
 				case *expression.GetField:
-					c, ok := fromScope.resolveColumn("", strings.ToLower(e.Table()), strings.ToLower(e.Name()), true, false)
+					c, ok := fromScope.getCol(e.Id())
 					if !ok {
-						err := sql.ErrColumnNotFound.New(e.Name)
-						b.handleErr(err)
+						c, ok = fromScope.resolveColumn("", strings.ToLower(e.Table()), strings.ToLower(e.Name()), true, false)
+						if !ok {
+							err := sql.ErrColumnNotFound.New(e.Name())
+							b.handleErr(err)
+						}
 					}
 					fromScope.addExtraColumn(c)
 				case sql.WindowAdaptableExpression:
@@ -150,7 +159,7 @@ func (b *Builder) analyzeOrderBy(fromScope, projScope *scope, order ast.OrderBy)
 						err := fmt.Errorf("failed to ref aggregate expression: %s", e.String())
 						b.handleErr(err)
 					}
-					return expression.NewGetField(int(id), e.Type(), e.String(), e.IsNullable()), transform.NewTree, nil
+					return expression.NewGetField(int(id), e.Type(ctx), e.String(), e.IsNullable(ctx)), transform.NewTree, nil
 				default:
 				}
 				return e, transform.SameTree, nil
@@ -158,9 +167,10 @@ func (b *Builder) analyzeOrderBy(fromScope, projScope *scope, order ast.OrderBy)
 			col := scopeColumn{
 				col:        expr.String(),
 				scalar:     expr,
-				typ:        expr.Type(),
-				nullable:   expr.IsNullable(),
+				typ:        expr.Type(b.ctx),
+				nullable:   expr.IsNullable(b.ctx),
 				descending: descending,
+				nullsLast:  nullsLast,
 			}
 			outScope.newColumn(col)
 		}
@@ -190,7 +200,7 @@ func (b *Builder) normalizeIntVal(e *ast.SQLVal) (any, bool) {
 		lit := b.convertInt(e.Val, 10)
 		return lit.Value(), true
 	} else if replace, ok := b.normalizeValArg(e); ok {
-		if lit, ok := replace.(*expression.Literal); ok && types.IsNumber(lit.Type()) {
+		if lit, ok := replace.(*expression.Literal); ok && types.IsNumber(lit.Type(b.ctx)) {
 			return lit.Value(), true
 		}
 	}
@@ -201,9 +211,19 @@ func (b *Builder) buildOrderBy(inScope, orderByScope *scope) {
 	if len(orderByScope.cols) == 0 {
 		return
 	}
-	var sortFields sql.SortFields
-	var deps sql.ColSet
-	for _, c := range orderByScope.cols {
+	sortConditions := b.buildSortConditions(orderByScope, transform.SameTree)
+	sort, err := b.f.buildSort(b.ctx, inScope.node, sortConditions, orderByScope.colset, inScope.refsSubquery)
+	if err != nil {
+		b.handleErr(err)
+	}
+	inScope.node = sort
+	return
+}
+
+// buildSortConditions builds a sql.SortConditions based on an ORDER BY scope and also returns dependencies
+func (b *Builder) buildSortConditions(orderByScope *scope, sameAlias transform.TreeIdentity) sql.SortConditions {
+	sortConditions := make(sql.SortConditions, len(orderByScope.cols))
+	for i, c := range orderByScope.cols {
 		so := sql.Ascending
 		if c.descending {
 			so = sql.Descending
@@ -212,19 +232,83 @@ func (b *Builder) buildOrderBy(inScope, orderByScope *scope) {
 		if scalar == nil {
 			scalar = c.scalarGf()
 		}
-		sf := sql.SortField{
-			Column: scalar,
-			Order:  so,
+		// Some nodes such as unions pass ORDER BYs to the top scope, where the original ORDER BY may no longer be
+		// accessible. It is safe to assume that the alias has already been computed.
+		if !sameAlias {
+			scalar, _, _ = transform.Expr(b.ctx, scalar, func(ctx *sql.Context, e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
+				switch e := e.(type) {
+				case *expression.Alias:
+					return expression.NewGetField(int(c.id), e.Type(ctx), e.Name(), e.IsNullable(ctx)), transform.NewTree, nil
+				default:
+					return e, transform.SameTree, nil
+				}
+			})
 		}
-		sortFields = append(sortFields, sf)
-		deps.Add(sql.ColumnId(c.id))
+		sortConditions[i] = sql.SortCondition{
+			Expr:         scalar,
+			Order:        so,
+			NullOrdering: nullOrdering(c.nullsLast),
+		}
 	}
-	sort, err := b.f.buildSort(inScope.node, sortFields, deps, inScope.refsSubquery)
-	if err != nil {
-		b.handleErr(err)
+	return sortConditions
+}
+
+// sortNullsLast returns whether an ORDER BY term ranks NULL above every other value. MySQL ranks NULL below every
+// value, and a NULLS FIRST or NULLS LAST clause places NULL relative to the sort direction.
+func sortNullsLast(o *ast.Order, descending bool) bool {
+	switch o.NullsOrder {
+	case ast.NullsFirstStr:
+		return descending
+	case ast.NullsLastStr:
+		return !descending
 	}
-	inScope.node = sort
-	return
+	return false
+}
+
+// nullOrdering converts the NULL rank of an ORDER BY term into a sql.NullOrdering.
+func nullOrdering(nullsLast bool) sql.NullOrdering {
+	if nullsLast {
+		return sql.NullsLast
+	}
+	return sql.NullsFirst
+}
+
+// buildOrderedInjectedExpr builds an InjectedExpr with an ORDER BY dependency
+func (b *Builder) buildOrderedInjectedExpr(inScope *scope, e *ast.OrderedInjectedExpr) sql.Expression {
+	if b.inAggFilter {
+		b.handleErr(sql.ErrAggregateInFilter.New())
+	}
+	inScope.initGroupBy()
+	gb := inScope.groupBy
+
+	var resolvedChildren []any
+	if len(e.Children) > 0 {
+		resolvedChildren = make([]any, len(e.Children))
+		for i, child := range e.Children {
+			resolvedChildren[i] = b.buildScalar(inScope, child)
+		}
+	} else {
+		resolvedChildren = make([]any, len(e.SelectExprChildren))
+		for i, child := range e.SelectExprChildren {
+			resolvedChildren[i] = b.selectExprToExpression(inScope, child)
+		}
+	}
+
+	orderByScope := b.analyzeOrderBy(inScope, inScope, e.OrderBy)
+	sortConditions := b.buildSortConditions(orderByScope, transform.SameTree)
+
+	resolvedChildren = append(resolvedChildren, sortConditions)
+
+	expr := b.buildInjectedExpressionFromResolvedChildren(e.InjectedExpr, resolvedChildren)
+	agg, ok := expr.(sql.Aggregation)
+	if !ok {
+		b.handleErr(fmt.Errorf("expected sql.Aggregation, got %T", expr))
+	}
+	if filter := b.buildAggregateFilter(inScope, e.Filter); filter != nil {
+		agg = aggregation.NewFilter(agg, filter)
+	}
+
+	return gb.registerAggregate(b.ctx, plan.AliasSubqueryString(b.ctx, agg), agg)
 }
 
 // unwrapExpression unwraps expressions wrapped in ParenExpr (parenthesis)

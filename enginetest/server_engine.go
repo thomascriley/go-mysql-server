@@ -15,6 +15,7 @@
 package enginetest
 
 import (
+	"context"
 	gosql "database/sql"
 	"encoding/json"
 	"errors"
@@ -25,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/apd/v3"
 	"github.com/dolthub/vitess/go/sqltypes"
 	"github.com/dolthub/vitess/go/vt/proto/query"
 	"github.com/dolthub/vitess/go/vt/sqlparser"
@@ -54,7 +56,7 @@ var _ QueryEngine = (*ServerQueryEngine)(nil)
 var address = "localhost"
 
 func NewServerQueryEngine(t *testing.T, engine *sqle.Engine, builder server.SessionBuilder) (*ServerQueryEngine, error) {
-	ctx := sql.NewEmptyContext()
+	ctx := engine.NewContext(context.Background())
 
 	if err := enableUserAccounts(ctx, engine); err != nil {
 		panic(err)
@@ -69,7 +71,7 @@ func NewServerQueryEngine(t *testing.T, engine *sqle.Engine, builder server.Sess
 		Protocol: "tcp",
 		Address:  fmt.Sprintf("%s:%d", address, p),
 	}
-	s, err := server.NewServer(config, engine, sql.NewContext, builder, nil)
+	s, err := server.NewServer(config, engine, sql.ContextFactoryWithVariables(engine.Variables()), builder, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -233,9 +235,7 @@ func (s *ServerQueryEngine) exec(ctx *sql.Context, stmt *gosql.Stmt, query strin
 // queryOrExec function use `query()` or `exec()` method of go-sql-driver depending on the sql parser plan.
 // If |stmt| is nil, then we use the connection db to query/exec the given query statement because some queries cannot
 // be run as prepared.
-// TODO: for `EXECUTE` and `CALL` statements, it can be either query or exec depending on the statement that prepared or stored procedure holds.
-//
-//	for now, we use `query` to get the row results for these statements. For statements that needs `exec`, the result is OkResult.
+// EXECUTE preserves affected-row results for prepared DML; CALL may return rows or an OK result.
 func (s *ServerQueryEngine) queryOrExec(ctx *sql.Context, stmt *gosql.Stmt, parsed sqlparser.Statement, query string, args []any) (sql.Schema, sql.RowIter, *sql.QueryFlags, error) {
 	// TODO: added `FLUSH` stmt here (should be `exec`) because we don't support `FLUSH BINARY LOGS` or `FLUSH ENGINE LOGS`, so nil schema is returned.
 	var shouldQuery bool
@@ -245,9 +245,26 @@ func (s *ServerQueryEngine) queryOrExec(ctx *sql.Context, stmt *gosql.Stmt, pars
 		if p.Returning != nil {
 			shouldQuery = true
 		}
+	case *sqlparser.Execute:
+		// Each ServerQueryEngine has its own server and a single client session.
+		var prepared sqlparser.Statement
+		err := s.server.SessionManager().Iter(func(session sql.Session) (bool, error) {
+			prepared, _ = session.GetPreparedQuery(p.Name)
+			return prepared != nil, nil
+		})
+		if err != nil {
+			return nil, nil, nil, err
+		}
+
+		switch prepared.(type) {
+		case *sqlparser.Insert, *sqlparser.Update, *sqlparser.Delete:
+			return s.queryOrExec(ctx, stmt, prepared, query, args)
+		}
+
+		shouldQuery = true
 	case *sqlparser.Select, *sqlparser.SetOp, *sqlparser.Show,
 		*sqlparser.Call, *sqlparser.Begin,
-		*sqlparser.Use, *sqlparser.Load, *sqlparser.Execute,
+		*sqlparser.Use, *sqlparser.Load,
 		*sqlparser.Analyze, *sqlparser.Flush, *sqlparser.Explain:
 		shouldQuery = true
 	default:
@@ -405,7 +422,7 @@ func convertValue(ctx *sql.Context, sch sql.Schema, row sql.Row) sql.Row {
 			}
 		case query.Type_TIME:
 			if row[i] != nil {
-				r, _, err := types.TimespanType_{}.Convert(ctx, string(row[i].([]byte)))
+				r, _, err := col.Type.Convert(ctx, string(row[i].([]byte)))
 				if err != nil {
 					//t.Skip(fmt.Sprintf("received error converting returned timespan result"))
 				} else {
@@ -645,10 +662,7 @@ func convertGoSqlType(columnType *gosql.ColumnType) (sql.Type, error) {
 		if !ok {
 			return nil, fmt.Errorf("could not get decimal size for column %s", columnType.Name())
 		}
-		decimalType, err := types.CreateDecimalType(uint8(precision), uint8(scale))
-		if err != nil {
-			return nil, err
-		}
+		decimalType := types.CreateLiteralDecimalType(uint8(precision), uint8(scale))
 		return decimalType, nil
 	case "date":
 		return types.Date, nil
@@ -665,7 +679,15 @@ func convertGoSqlType(columnType *gosql.ColumnType) (sql.Type, error) {
 	case "timestamp":
 		return types.Timestamp, nil
 	case "time":
-		return types.Time, nil
+		precision, _, ok := columnType.DecimalSize()
+		if !ok {
+			return nil, fmt.Errorf("could not get precision size for column %s", columnType.Name())
+		}
+		timeType, err := types.CreateTimespanType(int(precision))
+		if err != nil {
+			return nil, err
+		}
+		return timeType, nil
 	case "year":
 		return types.Year, nil
 	case "char", "varchar":
@@ -716,7 +738,15 @@ func prepareBindingArgs(ctx *sql.Context, bindings map[string]sqlparser.Expr) ([
 		if !ok {
 			return nil, fmt.Errorf("cannot get binding value")
 		}
-		args[i] = lit.Value()
+		val := lit.Value()
+		// TODO: `go-sql-driver` cannot handle `*apd.Decimal` value
+		//  but `database/sql` allows decimalDecompose interface which `*apd.Decimal` implements
+		//  This need fix on one of these libraries.
+		if dec, ok := val.(*apd.Decimal); ok {
+			args[i] = dec.Text('f')
+		} else {
+			args[i] = lit.Value()
+		}
 	}
 	return args, nil
 }
@@ -768,5 +798,9 @@ func enableUserAccounts(ctx *sql.Context, engine *sqle.Engine) error {
 // Other queries simply cause incorrect type result, which is not checked for ServerEngine test for now.
 // TODO: remove this map when we fix this issue.
 var cannotBePrepared = map[string]bool{
-	`select """""foo""""";`: true,
+	// Keep this assignment's decimal literal: the harness otherwise sends "1.6"
+	// as a string parameter, which fails conversion to the inferred INT type.
+	// The companion cast test exercises the parameterized path.
+	"UPDATE t_seq SET a = 1.6, b = a": true,
+	`select """""foo""""";`:           true,
 }

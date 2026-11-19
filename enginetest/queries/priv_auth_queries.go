@@ -797,6 +797,26 @@ var UserPrivTests = []UserPrivilegeTest{
 		},
 	},
 	{
+		Name: "ALTER USER can update the identity",
+		SetUpScript: []string{
+			"CREATE USER testuser1@`127.0.0.1` IDENTIFIED WITH mysql_native_password AS 'initial_identity';",
+		},
+		Assertions: []UserPrivilegeTestAssertion{
+			{
+				Query:    "select user, host, plugin, identity from mysql.user where user='testuser1';",
+				Expected: []sql.Row{{"testuser1", "127.0.0.1", "mysql_native_password", "initial_identity"}},
+			},
+			{
+				Query:    "ALTER USER testuser1@`127.0.0.1` IDENTIFIED WITH mysql_native_password AS 'updated_identity';",
+				Expected: []sql.Row{{types.NewOkResult(0)}},
+			},
+			{
+				Query:    "select user, host, plugin, identity from mysql.user where user='testuser1';",
+				Expected: []sql.Row{{"testuser1", "127.0.0.1", "mysql_native_password", "updated_identity"}},
+			},
+		},
+	},
+	{
 		Name: "User creation with SSL/TLS requirements",
 		SetUpScript: []string{
 			"CREATE USER testuser1@`127.0.0.1` REQUIRE NONE;",
@@ -2571,6 +2591,98 @@ FROM ((SELECT 1 as found FROM information_schema.tables WHERE table_schema = 'te
 			},
 		},
 	},
+	{
+		// https://github.com/dolthub/dolt/issues/12207
+		Name: "SET GLOBAL, PERSIST, and PERSIST_ONLY require the SUPER privilege",
+		SetUpScript: []string{
+			"CREATE USER tester@localhost;",
+			"GRANT SELECT ON mydb.* TO tester@localhost;",
+		},
+		Assertions: []UserPrivilegeTestAssertion{
+			{
+				User:        "tester",
+				Host:        "localhost",
+				Query:       "SET GLOBAL max_connections=7;",
+				ExpectedErr: sql.ErrSpecificAccessDenied,
+			},
+			{
+				User:        "tester",
+				Host:        "localhost",
+				Query:       "SET @@GLOBAL.max_connections=7;",
+				ExpectedErr: sql.ErrSpecificAccessDenied,
+			},
+			{
+				User:        "tester",
+				Host:        "localhost",
+				Query:       "SET PERSIST max_connections=9;",
+				ExpectedErr: sql.ErrSpecificAccessDenied,
+			},
+			{
+				User:        "tester",
+				Host:        "localhost",
+				Query:       "SET @@PERSIST.max_connections=9;",
+				ExpectedErr: sql.ErrSpecificAccessDenied,
+			},
+			{
+				User:        "tester",
+				Host:        "localhost",
+				Query:       "SET PERSIST_ONLY max_connections=9;",
+				ExpectedErr: sql.ErrSpecificAccessDenied,
+			},
+			{
+				User:     "root",
+				Host:     "localhost",
+				Query:    "GRANT SUPER ON *.* TO tester@localhost;",
+				Expected: []sql.Row{{types.NewOkResult(0)}},
+			},
+			{
+				User:     "tester",
+				Host:     "localhost",
+				Query:    "SET GLOBAL max_connections=7;",
+				Expected: []sql.Row{{types.NewOkResult(0)}},
+			},
+			{
+				User:     "root",
+				Host:     "localhost",
+				Query:    "SELECT @@global.max_connections;",
+				Expected: []sql.Row{{7}},
+			},
+			{
+				User:     "tester",
+				Host:     "localhost",
+				Query:    "SET PERSIST max_connections=9;",
+				Expected: []sql.Row{{types.NewOkResult(0)}},
+			},
+			{
+				User:     "root",
+				Host:     "localhost",
+				Query:    "SELECT @@global.max_connections;",
+				Expected: []sql.Row{{9}},
+			},
+		},
+	},
+	{
+		// https://github.com/dolthub/dolt/issues/12207
+		Name: "SET SESSION and user-defined variables do not require privileges",
+		SetUpScript: []string{
+			"CREATE USER tester@localhost;",
+			"GRANT SELECT ON mydb.* TO tester@localhost;",
+		},
+		Assertions: []UserPrivilegeTestAssertion{
+			{
+				User:     "tester",
+				Host:     "localhost",
+				Query:    "SET SESSION sql_mode='';",
+				Expected: []sql.Row{{types.NewOkResult(0)}},
+			},
+			{
+				User:     "tester",
+				Host:     "localhost",
+				Query:    "SET @probe_user_var = 1;",
+				Expected: []sql.Row{{types.NewOkResult(0)}},
+			},
+		},
+	},
 }
 
 // NoopPlaintextPlugin is used to authenticate plaintext user plugins
@@ -3035,6 +3147,19 @@ var ServerAuthTests = []ServerAuthenticationTest{
 // equivalent test would comparatively take up many more lines. This is intended to have as many tests as possible that
 // are as quick to write as possible.
 var QuickPrivTests = []QuickPrivilegeTest{
+	{
+		Queries:      []string{"GRANT SELECT, INSERT ON mydb.test TO tester@localhost", "INSERT INTO mydb.test VALUES (0, 9) ON DUPLICATE KEY UPDATE v1 = 9"},
+		ExpectingErr: true,
+	},
+	{
+		// Authorization checks are unconditional: UPDATE is required even when key 99 has no duplicate.
+		Queries:      []string{"GRANT SELECT, INSERT ON mydb.test TO tester@localhost", "INSERT INTO mydb.test VALUES (99, 9) ON DUPLICATE KEY UPDATE v1 = 9"},
+		ExpectingErr: true,
+	},
+	{
+		Queries:  []string{"GRANT SELECT, INSERT, UPDATE ON mydb.test TO tester@localhost", "INSERT INTO mydb.test VALUES (0, 9) ON DUPLICATE KEY UPDATE v1 = 9"},
+		Expected: []sql.Row{{types.NewOkResult(2)}},
+	},
 	{
 		Queries: []string{
 			"GRANT SELECT ON *.* TO tester@localhost",
@@ -3680,5 +3805,84 @@ var QuickPrivTests = []QuickPrivilegeTest{
 			"GRANT RELOAD ON *.* TO tester@localhost",
 			"FLUSH PRIVILEGES;",
 		},
+	},
+	{
+		Queries: []string{
+			"GRANT SELECT ON mydb.test TO tester@localhost",
+			"WITH cte AS (SELECT * FROM mydb.test) SELECT * FROM cte",
+		},
+		Expected: []sql.Row{{0, 0}, {1, 1}},
+	},
+	{
+		Queries: []string{
+			"GRANT SELECT ON mydb.test TO tester@localhost",
+			"WITH RECURSIVE cte (n) AS (SELECT MIN(pk) FROM mydb.test UNION ALL SELECT n + 1 FROM cte WHERE n < 2) SELECT * FROM cte",
+		},
+		Expected: []sql.Row{{0}, {1}, {2}},
+	},
+	{
+		Queries: []string{
+			"GRANT SELECT ON mydb.test TO tester@localhost",
+			"WITH cte AS (SELECT * FROM mydb.test2) SELECT * FROM cte",
+		},
+		ExpectingErr: true,
+	},
+	{
+		Queries: []string{
+			"GRANT SELECT ON mydb.test TO tester@localhost",
+			"WITH test2 AS (SELECT * FROM mydb.test) SELECT * FROM test2",
+		},
+		Expected: []sql.Row{{0, 0}, {1, 1}},
+	},
+	{
+		Queries: []string{
+			"GRANT SELECT ON mydb.test TO tester@localhost",
+			"GRANT INSERT ON mydb.test2 TO tester@localhost",
+			"WITH mydb AS (SELECT * FROM mydb.test) SELECT * FROM mydb.test2",
+		},
+		ExpectedErr: sql.ErrPrivilegeCheckFailed,
+	},
+	{
+		Queries: []string{
+			"GRANT SELECT ON mydb.test TO tester@localhost",
+			"GRANT SELECT ON mydb.test2 TO tester@localhost",
+			"WITH test2 AS (SELECT * FROM mydb.test) INSERT INTO mydb.test2 VALUES (5, 5)",
+		},
+		ExpectedErr: sql.ErrPrivilegeCheckFailed,
+	},
+	{
+		Queries: []string{
+			"GRANT SELECT ON mydb.test TO tester@localhost",
+			"GRANT INSERT ON mydb.test2 TO tester@localhost",
+			"INSERT INTO mydb.test2 WITH cte AS (SELECT pk + 10, v1 FROM mydb.test) SELECT * FROM cte",
+		},
+	},
+	{
+		Queries: []string{
+			"GRANT SELECT ON mydb.test TO tester@localhost",
+			"GRANT SELECT, UPDATE ON mydb.test2 TO tester@localhost",
+			"WITH cte AS (SELECT pk FROM mydb.test) UPDATE mydb.test2 SET v1 = 0 WHERE pk IN (SELECT pk FROM cte)",
+		},
+	},
+	{
+		Queries: []string{
+			"GRANT SELECT ON mydb.test TO tester@localhost",
+			"GRANT SELECT, DELETE ON mydb.test2 TO tester@localhost",
+			"WITH cte AS (SELECT pk FROM mydb.test) DELETE FROM mydb.test2 WHERE pk IN (SELECT pk FROM cte)",
+		},
+	}, {
+		Queries: []string{
+			"GRANT SELECT ON mydb.test TO tester@localhost",
+			"GRANT SELECT ON mydb.test2 TO tester@localhost",
+			"INSERT INTO mydb.test2 WITH test2 AS (SELECT pk + 10, v1 FROM mydb.test) SELECT * FROM test2",
+		},
+		ExpectedErr: sql.ErrPrivilegeCheckFailed,
+	},
+	{
+		Queries: []string{
+			"GRANT SELECT ON mydb.test TO tester@localhost",
+			"WITH a AS (SELECT pk FROM mydb.test), b AS (SELECT * FROM a) SELECT COUNT(*) FROM b",
+		},
+		Expected: []sql.Row{{2}},
 	},
 }

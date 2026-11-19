@@ -19,11 +19,10 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
-	"math/big"
 	"time"
 	"unsafe"
 
-	"github.com/shopspring/decimal"
+	"github.com/cockroachdb/apd/v3"
 )
 
 type Type struct {
@@ -182,14 +181,48 @@ func ReadFloat64(val []byte) float64 {
 	return math.Float64frombits(x)
 }
 
-func ReadDecimal(val []byte) decimal.Decimal {
+func ReadDecimal(val []byte) *apd.Decimal {
+	if len(val) == int(Int32Size) {
+		v := ReadInt32(val)
+		if v == int32(0xc000) {
+			return &apd.Decimal{Form: apd.NaN}
+		} else if v == int32(0xd000) {
+			return &apd.Decimal{Form: apd.Infinite}
+		} else if v == int32(0xf000) {
+			return &apd.Decimal{Form: apd.Infinite, Negative: true}
+		}
+	}
 	e := ReadInt32(val[:Int32Size])
 	s := ReadInt8(val[Int32Size : Int32Size+Int8Size])
-	b := big.NewInt(0).SetBytes(val[Int32Size+Int8Size:])
-	if s < 0 {
-		b = b.Neg(b)
+	d := new(apd.Decimal)
+	d.Coeff.SetBytes(val[Int32Size+Int8Size:])
+	d.Exponent = e
+	d.Negative = s < 0
+	return d
+}
+
+func ReadDecimalInto(val []byte, d *apd.Decimal) {
+	if len(val) == int(Int32Size) {
+		v := ReadInt32(val)
+		if v == int32(0xc000) {
+			d.Form = apd.NaN
+			return
+		} else if v == int32(0xd000) {
+			d.Form = apd.Infinite
+			d.Negative = false
+			return
+		} else if v == int32(0xf000) {
+			d.Form = apd.Infinite
+			d.Negative = true
+			return
+		}
 	}
-	return decimal.NewFromBigInt(b, e)
+	e := ReadInt32(val[:Int32Size])
+	s := ReadInt8(val[Int32Size : Int32Size+Int8Size])
+	d.Coeff.SetBytes(val[Int32Size+Int8Size:])
+	d.Exponent = e
+	d.Negative = s < 0
+	return
 }
 
 func ReadDate(val []byte) time.Time {

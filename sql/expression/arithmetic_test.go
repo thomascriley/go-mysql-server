@@ -20,18 +20,24 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dolthub/vitess/go/sqltypes"
-	"github.com/shopspring/decimal"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/src-d/go-errors.v1"
 
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/types"
-	_ "github.com/dolthub/go-mysql-server/sql/variables"
+)
+
+var (
+	date2001               = time.Date(2001, time.January, 1, 0, 0, 0, 0, time.UTC)
+	datetime2001noon       = time.Date(2001, time.January, 1, 12, 0, 0, 0, time.UTC)
+	datetime2001noon123    = time.Date(2001, time.January, 1, 12, 0, 0, 123000000, time.UTC)
+	datetime2001noon123456 = time.Date(2001, time.January, 1, 12, 0, 0, 123456000, time.UTC)
 )
 
 func TestPlus(t *testing.T) {
+	bigDecimal, _, _ := apd.NewFromString("3720481604718463778705849469618542795")
 	var testCases = []struct {
 		name  string
 		left  sql.Expression
@@ -85,24 +91,29 @@ func TestPlus(t *testing.T) {
 			exp:   3.1459,
 		},
 		{
-			left:  NewLiteral(decimal.New(1, 0), types.MustCreateDecimalType(10, 0)),
-			right: NewLiteral(decimal.New(1, 0), types.MustCreateDecimalType(10, 0)),
+			left:  NewLiteral(apd.New(1, 0), types.MustCreateDecimalType(10, 0)),
+			right: NewLiteral(apd.New(1, 0), types.MustCreateDecimalType(10, 0)),
 			exp:   "2",
 		},
 		{
-			left:  NewLiteral(decimal.New(1000, -3), types.MustCreateDecimalType(10, 3)), // 1.000
-			right: NewLiteral(decimal.New(1, 0), types.MustCreateDecimalType(10, 0)),
+			left:  NewLiteral(apd.New(1000, -3), types.MustCreateDecimalType(10, 3)), // 1.000
+			right: NewLiteral(apd.New(1, 0), types.MustCreateDecimalType(10, 0)),
 			exp:   "2.000",
 		},
 		{
-			left:  NewLiteral(decimal.New(1000, -3), types.MustCreateDecimalType(10, 3)),   // 1.000
-			right: NewLiteral(decimal.New(100000, -5), types.MustCreateDecimalType(10, 5)), // 1.00000
+			left:  NewLiteral(apd.New(1000, -3), types.MustCreateDecimalType(10, 3)),   // 1.000
+			right: NewLiteral(apd.New(100000, -5), types.MustCreateDecimalType(10, 5)), // 1.00000
 			exp:   "2.00000",
 		},
 		{
-			left:  NewLiteral(decimal.New(1459, -4), types.MustCreateDecimalType(10, 4)), // 0.1459
-			right: NewLiteral(decimal.New(3, 0), types.MustCreateDecimalType(10, 0)),     // 3
+			left:  NewLiteral(apd.New(1459, -4), types.MustCreateDecimalType(10, 4)), // 0.1459
+			right: NewLiteral(apd.New(3, 0), types.MustCreateDecimalType(10, 0)),     // 3
 			exp:   "3.1459",
+		},
+		{
+			left:  NewLiteral(apd.New(1459, -4), types.MustCreateDecimalType(10, 4)), // 0.1459
+			right: NewLiteral(bigDecimal, types.MustCreateDecimalType(10, 0)),        // 3720481604718463778705849469618542795
+			exp:   "3720481604718463778705849469618542795.1459",
 		},
 		{
 			left:  NewLiteral(2001, types.Year),
@@ -110,43 +121,38 @@ func TestPlus(t *testing.T) {
 			exp:   uint64(4003),
 		},
 		{
-			left:  NewLiteral("2001-01-01", types.Date),
-			right: NewLiteral("2001-01-01", types.Date),
+			left:  NewLiteral(date2001, types.Date),
+			right: NewLiteral(date2001, types.Date),
 			exp:   int64(40020202),
 		},
 		{
-			skip:  true, // need to trim just the date portion
-			left:  NewLiteral("2001-01-01 12:00:00", types.Date),
-			right: NewLiteral("2001-01-01 12:00:00", types.Date),
+			left:  NewLiteral(datetime2001noon, types.Date),
+			right: NewLiteral(datetime2001noon, types.Date),
 			exp:   int64(40020202),
 		},
 		{
-			skip:  true, // need to trim just the date portion
-			left:  NewLiteral("2001-01-01 12:00:00.123456", types.Date),
-			right: NewLiteral("2001-01-01 12:00:00.123456", types.Date),
+			left:  NewLiteral(datetime2001noon123456, types.Date),
+			right: NewLiteral(datetime2001noon123456, types.Date),
 			exp:   int64(40020202),
 		},
 		{
-			left:  NewLiteral("2001-01-01 12:00:00", types.Datetime),
-			right: NewLiteral("2001-01-01 12:00:00", types.Datetime),
+			left:  NewLiteral(datetime2001noon, types.Datetime),
+			right: NewLiteral(datetime2001noon, types.Datetime),
 			exp:   int64(40020202240000),
 		},
 		{
-			skip:  true, // need to trim just the datetime portion according to precision
-			left:  NewLiteral("2001-01-01 12:00:00.123456", types.Datetime),
-			right: NewLiteral("2001-01-01 12:00:00.123456", types.Datetime),
+			left:  NewLiteral(datetime2001noon123456, types.Datetime),
+			right: NewLiteral(datetime2001noon123456, types.Datetime),
 			exp:   int64(40020202240000),
 		},
 		{
-			skip:  true, // need to trim just the datetime portion according to precision and use as exponent
-			left:  NewLiteral("2001-01-01 12:00:00.123456", types.MustCreateDatetimeType(sqltypes.Datetime, 3)),
-			right: NewLiteral("2001-01-01 12:00:00.123456", types.MustCreateDatetimeType(sqltypes.Datetime, 3)),
+			left:  NewLiteral(datetime2001noon123, types.Datetime3),
+			right: NewLiteral(datetime2001noon123, types.Datetime3),
 			exp:   "40020202240000.246",
 		},
 		{
-			skip:  true, // need to use precision as exponent
-			left:  NewLiteral("2001-01-01 12:00:00.123456", types.DatetimeMaxPrecision),
-			right: NewLiteral("2001-01-01 12:00:00.123456", types.DatetimeMaxPrecision),
+			left:  NewLiteral(datetime2001noon123456, types.DatetimeMaxPrecision),
+			right: NewLiteral(datetime2001noon123456, types.DatetimeMaxPrecision),
 			exp:   "40020202240000.246912",
 		},
 		{
@@ -177,7 +183,8 @@ func TestPlus(t *testing.T) {
 	}
 
 	for _, tt := range testCases {
-		name := fmt.Sprintf("%s(%v)+%s(%v)", tt.left.Type(), tt.left, tt.right.Type(), tt.right)
+		ctx := sql.NewEmptyContext()
+		name := fmt.Sprintf("%s(%v)+%s(%v)", tt.left.Type(ctx), tt.left, tt.right.Type(ctx), tt.right)
 		t.Run(name, func(t *testing.T) {
 			require := require.New(t)
 			if tt.skip {
@@ -186,8 +193,8 @@ func TestPlus(t *testing.T) {
 			f := NewPlus(tt.left, tt.right)
 			result, err := f.Eval(sql.NewEmptyContext(), nil)
 			require.NoError(err)
-			if dec, ok := result.(decimal.Decimal); ok {
-				result = dec.StringFixed(dec.Exponent() * -1)
+			if dec, ok := result.(*apd.Decimal); ok {
+				result = dec.Text('f')
 			}
 			assert.Equal(t, tt.exp, result)
 		})
@@ -248,23 +255,23 @@ func TestMinus(t *testing.T) {
 			exp:   -2.8541,
 		},
 		{
-			left:  NewLiteral(decimal.New(1, 0), types.MustCreateDecimalType(10, 0)),
-			right: NewLiteral(decimal.New(1, 0), types.MustCreateDecimalType(10, 0)),
+			left:  NewLiteral(apd.New(1, 0), types.MustCreateDecimalType(10, 0)),
+			right: NewLiteral(apd.New(1, 0), types.MustCreateDecimalType(10, 0)),
 			exp:   "0",
 		},
 		{
-			left:  NewLiteral(decimal.New(1000, -3), types.MustCreateDecimalType(10, 3)), // 1.000
-			right: NewLiteral(decimal.New(1, 0), types.MustCreateDecimalType(10, 0)),
+			left:  NewLiteral(apd.New(1000, -3), types.MustCreateDecimalType(10, 3)), // 1.000
+			right: NewLiteral(apd.New(1, 0), types.MustCreateDecimalType(10, 0)),
 			exp:   "0.000",
 		},
 		{
-			left:  NewLiteral(decimal.New(1000, -3), types.MustCreateDecimalType(10, 3)),   // 1.000
-			right: NewLiteral(decimal.New(100000, -5), types.MustCreateDecimalType(10, 5)), // 1.00000
+			left:  NewLiteral(apd.New(1000, -3), types.MustCreateDecimalType(10, 3)),   // 1.000
+			right: NewLiteral(apd.New(100000, -5), types.MustCreateDecimalType(10, 5)), // 1.00000
 			exp:   "0.00000",
 		},
 		{
-			left:  NewLiteral(decimal.New(1459, -4), types.MustCreateDecimalType(10, 4)), // 0.1459
-			right: NewLiteral(decimal.New(3, 0), types.MustCreateDecimalType(10, 0)),     // 3
+			left:  NewLiteral(apd.New(1459, -4), types.MustCreateDecimalType(10, 4)), // 0.1459
+			right: NewLiteral(apd.New(3, 0), types.MustCreateDecimalType(10, 0)),     // 3
 			exp:   "-2.8541",
 		},
 		{
@@ -273,43 +280,41 @@ func TestMinus(t *testing.T) {
 			exp:   uint64(1),
 		},
 		{
-			left:  NewLiteral("2001-01-01", types.Date),
-			right: NewLiteral("2001-01-01", types.Date),
+			left:  NewLiteral(date2001, types.Date),
+			right: NewLiteral(date2001, types.Date),
 			exp:   int64(0),
 		},
 		{
 			skip:  true, // need to trim just the date portion
-			left:  NewLiteral("2001-01-01 12:00:00", types.Date),
-			right: NewLiteral("2001-01-01 12:00:00", types.Date),
+			left:  NewLiteral(datetime2001noon, types.Date),
+			right: NewLiteral(datetime2001noon, types.Date),
 			exp:   int64(0),
 		},
 		{
 			skip:  true, // need to trim just the date portion
-			left:  NewLiteral("2001-01-01 12:00:00.123456", types.Date),
-			right: NewLiteral("2001-01-01 12:00:00.123456", types.Date),
+			left:  NewLiteral(datetime2001noon123456, types.Date),
+			right: NewLiteral(datetime2001noon123456, types.Date),
 			exp:   int64(0),
 		},
 		{
-			left:  NewLiteral("2001-01-01 12:00:00", types.Datetime),
-			right: NewLiteral("2001-01-01 12:00:00", types.Datetime),
+			left:  NewLiteral(datetime2001noon, types.Datetime),
+			right: NewLiteral(datetime2001noon, types.Datetime),
 			exp:   int64(0),
 		},
 		{
-			skip:  true, // need to trim just the datetime portion according to precision
-			left:  NewLiteral("2001-01-01 12:00:00.123456", types.Datetime),
-			right: NewLiteral("2001-01-01 12:00:00.123456", types.Datetime),
+			left:  NewLiteral(datetime2001noon123456, types.Datetime),
+			right: NewLiteral(datetime2001noon123456, types.Datetime),
 			exp:   int64(0),
 		},
 		{
-			skip:  true, // need to trim just the datetime portion according to precision and use as exponent
-			left:  NewLiteral("2001-01-01 12:00:00.123456", types.MustCreateDatetimeType(sqltypes.Datetime, 3)),
-			right: NewLiteral("2001-01-01 12:00:00.123456", types.MustCreateDatetimeType(sqltypes.Datetime, 3)),
+			left:  NewLiteral(datetime2001noon123, types.Datetime3),
+			right: NewLiteral(datetime2001noon123, types.Datetime3),
 			exp:   "0.000",
 		},
 		{
 			skip:  true, // need to use precision as exponent
-			left:  NewLiteral("2001-01-01 12:00:00.123456", types.DatetimeMaxPrecision),
-			right: NewLiteral("2001-01-01 12:00:00.123456", types.DatetimeMaxPrecision),
+			left:  NewLiteral(datetime2001noon123456, types.DatetimeMaxPrecision),
+			right: NewLiteral(datetime2001noon123456, types.DatetimeMaxPrecision),
 			exp:   "0.000000",
 		},
 		{
@@ -335,7 +340,8 @@ func TestMinus(t *testing.T) {
 	}
 
 	for _, tt := range testCases {
-		name := fmt.Sprintf("%s(%v)-%s(%v)", tt.left.Type(), tt.left, tt.right.Type(), tt.right)
+		ctx := sql.NewEmptyContext()
+		name := fmt.Sprintf("%s(%v)-%s(%v)", tt.left.Type(ctx), tt.left, tt.right.Type(ctx), tt.right)
 		t.Run(name, func(t *testing.T) {
 			require := require.New(t)
 			if tt.skip {
@@ -344,8 +350,8 @@ func TestMinus(t *testing.T) {
 			f := NewMinus(tt.left, tt.right)
 			result, err := f.Eval(sql.NewEmptyContext(), nil)
 			require.NoError(err)
-			if dec, ok := result.(decimal.Decimal); ok {
-				result = dec.StringFixed(dec.Exponent() * -1)
+			if dec, ok := result.(*apd.Decimal); ok {
+				result = dec.Text('f')
 			}
 			assert.Equal(t, tt.exp, result)
 		})
@@ -412,28 +418,28 @@ func TestMult(t *testing.T) {
 			exp:   9.4377,
 		},
 		{
-			left:  NewLiteral(decimal.New(1, 0), types.MustCreateDecimalType(10, 0)),
-			right: NewLiteral(decimal.New(1, 0), types.MustCreateDecimalType(10, 0)),
+			left:  NewLiteral(apd.New(1, 0), types.MustCreateDecimalType(10, 0)),
+			right: NewLiteral(apd.New(1, 0), types.MustCreateDecimalType(10, 0)),
 			exp:   "1",
 		},
 		{
-			left:  NewLiteral(decimal.New(1000, -3), types.MustCreateDecimalType(10, 3)), // 1.000
-			right: NewLiteral(decimal.New(1, 0), types.MustCreateDecimalType(10, 0)),
+			left:  NewLiteral(apd.New(1000, -3), types.MustCreateDecimalType(10, 3)), // 1.000
+			right: NewLiteral(apd.New(1, 0), types.MustCreateDecimalType(10, 0)),
 			exp:   "1.000",
 		},
 		{
-			left:  NewLiteral(decimal.New(1000, -3), types.MustCreateDecimalType(10, 3)),   // 1.000
-			right: NewLiteral(decimal.New(100000, -5), types.MustCreateDecimalType(10, 5)), // 1.00000
+			left:  NewLiteral(apd.New(1000, -3), types.MustCreateDecimalType(10, 3)),   // 1.000
+			right: NewLiteral(apd.New(100000, -5), types.MustCreateDecimalType(10, 5)), // 1.00000
 			exp:   "1.00000000",
 		},
 		{
-			left:  NewLiteral(decimal.New(1459, -4), types.MustCreateDecimalType(10, 4)), // 0.1459
-			right: NewLiteral(decimal.New(3, 0), types.MustCreateDecimalType(10, 0)),     // 3
+			left:  NewLiteral(apd.New(1459, -4), types.MustCreateDecimalType(10, 4)), // 0.1459
+			right: NewLiteral(apd.New(3, 0), types.MustCreateDecimalType(10, 0)),     // 3
 			exp:   "0.4377",
 		},
 		{
-			left:  NewLiteral(decimal.New(31459, -4), types.MustCreateDecimalType(10, 4)), // 3.1459
-			right: NewLiteral(decimal.New(3, 0), types.MustCreateDecimalType(10, 0)),      // 3
+			left:  NewLiteral(apd.New(31459, -4), types.MustCreateDecimalType(10, 4)), // 3.1459
+			right: NewLiteral(apd.New(3, 0), types.MustCreateDecimalType(10, 0)),      // 3
 			exp:   "9.4377",
 		},
 		{
@@ -442,46 +448,39 @@ func TestMult(t *testing.T) {
 			exp:   uint64(4006002),
 		},
 		{
-			left:  NewLiteral("2001-01-01", types.Date),
-			right: NewLiteral("2001-01-01", types.Date),
+			left:  NewLiteral(date2001, types.Date),
+			right: NewLiteral(date2001, types.Date),
 			exp:   int64(400404142030201),
 		},
 		{
-			skip:  true, // need to trim just the date portion
-			left:  NewLiteral("2001-01-01 12:00:00", types.Date),
-			right: NewLiteral("2001-01-01 12:00:00", types.Date),
+			left:  NewLiteral(datetime2001noon, types.Date),
+			right: NewLiteral(datetime2001noon, types.Date),
 			exp:   int64(400404142030201),
 		},
 		{
-			skip:  true, // need to trim just the date portion
-			left:  NewLiteral("2001-01-01 12:00:00.123456", types.Date),
-			right: NewLiteral("2001-01-01 12:00:00.123456", types.Date),
+			left:  NewLiteral(datetime2001noon123456, types.Date),
+			right: NewLiteral(datetime2001noon123456, types.Date),
 			exp:   int64(400404142030201),
 		},
 		{
-			// MySQL throws out of range
-			skip:  true,
-			left:  NewLiteral("2001-01-01 12:00:00", types.Datetime),
-			right: NewLiteral("2001-01-01 12:00:00", types.Datetime),
-			err:   sql.ErrValueOutOfRange,
+			left:  NewLiteral(datetime2001noon, types.Datetime),
+			right: NewLiteral(datetime2001noon, types.Datetime),
+			err:   sql.ErrIntegerOutOfRange,
 		},
 		{
-			skip:  true, // need to trim just the datetime portion according to precision
-			left:  NewLiteral("2001-01-01 12:00:00.123456", types.Datetime),
-			right: NewLiteral("2001-01-01 12:00:00.123456", types.Datetime),
-			err:   sql.ErrValueOutOfRange,
+			left:  NewLiteral(datetime2001noon123456, types.Datetime),
+			right: NewLiteral(datetime2001noon123456, types.Datetime),
+			err:   sql.ErrIntegerOutOfRange,
 		},
 		{
-			skip:  true, // need to trim just the datetime portion according to precision and use as exponent
-			left:  NewLiteral("2001-01-01 12:00:00.123456", types.MustCreateDatetimeType(sqltypes.Datetime, 3)),
-			right: NewLiteral("2001-01-01 12:00:00.123456", types.MustCreateDatetimeType(sqltypes.Datetime, 3)),
-			exp:   "400404146832630176884875520.015129",
+			left:  NewLiteral(datetime2001noon123, types.Datetime3),
+			right: NewLiteral(datetime2001noon123, types.Datetime3),
+			exp:   "400404146832630176884875520.015129000000",
 		},
 		{
-			skip:  true, // need to use precision as exponent
-			left:  NewLiteral("2001-01-01 12:00:00.123456", types.DatetimeMaxPrecision),
-			right: NewLiteral("2001-01-01 12:00:00.123456", types.DatetimeMaxPrecision),
-			exp:   "400404146832630195134087741.455241383936",
+			left:  NewLiteral(datetime2001noon123456, types.DatetimeMaxPrecision),
+			right: NewLiteral(datetime2001noon123456, types.DatetimeMaxPrecision),
+			exp:   "400404146832630195134087741.455241383936000000",
 		},
 		{
 			left:  NewLiteral("10", types.Text),
@@ -501,7 +500,8 @@ func TestMult(t *testing.T) {
 	}
 
 	for _, tt := range testCases {
-		name := fmt.Sprintf("%s(%v)*%s(%v)", tt.left.Type(), tt.left, tt.right.Type(), tt.right)
+		ctx := sql.NewEmptyContext()
+		name := fmt.Sprintf("%s(%v)*%s(%v)", tt.left.Type(ctx), tt.left, tt.right.Type(ctx), tt.right)
 		t.Run(name, func(t *testing.T) {
 			require := require.New(t)
 			if tt.skip {
@@ -511,12 +511,12 @@ func TestMult(t *testing.T) {
 			result, err := f.Eval(sql.NewEmptyContext(), nil)
 			if tt.err != nil {
 				require.Error(err)
-				require.True(tt.err.Is(err), err.Error())
+				require.True(tt.err.Is(err), fmt.Sprintf("Expected: '%s'\nReceived:'%s'", tt.err, err.Error()))
 				return
 			}
 			require.NoError(err)
-			if dec, ok := result.(decimal.Decimal); ok {
-				result = dec.StringFixed(dec.Exponent() * -1)
+			if dec, ok := result.(*apd.Decimal); ok {
+				result = dec.Text('f')
 			}
 			assert.Equal(t, tt.exp, result)
 		})
@@ -541,6 +541,8 @@ func TestMod(t *testing.T) {
 		{"1 % 0", 1, 0, "0", true},
 		{"0 % 0", 0, 0, "0", true},
 		{"0.5 % 0.24", 0, 0, "0.02", true},
+		{"12385865823658963784136.5 % 24852.24", 0, 0, "24264.50", true},
+		{"24852.5 % 12385865823658963784136.24", 0, 0, "24852.5", true},
 	}
 
 	for _, tt := range testCases {
@@ -554,9 +556,9 @@ func TestMod(t *testing.T) {
 			if tt.null {
 				require.Nil(result)
 			} else {
-				r, ok := result.(decimal.Decimal)
+				r, ok := result.(*apd.Decimal)
 				require.True(ok)
-				require.Equal(tt.expected, r.StringFixed(r.Exponent()*-1))
+				require.Equal(tt.expected, r.Text('f'))
 			}
 		})
 	}
@@ -591,11 +593,157 @@ func TestUnaryMinus(t *testing.T) {
 			f := NewUnaryMinus(NewLiteral(tt.input, tt.typ))
 			result, err := f.Eval(sql.NewEmptyContext(), nil)
 			require.NoError(t, err)
-			if dt, ok := result.(decimal.Decimal); ok {
-				require.Equal(t, tt.expected, dt.StringFixed(dt.Exponent()*-1))
+			if dt, ok := result.(*apd.Decimal); ok {
+				require.Equal(t, tt.expected, dt.Text('f'))
 			} else {
 				require.Equal(t, tt.expected, result)
 			}
 		})
 	}
+}
+
+// Results:
+// BenchmarkPlusHighScaleDecimals-16          3770235	       308.2 ns/op
+func BenchmarkPlusHighScaleDecimals(b *testing.B) {
+	require := require.New(b)
+	ctx := sql.NewEmptyContext()
+	p := NewPlus(
+		NewLiteral(types.DecimalFromFloat64(0.123456789), types.MustCreateDecimalType(types.DecimalTypeMaxPrecision, types.DecimalTypeMaxScale)),
+		NewLiteral(types.DecimalFromFloat64(0.987654321), types.MustCreateDecimalType(types.DecimalTypeMaxPrecision, types.DecimalTypeMaxScale)),
+	)
+	var res interface{}
+	var err error
+	for i := 0; i < b.N; i++ {
+		res, err = p.Eval(ctx, nil)
+		require.NoError(err)
+	}
+	if dec, ok := res.(*apd.Decimal); ok {
+		res = dec.Text('f')
+	}
+	exp := "1.111111110"
+	if res != exp {
+		b.Logf("Expected %v, got %v", exp, res)
+	}
+}
+
+// Results:
+// BenchmarkMinusHighScaleDecimals-16          3570638	       318.9 ns/op
+func BenchmarkMinusHighScaleDecimals(b *testing.B) {
+	require := require.New(b)
+	ctx := sql.NewEmptyContext()
+	m := NewMinus(
+		NewLiteral(types.DecimalFromFloat64(0.123456789), types.MustCreateDecimalType(types.DecimalTypeMaxPrecision, types.DecimalTypeMaxScale)),
+		NewLiteral(types.DecimalFromFloat64(0.987654321), types.MustCreateDecimalType(types.DecimalTypeMaxPrecision, types.DecimalTypeMaxScale)),
+	)
+	var res interface{}
+	var err error
+	for i := 0; i < b.N; i++ {
+		res, err = m.Eval(ctx, nil)
+		require.NoError(err)
+	}
+	if dec, ok := res.(*apd.Decimal); ok {
+		res = dec.Text('f')
+	}
+	exp := "-0.864197532"
+	if res != exp {
+		b.Logf("Expected %v, got %v", exp, res)
+	}
+}
+
+// Results:
+// BenchmarkMultHighScaleDecimals-16          3579982	       330.5 ns/op
+func BenchmarkMultHighScaleDecimals(b *testing.B) {
+	require := require.New(b)
+	ctx := sql.NewEmptyContext()
+	m := NewMult(
+		NewLiteral(types.DecimalFromFloat64(0.123456789), types.MustCreateDecimalType(types.DecimalTypeMaxPrecision, types.DecimalTypeMaxScale)),
+		NewLiteral(types.DecimalFromFloat64(0.987654321), types.MustCreateDecimalType(types.DecimalTypeMaxPrecision, types.DecimalTypeMaxScale)),
+	)
+	var res interface{}
+	var err error
+	for i := 0; i < b.N; i++ {
+		res, err = m.Eval(ctx, nil)
+		require.NoError(err)
+	}
+	if dec, ok := res.(*apd.Decimal); ok {
+		res = dec.Text('f')
+	}
+	exp := "0.121932631112635269"
+	if res != exp {
+		b.Logf("Expected %v, got %v", exp, res)
+	}
+}
+
+// Interval arithmetic must preserve precision both when converting its operand
+// and when serializing its result.
+func TestIntervalArithmeticPrecision(t *testing.T) {
+	ctx := sql.NewEmptyContext()
+	for _, tc := range []struct {
+		name      string
+		typ       sql.Type
+		input     interface{}
+		unit      string
+		amount    interface{}
+		op        string
+		reverse   bool
+		precision int
+		expected  string
+	}{
+		{"reported addition", types.DatetimeMaxPrecision, "2026-01-02 12:34:56.527248", "MICROSECOND", int64(1), "+", false, 6, "2026-01-02 12:34:56.527249"},
+		{"reported subtraction", types.DatetimeMaxPrecision, "2026-01-02 12:34:56.527248", "HOUR", int64(12), "-", false, 6, "2026-01-02 00:34:56.527248"},
+		{"below rounding midpoint", types.DatetimeMaxPrecision, "2026-01-02 12:34:56.127248", "DAY", int64(1), "+", false, 6, "2026-01-03 12:34:56.127248"},
+		{"reversed addition", types.DatetimeMaxPrecision, "2026-01-02 12:34:56.527248", "MICROSECOND", int64(1), "+", true, 6, "2026-01-02 12:34:56.527249"},
+		{"carry into next day", types.DatetimeMaxPrecision, "2026-01-02 23:59:59.999999", "MICROSECOND", int64(1), "+", false, 6, "2026-01-03 00:00:00.000000"},
+		{"borrow from previous day", types.DatetimeMaxPrecision, "2026-01-03 00:00:00.000000", "MICROSECOND", int64(1), "-", false, 6, "2026-01-02 23:59:59.999999"},
+		{"zero precision", types.Datetime, "2026-01-02 12:34:56", "SECOND", int64(1), "+", false, 0, "2026-01-02 12:34:57"},
+		{"interval adds precision", types.Datetime, "2026-01-02 12:34:56", "MICROSECOND", int64(1), "+", false, 6, "2026-01-02 12:34:56.000001"},
+		{"milliseconds", types.MustCreateDatetimeType(types.Datetime.Type(), 3), "2026-01-02 12:34:56.527", "HOUR", int64(1), "+", false, 3, "2026-01-02 13:34:56.527"},
+		{"milliseconds plus microsecond", types.MustCreateDatetimeType(types.Datetime.Type(), 3), "2026-01-02 12:34:56.527", "MICROSECOND", int64(1), "+", false, 6, "2026-01-02 12:34:56.527001"},
+		{"timestamp becomes datetime", types.MustCreateDatetimeType(types.Timestamp.Type(), 6), "2026-01-02 12:34:56.527248", "HOUR", int64(1), "+", false, 6, "2026-01-02 13:34:56.527248"},
+		{"date plus microsecond", types.Date, "2026-01-02", "MICROSECOND", int64(1), "+", false, 6, "2026-01-02 00:00:00.000001"},
+		{"composite", types.Datetime, "2026-01-02 12:34:56", "SECOND_MICROSECOND", "1.000001", "+", false, 6, "2026-01-02 12:34:57.000001"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			value, _, err := tc.typ.Convert(ctx, tc.input)
+			require.NoError(t, err)
+			var left sql.Expression = NewGetField(0, tc.typ, "d", true)
+			amountType := sql.Type(types.Int64)
+			if _, ok := tc.amount.(string); ok {
+				amountType = types.LongText
+			}
+			var right sql.Expression = NewInterval(NewLiteral(tc.amount, amountType), tc.unit)
+			if tc.reverse {
+				left, right = right, left
+			}
+			expr := NewArithmetic(left, right, tc.op)
+			expectedType := types.MustCreateDatetimeType(types.Datetime.Type(), tc.precision)
+			require.Equal(t, expectedType, expr.Type(ctx))
+			actual, err := expr.Eval(ctx, sql.Row{value})
+			require.NoError(t, err)
+			expected, _, err := expectedType.Convert(ctx, tc.expected)
+			require.NoError(t, err)
+			require.Equal(t, expected, actual)
+			serialized, err := expr.Type(ctx).SQL(ctx, nil, actual)
+			require.NoError(t, err)
+			require.Equal(t, tc.expected, serialized.ToString())
+			actual, err = expr.Eval(ctx, sql.Row{nil})
+			require.NoError(t, err)
+			require.Nil(t, actual)
+		})
+	}
+}
+
+// An integrator can implement TimeDeltaExpression without using *Interval.
+type externalInterval struct {
+	*Interval
+}
+
+func TestExternalIntervalArithmeticPrecision(t *testing.T) {
+	ctx := sql.NewEmptyContext()
+	interval := &externalInterval{NewInterval(NewLiteral(int64(1), types.Int64), "MICROSECOND")}
+	expr := NewPlus(NewLiteral(datetime2001noon, types.Datetime), interval)
+	require.Equal(t, types.DatetimeMaxPrecision, expr.Type(ctx))
+	actual, err := expr.Eval(ctx, nil)
+	require.NoError(t, err)
+	require.Equal(t, datetime2001noon.Add(time.Microsecond), actual)
 }

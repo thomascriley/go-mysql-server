@@ -21,6 +21,7 @@ type TableCopier struct {
 var _ sql.Databaser = (*TableCopier)(nil)
 var _ sql.Node = (*TableCopier)(nil)
 var _ sql.CollationCoercible = (*TableCopier)(nil)
+var _ DisjointedChildrenNode = (*TableCopier)(nil)
 
 type CopierProps struct {
 	replace bool
@@ -51,14 +52,16 @@ func (tc *TableCopier) Database() sql.Database {
 }
 
 func (tc *TableCopier) ProcessCreateTable(ctx *sql.Context, b sql.NodeExecBuilder, row sql.Row) (sql.RowIter, error) {
-	ct := tc.Destination.(*CreateTable)
+	destination, ok := tc.Destination.(sql.Nameable)
+	if !ok {
+		return nil, fmt.Errorf("TableCopier requires a named create-table destination, found %T", tc.Destination)
+	}
 
-	_, err := b.Build(ctx, ct, row)
-	if err != nil {
+	if err := buildAndCloseTableCopierDestination(ctx, b, tc.Destination, row); err != nil {
 		return sql.RowsToRowIter(), err
 	}
 
-	table, tableExists, err := tc.db.GetTableInsensitive(ctx, ct.Name())
+	table, tableExists, err := tc.db.GetTableInsensitive(ctx, destination.Name())
 	if err != nil {
 		return sql.RowsToRowIter(), err
 	}
@@ -67,8 +70,8 @@ func (tc *TableCopier) ProcessCreateTable(ctx *sql.Context, b sql.NodeExecBuilde
 		return sql.RowsToRowIter(), fmt.Errorf("error: Newly created table does not exist")
 	}
 
-	if tc.createTableSelectCanBeCopied(table) {
-		return tc.CopyTableOver(ctx, tc.Source.Schema()[0].Source, table.Name())
+	if tc.createTableSelectCanBeCopied(ctx, table) {
+		return tc.CopyTableOver(ctx, tc.Source.Schema(ctx)[0].Source, table.Name())
 	}
 
 	// TODO: Improve parsing for CREATE TABLE SELECT to allow for IGNORE/REPLACE and custom specs
@@ -77,8 +80,17 @@ func (tc *TableCopier) ProcessCreateTable(ctx *sql.Context, b sql.NodeExecBuilde
 	return b.Build(ctx, ii, row)
 }
 
+// buildAndCloseTableCopierDestination executes the create phase and releases its iterator before rows are copied.
+func buildAndCloseTableCopierDestination(ctx *sql.Context, b sql.NodeExecBuilder, destination sql.Node, row sql.Row) error {
+	iter, err := b.Build(ctx, destination, row)
+	if err != nil || iter == nil {
+		return err
+	}
+	return iter.Close(ctx)
+}
+
 // createTableSelectCanBeCopied determines whether the newly created table's data can just be copied from the Source table
-func (tc *TableCopier) createTableSelectCanBeCopied(tableNode sql.Table) bool {
+func (tc *TableCopier) createTableSelectCanBeCopied(ctx *sql.Context, tableNode sql.Table) bool {
 	// The differences in LIMIT between integrators prevent us from using a copy
 	if _, ok := tc.Source.(*Limit); ok {
 		return false
@@ -94,8 +106,8 @@ func (tc *TableCopier) createTableSelectCanBeCopied(tableNode sql.Table) bool {
 	}
 
 	// If there isn't a match in schema we cannot do a direct copy.
-	sourceSchema := tc.Source.Schema()
-	tableNodeSchema := tableNode.Schema()
+	sourceSchema := tc.Source.Schema(ctx)
+	tableNodeSchema := tableNode.Schema(ctx)
 
 	if len(sourceSchema) != len(tableNodeSchema) {
 		return false
@@ -125,16 +137,33 @@ func (tc *TableCopier) CopyTableOver(ctx *sql.Context, sourceTable string, desti
 	return sql.RowsToRowIter([]sql.Row{{types.OkResult{RowsAffected: rowsUpdated, InsertID: 0, Info: nil}}}...), nil
 }
 
-func (tc *TableCopier) Schema() sql.Schema {
-	return tc.Destination.Schema()
+func (tc *TableCopier) Schema(ctx *sql.Context) sql.Schema {
+	return tc.Destination.Schema(ctx)
 }
 
 func (tc *TableCopier) Children() []sql.Node {
 	return nil
 }
 
-func (tc *TableCopier) WithChildren(...sql.Node) (sql.Node, error) {
+func (tc *TableCopier) WithChildren(*sql.Context, ...sql.Node) (sql.Node, error) {
 	return tc, nil
+}
+
+// DisjointedChildren exposes the independently analyzed destination and source trees.
+func (tc *TableCopier) DisjointedChildren() [][]sql.Node {
+	return [][]sql.Node{{tc.Destination}, {tc.Source}}
+}
+
+// WithDisjointedChildren returns a TableCopier with replacement destination and source trees.
+func (tc *TableCopier) WithDisjointedChildren(children [][]sql.Node) (sql.Node, error) {
+	if len(children) != 2 || len(children[0]) != 1 || len(children[1]) != 1 {
+		return nil, sql.ErrInvalidChildrenNumber.New(tc, len(children), 2)
+	}
+
+	ntc := *tc
+	ntc.Destination = children[0][0]
+	ntc.Source = children[1][0]
+	return &ntc, nil
 }
 
 // CollationCoercibility implements the interface sql.CollationCoercible.

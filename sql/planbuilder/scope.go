@@ -26,6 +26,26 @@ import (
 	"github.com/dolthub/go-mysql-server/sql/transform"
 )
 
+// queryBlock identifies a SELECT and its enclosing SELECT. One SELECT produces
+// several scopes: for SELECT x FROM t HAVING x > 0, buildSelect creates a FROM
+// scope for t, pushes a projection scope for x, and builds a HAVING scope for
+// x > 0. All three belong to the same queryBlock, though their scope parents
+// differ. In SELECT t.x FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.y = t.x),
+// the outer and nested SELECT each have their own queryBlock and builder scopes.
+// Tracking the scope parent chain and the enclosing query block chain separately
+// is required to analyze name lookup, correlated references, and expression
+// ownership correctly.
+type queryBlock struct {
+	// source is the FROM scope that owns this query block.
+	source *scope
+	// parent is the parent query block that encloses this query block. The projections from the
+	// parent query block are visible and may be correlated references in this query block.
+	parent *queryBlock
+	// correlations records columns resolved outside this query block. It is nil
+	// for a top-level query.
+	correlations *subquery
+}
+
 // scope tracks relational dependencies necessary to type check expressions,
 // resolve name definitions, and build relational nodes.
 type scope struct {
@@ -40,7 +60,7 @@ type scope struct {
 	tables              map[string]sql.TableId
 	oldTables           map[sql.TableId]string
 	windowDefs          map[string]*sql.WindowDefinition
-	selectAliases       map[string]sql.Expression
+	selectAliases       map[string]*expression.Alias
 	insertColumnAliases map[string]string
 
 	// redirectCol is used for using and natural joins right-table
@@ -56,6 +76,9 @@ type scope struct {
 	parent         *scope
 	activeSubquery *subquery
 
+	// queryBlock is the semantic SELECT block containing this scope.
+	queryBlock *queryBlock
+
 	// groupBy collects aggregation functions and inputs
 	groupBy *groupBy
 
@@ -68,7 +91,12 @@ type scope struct {
 	// windowFuncs is a list of window functions in the current scope
 	windowFuncs []scopeColumn
 
+	// selectAliasScope marks the temporary SELECT list alias scope.
+	selectAliasScope bool
+
 	refsSubquery bool
+
+	schemaName string
 }
 
 // resolveColumn matches a variable use to a column definition with a unique
@@ -92,7 +120,13 @@ func (s *scope) resolveColumn(db, table, col string, checkParent, chooseFirst bo
 
 	var found scopeColumn
 	var foundCand bool
+	// In window clauses (PARTITION BY, ORDER BY), column names must match
+	// table columns, not same-level SELECT aliases with the same name.
+	hideAliases := s.selectAliasScope && s.b.windowClause != ""
 	for _, c := range s.cols {
+		if hideAliases {
+			break
+		}
 		if strings.EqualFold(c.col, col) && (strings.EqualFold(c.table, table) || table == "") && (strings.EqualFold(c.db, db) || db == "") {
 			if foundCand {
 				if found.equals(c) {
@@ -105,9 +139,9 @@ func (s *scope) resolveColumn(db, table, col string, checkParent, chooseFirst bo
 						return c, true
 					}
 				}
-				if c.table == OnDupValuesPrefix {
+				if s.insertTableAlias != "" && c.table == s.insertTableAlias {
 					return found, true
-				} else if found.table == OnDupValuesPrefix {
+				} else if s.insertTableAlias != "" && found.table == s.insertTableAlias {
 					return c, true
 				}
 				err := sql.ErrAmbiguousColumnName.New(col, []string{c.table, found.table})
@@ -140,16 +174,22 @@ func (s *scope) resolveColumn(db, table, col string, checkParent, chooseFirst bo
 		}
 	}
 
-	if !checkParent || s.parent == nil {
+	if !checkParent {
 		return scopeColumn{}, false
 	}
 
-	c, foundCand := s.parent.resolveColumn(db, table, col, true, false)
+	parent, correlations := s.parentForColumnResolution()
+	if parent == nil {
+		return scopeColumn{}, false
+	}
+	c, foundCand := parent.resolveColumn(db, table, col, true, false)
 	if !foundCand {
 		return scopeColumn{}, false
 	}
 
-	if s.activeSubquery != nil {
+	if correlations != nil {
+		correlations.addOutOfScope(c.id)
+	} else if s.activeSubquery != nil {
 		s.activeSubquery.addOutOfScope(c.id)
 	}
 	return c, true
@@ -166,8 +206,10 @@ func (s *scope) resolveColumnAsTable(db, table string) []scopeColumn {
 		}
 		tableCols = append(tableCols, col)
 	}
-	if len(tableCols) == 0 && s.parent != nil {
-		return s.parent.resolveColumnAsTable(db, table)
+	if len(tableCols) == 0 {
+		if parent, _ := s.parentForColumnResolution(); parent != nil {
+			return parent.resolveColumnAsTable(db, table)
+		}
 	}
 	sort.Slice(tableCols, func(i, j int) bool {
 		return tableCols[i].id < tableCols[j].id
@@ -177,25 +219,24 @@ func (s *scope) resolveColumnAsTable(db, table string) []scopeColumn {
 
 // getCol gets a scopeColumn based on a columnId
 func (s *scope) getCol(colId sql.ColumnId) (scopeColumn, bool) {
-	if s.colset.Contains(colId) {
-		for _, c := range s.cols {
-			if sql.ColumnId(c.id) == colId {
-				return c, true
-			}
+	if !s.colset.Contains(colId) {
+		return scopeColumn{}, false
+	}
+	return s.findColumn(colId)
+}
+
+// findColumn returns the column with the given ID from this scope only.
+func (s *scope) findColumn(id sql.ColumnId) (scopeColumn, bool) {
+	for _, col := range s.cols {
+		if sql.ColumnId(col.id) == id {
+			return col, true
 		}
 	}
 	return scopeColumn{}, false
 }
 
 func (s *scope) hasTable(table string) bool {
-	_, ok := s.tables[strings.ToLower(table)]
-	if ok {
-		return true
-	}
-	if s.parent != nil {
-		return s.parent.hasTable(table)
-	}
-	return false
+	return s.getTable(table) != 0
 }
 
 // getTable returns the table ID matching the given name.
@@ -204,10 +245,37 @@ func (s *scope) getTable(table string) sql.TableId {
 	if ok {
 		return id
 	}
-	if s.parent != nil {
-		return s.parent.getTable(table)
+	if parent, _ := s.parentForColumnResolution(); parent != nil {
+		return parent.getTable(table)
 	}
 	return 0
+}
+
+// parentForColumnResolution returns the next scope to search after a column is
+// absent locally. Normal parent lookup follows the builder's parent scope. When
+// resolving aggregate arguments, lookup instead enters the enclosing query's
+// source scope (i.e. following the semantic queryBlock), skipping intermediate
+// projection and HAVING namespaces, since those are not valid for aggregation
+// argument resolution.
+// When lookup finds a column across that boundary, the caller adds its ID to
+// the returned subquery's correlated dependencies.
+// A query without correlation tracking retains normal parent lookup.
+// A subquery with no visible parent query block terminates lookup.
+func (s *scope) parentForColumnResolution() (nextScope *scope, correlatedSubquery *subquery) {
+	if s.b == nil || s.queryBlock == nil || !s.b.isAggregateArgumentQuerySource(s) {
+		return s.parent, nil
+	}
+	if s.queryBlock.parent != nil {
+		return s.queryBlock.parent.source, s.queryBlock.correlations
+	}
+	if s.queryBlock.correlations != nil {
+		// If the query has no visible parent query block, we can stop lookup here
+		return nil, nil
+	} else {
+		// Otherwise, return the scope's parent to retain access to enclosing
+		// builder namespaces (e.g. to provide NEW/OLD refs for triggers).
+		return s.parent, nil
+	}
 }
 
 // triggerCol is used to hallucinate a new column during trigger DDL
@@ -279,6 +347,19 @@ func (s *scope) initGroupBy() {
 	if s.groupBy == nil {
 		s.groupBy = &groupBy{outScope: s.replace()}
 	}
+}
+
+// aggCount returns the count of aggregate expressions in this scope.
+func (s *scope) aggCount() int {
+	if s.groupBy == nil {
+		return 0
+	}
+	return len(s.groupBy.aggs)
+}
+
+// windowFuncCount returns the count of window functions in this scope.
+func (s *scope) windowFuncCount() int {
+	return len(s.windowFuncs)
 }
 
 // pushSubquery creates a new scope with the subquery already initialized.
@@ -389,8 +470,10 @@ func (s *scope) setColAlias(cols []string) {
 // into this scope.
 func (s *scope) push() *scope {
 	new := &scope{
-		b:      s.b,
-		parent: s,
+		b:          s.b,
+		parent:     s,
+		queryBlock: s.queryBlock,
+		schemaName: s.schemaName,
 	}
 	if s.procActive() {
 		new.initProc()
@@ -406,18 +489,19 @@ func (s *scope) replace() *scope {
 		return &scope{}
 	}
 	return &scope{
-		b:      s.b,
-		parent: s.parent,
+		b:          s.b,
+		parent:     s.parent,
+		queryBlock: s.queryBlock,
 	}
 }
 
 // aliasCte copies a scope, but increments the column and table ids
 // for the new relation.
-func (s *scope) aliasCte(alias string) *scope {
+func (s *scope) aliasCte(ctx *sql.Context, alias string) *scope {
 	if s == nil {
 		return nil
 	}
-	outScope := s.copy()
+	outScope := s.copy(ctx)
 
 	sq, _ := outScope.node.(*plan.SubqueryAlias)
 
@@ -459,14 +543,14 @@ func (s *scope) aliasCte(alias string) *scope {
 }
 
 // copy produces an identical scope with copied references.
-func (s *scope) copy() *scope {
+func (s *scope) copy(ctx *sql.Context) *scope {
 	if s == nil {
 		return nil
 	}
 
 	ret := *s
 	if ret.node != nil {
-		ret.node, _ = DeepCopyNode(s.node)
+		ret.node, _ = DeepCopyNode(ctx, s.node)
 	}
 	if s.tables != nil {
 		ret.tables = make(map[string]sql.TableId, len(s.tables))
@@ -498,7 +582,7 @@ func (s *scope) copy() *scope {
 		ret.colset = s.colset.Copy()
 	}
 	if s.selectAliases != nil {
-		ret.selectAliases = make(map[string]sql.Expression, len(s.selectAliases))
+		ret.selectAliases = make(map[string]*expression.Alias, len(s.selectAliases))
 		for k, v := range s.selectAliases {
 			ret.selectAliases[k] = v
 		}
@@ -508,9 +592,9 @@ func (s *scope) copy() *scope {
 }
 
 // DeepCopyNode copies a sql.Node.
-func DeepCopyNode(node sql.Node) (sql.Node, error) {
-	n, _, err := transform.NodeExprs(node, func(e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
-		e, err := transform.Clone(e)
+func DeepCopyNode(ctx *sql.Context, node sql.Node) (sql.Node, error) {
+	n, _, err := transform.NodeExprs(ctx, node, func(ctx *sql.Context, e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
+		e, err := transform.Clone(ctx, e)
 		return e, transform.NewTree, err
 	})
 	return n, err
@@ -618,6 +702,10 @@ func (s *scope) addExpressions(newExprs map[string]columnId) {
 // multi-relational expressions.
 func (s *scope) appendColumnsFromScope(src *scope) {
 	s.cols = append(s.cols, src.cols...)
+	for _, c := range src.cols {
+		s.colset.Add(sql.ColumnId(c.id))
+	}
+
 	if len(src.exprs) > 0 && s.exprs == nil {
 		s.exprs = make(map[string]columnId)
 	}
@@ -646,10 +734,8 @@ func (s *scope) handleErr(err error) {
 	panic(parseErr{err})
 }
 
-// tableId and columnId are temporary ways to track expression
-// and name uniqueness.
+// columnId is a temporary way to track expression and name uniqueness.
 // todo: the plan format should track these
-type tableId uint16
 type columnId uint16
 
 type scopeColumn struct {
@@ -663,12 +749,9 @@ type scopeColumn struct {
 	tableId     sql.TableId
 	nullable    bool
 	descending  bool
+	nullsLast   bool
 	outOfScope  bool
-}
-
-// empty returns true if a scopeColumn is the null value
-func (c scopeColumn) empty() bool {
-	return c.id == 0
+	hidden      bool
 }
 
 func (c scopeColumn) equals(other scopeColumn) bool {
@@ -711,10 +794,11 @@ func (c scopeColumn) scalarGf() sql.Expression {
 			return e
 		}
 	}
+	name := c.col
 	if c.originalCol != "" {
-		return expression.NewGetFieldWithTable(int(c.id), int(c.tableId), c.typ, c.db, c.table, c.originalCol, c.nullable)
+		name = c.originalCol
 	}
-	return expression.NewGetFieldWithTable(int(c.id), int(c.tableId), c.typ, c.db, c.table, c.col, c.nullable)
+	return expression.NewGetFieldWithTable(int(c.id), int(c.tableId), c.typ, c.db, c.table, name, c.nullable)
 }
 
 func (c scopeColumn) String() string {

@@ -15,7 +15,6 @@
 package json
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -44,7 +43,7 @@ var _ sql.CollationCoercible = (*JsonValue)(nil)
 var jsonValueDefaultType = types.MustCreateString(sqltypes.VarChar, 512, sql.Collation_Default)
 
 // NewJsonValue creates a new JsonValue UDF.
-func NewJsonValue(args ...sql.Expression) (sql.Expression, error) {
+func NewJsonValue(ctx *sql.Context, args ...sql.Expression) (sql.Expression, error) {
 	if len(args) < 1 || len(args) > 3 {
 		return nil, sql.ErrInvalidArgumentNumber.New("JSON_VALUE", 2, len(args))
 	} else if len(args) == 1 {
@@ -53,7 +52,7 @@ func NewJsonValue(args ...sql.Expression) (sql.Expression, error) {
 		return &JsonValue{JSON: args[0], Path: args[1], Typ: jsonValueDefaultType}, nil
 	} else {
 		// third argument is literal zero of the coercion type
-		return &JsonValue{JSON: args[0], Path: args[1], Typ: args[2].Type()}, nil
+		return &JsonValue{JSON: args[0], Path: args[1], Typ: args[2].Type(ctx)}, nil
 	}
 }
 
@@ -73,7 +72,7 @@ func (j *JsonValue) Resolved() bool {
 }
 
 // Type implements the sql.Expression interface.
-func (j *JsonValue) Type() sql.Type { return j.Typ }
+func (j *JsonValue) Type(ctx *sql.Context) sql.Type { return j.Typ }
 
 // CollationCoercibility implements the interface sql.CollationCoercible.
 func (*JsonValue) CollationCoercibility(ctx *sql.Context) (collation sql.CollationID, coercibility byte) {
@@ -139,8 +138,8 @@ func (j *JsonValue) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 }
 
 // IsNullable implements the sql.Expression interface.
-func (j *JsonValue) IsNullable() bool {
-	return j.JSON.IsNullable() || j.Path.IsNullable()
+func (j *JsonValue) IsNullable(ctx *sql.Context) bool {
+	return j.JSON.IsNullable(ctx) || j.Path.IsNullable(ctx)
 }
 
 // Children implements the sql.Expression interface.
@@ -149,7 +148,7 @@ func (j *JsonValue) Children() []sql.Expression {
 }
 
 // WithChildren implements the Expression interface.
-func (j *JsonValue) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (j *JsonValue) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 2 {
 		return nil, sql.ErrInvalidChildrenNumber.New(j, len(children), 2)
 	}
@@ -165,7 +164,37 @@ func (j *JsonValue) String() string {
 	for i, c := range children {
 		parts[i] = c.String()
 	}
+	if !j.Typ.Equals(jsonValueDefaultType) {
+		parts = append(parts, fmt.Sprintf("'%s'", jsonValueTypeName(j.Typ)))
+	}
 	return fmt.Sprintf("json_value(%s)", strings.Join(parts, ", "))
+}
+
+func jsonValueTypeName(typ sql.Type) string {
+	switch {
+	case typ.Type() == sqltypes.Year:
+		return "year"
+	case typ.Type() == sqltypes.Time:
+		return "time"
+	case typ.Type() == sqltypes.Date:
+		return "date"
+	case typ.Type() == sqltypes.Datetime || typ.Type() == sqltypes.Timestamp:
+		return "datetime"
+	case types.IsJSON(typ):
+		return "json"
+	case typ == types.Float32:
+		return "float"
+	case typ == types.Float64:
+		return "double"
+	case types.IsSigned(typ):
+		return "signed"
+	case types.IsUnsigned(typ):
+		return "unsigned"
+	case types.IsText(typ):
+		return "char"
+	default:
+		return typ.String()
+	}
 }
 
 // GetJSONFromWrapperOrCoercibleString takes a valid argument for JSON functions (either a JSON wrapper type or a string)
@@ -180,7 +209,7 @@ func GetJSONFromWrapperOrCoercibleString(ctx *sql.Context, js interface{}, funct
 		if err != nil {
 			return nil, err
 		}
-		if err = json.Unmarshal(strData.([]byte), &jsonData); err != nil {
+		if err = types.JsonUnmarshal(strData.([]byte), &jsonData); err != nil {
 			return nil, err
 		}
 		return jsonData, nil

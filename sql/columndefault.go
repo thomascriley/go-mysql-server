@@ -21,6 +21,7 @@ import (
 // ColumnDefaultValue is an expression representing the default value of a column. May represent both a default literal
 // and a default expression. A nil pointer of this type represents an implicit default value and is thus valid, so all
 // method calls will return without error.
+// TODO: This needs a better name because it's not always the default value. It can also be a generated or ON UPDATE value
 type ColumnDefaultValue struct {
 	// Expression is the expression representing this default value
 	Expr Expression
@@ -84,6 +85,12 @@ func (e *ColumnDefaultValue) Eval(ctx *Context, r Row) (interface{}, error) {
 		var inRange ConvertInRange
 		if roundType, isRoundType := e.OutType.(RoundingNumberType); isRoundType {
 			val, inRange, err = roundType.ConvertRound(ctx, val)
+		} else if outType, isOutExtended := e.OutType.(ExtendedType); isOutExtended {
+			if exprType, isExprExtended := e.Expr.Type(ctx).(ExtendedType); isExprExtended && !outType.Equals(exprType) {
+				val, inRange, err = outType.ConvertToType(ctx, exprType, val, 'a')
+			} else {
+				val, inRange, err = e.OutType.Convert(ctx, val)
+			}
 		} else {
 			val, inRange, err = e.OutType.Convert(ctx, val)
 		}
@@ -119,14 +126,14 @@ func (e *ColumnDefaultValue) IsParenthesized() bool {
 }
 
 // IsNullable implements sql.Expression
-func (e *ColumnDefaultValue) IsNullable() bool {
+func (e *ColumnDefaultValue) IsNullable(ctx *Context) bool {
 	if e == nil {
 		return true
 	}
 	if !e.ReturnNil {
 		return false
 	}
-	return e.Expr.IsNullable()
+	return e.Expr.IsNullable(ctx)
 }
 
 // Resolved implements sql.Expression
@@ -174,27 +181,28 @@ func (e *ColumnDefaultValue) String() string {
 	return fmt.Sprintf("(%s)", str)
 }
 
-func (e *ColumnDefaultValue) DebugString() string {
+func (e *ColumnDefaultValue) DebugString(ctx *Context) string {
 	if e == nil {
 		return ""
 	}
 
 	if e.Literal {
-		return DebugString(e.Expr)
+		return DebugString(ctx, e.Expr)
 	} else if e.Parenthesized {
-		return fmt.Sprintf("parenthesized(%s)", DebugString(e.Expr))
+		return fmt.Sprintf("parenthesized(%s)", DebugString(ctx, e.Expr))
 	} else {
-		return fmt.Sprintf("(%s)", DebugString(e.Expr))
+		return fmt.Sprintf("(%s)", DebugString(ctx, e.Expr))
 	}
 }
 
 // Type implements sql.Expression
-func (e *ColumnDefaultValue) Type() Type {
+func (e *ColumnDefaultValue) Type(ctx *Context) Type {
 	if e == nil {
+		// TODO: This is not correct. The type should be types.Null. But that causes a cyclical import.
 		return nil
 	}
 	if e.OutType == nil {
-		return e.Expr.Type()
+		return e.Expr.Type(ctx)
 	}
 	return e.OutType
 }
@@ -208,7 +216,7 @@ func (e *ColumnDefaultValue) CollationCoercibility(ctx *Context) (collation Coll
 }
 
 // WithChildren implements sql.Expression
-func (e *ColumnDefaultValue) WithChildren(children ...Expression) (Expression, error) {
+func (e *ColumnDefaultValue) WithChildren(ctx *Context, children ...Expression) (Expression, error) {
 	if e == nil && len(children) == 0 {
 		return e, nil
 	}
@@ -264,7 +272,7 @@ func (u UnresolvedColumnDefault) String() string {
 	return u.ExprString
 }
 
-func (u UnresolvedColumnDefault) Type() Type {
+func (u UnresolvedColumnDefault) Type(ctx *Context) Type {
 	panic("UnresolvedColumnDefault is a placeholder node, but Type() was called")
 }
 
@@ -273,7 +281,7 @@ func (UnresolvedColumnDefault) CollationCoercibility(ctx *Context) (collation Co
 	return Collation_binary, 7
 }
 
-func (u UnresolvedColumnDefault) IsNullable() bool {
+func (u UnresolvedColumnDefault) IsNullable(ctx *Context) bool {
 	return true
 }
 
@@ -285,7 +293,7 @@ func (u UnresolvedColumnDefault) Children() []Expression {
 	return nil
 }
 
-func (u UnresolvedColumnDefault) WithChildren(children ...Expression) (Expression, error) {
+func (u UnresolvedColumnDefault) WithChildren(ctx *Context, children ...Expression) (Expression, error) {
 	if len(children) != 0 {
 		return nil, ErrInvalidChildrenNumber.New(u, len(children), 0)
 	}

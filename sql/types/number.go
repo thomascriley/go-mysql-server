@@ -21,15 +21,14 @@ import (
 	"fmt"
 	"math"
 	"reflect"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
 	"unicode"
 
+	"github.com/cockroachdb/apd/v3"
 	"github.com/dolthub/vitess/go/sqltypes"
 	"github.com/dolthub/vitess/go/vt/proto/query"
-	"github.com/shopspring/decimal"
 
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/values"
@@ -63,17 +62,12 @@ var (
 	// Float64 is a floating point number of 64 bits.
 	Float64 = MustCreateNumberType(sqltypes.Float64)
 
-	// decimal that represents the max value an uint64 can hold
-	dec_uint64_max = decimal.NewFromInt(math.MaxInt64).Mul(decimal.NewFromInt(2).Add(decimal.NewFromInt(1)))
-	dec_uint32_max = decimal.NewFromInt(math.MaxInt32).Mul(decimal.NewFromInt(2).Add(decimal.NewFromInt(1)))
-	dec_uint16_max = decimal.NewFromInt(math.MaxInt16).Mul(decimal.NewFromInt(2).Add(decimal.NewFromInt(1)))
-	dec_uint8_max  = decimal.NewFromInt(math.MaxInt8).Mul(decimal.NewFromInt(2).Add(decimal.NewFromInt(1)))
-	// decimal that represents the max value an int64 can hold
-	dec_int64_max = decimal.NewFromInt(math.MaxInt64)
-	// decimal that represents the min value an int64 can hold
-	dec_int64_min = decimal.NewFromInt(math.MinInt64)
-	// decimal that represents the zero value
-	dec_zero = decimal.NewFromInt(0)
+	// DecimalMaxUint64 represents the max value an uint64 can hold
+	DecimalMaxUint64 = DecimalFromUint64(math.MaxUint64)
+	// DecimalMaxInt64 represents the max value an int64 can hold
+	DecimalMaxInt64 = DecimalFromInt64(math.MaxInt64)
+	// DecimalMinInt64 represents the min value an int64 can hold
+	DecimalMinInt64 = DecimalFromInt64(math.MinInt64)
 
 	numberInt8ValueType    = reflect.TypeOf(int8(0))
 	numberInt16ValueType   = reflect.TypeOf(int16(0))
@@ -85,8 +79,6 @@ var (
 	numberUint64ValueType  = reflect.TypeOf(uint64(0))
 	numberFloat32ValueType = reflect.TypeOf(float32(0))
 	numberFloat64ValueType = reflect.TypeOf(float64(0))
-
-	numre = regexp.MustCompile(`^[ ]*[0-9]*\.?[0-9]+`)
 )
 
 type Round bool
@@ -285,10 +277,6 @@ func (t NumberTypeImpl_) Convert(ctx context.Context, v interface{}) (interface{
 		return nil, sql.InRange, nil
 	}
 
-	if ti, ok := v.(time.Time); ok {
-		v = ti.UTC().Unix()
-	}
-
 	if jv, ok := v.(sql.JSONWrapper); ok {
 		v, err = jv.ToInterface(ctx)
 		if err != nil {
@@ -296,6 +284,10 @@ func (t NumberTypeImpl_) Convert(ctx context.Context, v interface{}) (interface{
 		}
 	}
 
+	// TODO: This can be cleaned up a lot. The max/min values can be passed into the convert functions and checked
+	//  there to avoid doing extra checks. Range checks seem to be inconsistent, sometimes we do them multiple times,
+	//  sometimes we skip them altogether. We also do a lot of back and forth casting; for example, the int8 case will
+	//  cast the value into an int64 during convertToInt64 and then cast it back to an int8.
 	switch t.baseType {
 	case sqltypes.Int8:
 		num, inRange, err := convertToInt64(t, v, ShouldTruncate)
@@ -400,7 +392,7 @@ func (t NumberTypeImpl_) Convert(ctx context.Context, v interface{}) (interface{
 	case sqltypes.Float32:
 		num, err := convertToFloat64(t, v)
 		if err != nil && !sql.ErrTruncatedIncorrect.Is(err) {
-			return int8(num), sql.InRange, err
+			return float32(num), sql.InRange, err
 		}
 		if num > math.MaxFloat32 {
 			return float32(math.MaxFloat32), sql.Overflow, nil
@@ -410,8 +402,8 @@ func (t NumberTypeImpl_) Convert(ctx context.Context, v interface{}) (interface{
 		}
 		return float32(num), sql.InRange, err
 	case sqltypes.Float64:
-		ret, err := convertToFloat64(t, v)
-		return ret, sql.InRange, err
+		num, err := convertToFloat64(t, v)
+		return num, sql.InRange, err
 	default:
 		return nil, sql.InRange, sql.ErrInvalidType.New(t.baseType.String())
 	}
@@ -677,8 +669,8 @@ func (t NumberTypeImpl_) SQLUint24(ctx *sql.Context, dest []byte, v interface{})
 	if err != nil {
 		return nil, err
 	}
-	if num > (1 << 24) {
-		num = uint64((1 << 24))
+	if num > (1<<24 - 1) {
+		num = uint64(1<<24 - 1)
 	}
 	dest = strconv.AppendUint(dest, num, 10)
 
@@ -982,7 +974,13 @@ func (t NumberTypeImpl_) DisplayWidth() int {
 func convertToInt64(t NumberTypeImpl_, v any, round Round) (int64, sql.ConvertInRange, error) {
 	switch v := v.(type) {
 	case time.Time:
-		return v.UTC().Unix(), sql.InRange, nil
+		// TODO: types.TypeAwareConversion() should be used a majority of the time as the original precision should be
+		//  preserved. Use MaxDatetimePrecision to cover cases that avoid that code path for now.
+		f64, err := DatetimeMaxPrecision.ToFloat64(v)
+		if err != nil {
+			return 0, sql.InRange, err
+		}
+		return int64(f64), sql.InRange, nil
 	case int:
 		return int64(v), sql.InRange, nil
 	case int8:
@@ -1015,24 +1013,24 @@ func convertToInt64(t NumberTypeImpl_, v any, round Round) (int64, sql.ConvertIn
 		}
 		return int64(math.Round(float64(v))), sql.InRange, nil
 	case float64:
+		if math.IsNaN(v) {
+			return 0, sql.InRange, sql.ErrInvalidValue.New(v, t.String())
+		}
 		if v > float64(math.MaxInt64) {
 			return math.MaxInt64, sql.Overflow, nil
 		}
 		if v < float64(math.MinInt64) {
 			return math.MinInt64, sql.Underflow, nil
 		}
-		if !IsValidFloat(v) {
-			return 0, sql.InRange, sql.ErrInvalidValue.New(v, t.String())
-		}
 		return int64(math.Round(v)), sql.InRange, nil
-	case decimal.Decimal:
-		if v.GreaterThan(dec_int64_max) {
-			return dec_int64_max.IntPart(), sql.Overflow, nil
+	case *apd.Decimal:
+		if v.Cmp(DecimalMaxInt64) > 0 {
+			return math.MaxInt64, sql.Overflow, nil
 		}
-		if v.LessThan(dec_int64_min) {
-			return dec_int64_min.IntPart(), sql.Underflow, nil
+		if v.Cmp(DecimalMinInt64) < 0 {
+			return math.MinInt64, sql.Underflow, nil
 		}
-		return v.Round(0).IntPart(), sql.InRange, nil
+		return DecimalRoundedIntPart(v), sql.InRange, nil
 	case []byte:
 		i, err := strconv.ParseInt(hex.EncodeToString(v), 16, 64)
 		if err != nil {
@@ -1042,7 +1040,8 @@ func convertToInt64(t NumberTypeImpl_, v any, round Round) (int64, sql.ConvertIn
 	case string:
 		var err error
 		if round {
-			truncStr, didTrunc := TruncateStringToDouble(v)
+			// An integer column accepts a dangling exponent, as in "1E".
+			truncStr, didTrunc := TruncateStringToDouble(v, false)
 			if didTrunc {
 				err = sql.ErrTruncatedIncorrect.New(t, v)
 			}
@@ -1083,7 +1082,13 @@ func convertToInt64(t NumberTypeImpl_, v any, round Round) (int64, sql.ConvertIn
 func convertToUint64(t NumberTypeImpl_, v any, round Round) (uint64, sql.ConvertInRange, error) {
 	switch v := v.(type) {
 	case time.Time:
-		return uint64(v.UTC().Unix()), sql.InRange, nil
+		// TODO: types.TypeAwareConversion() should be used a majority of the time as the original precision should be
+		//  preserved. Use MaxDatetimePrecision to cover cases that avoid that code path for now.
+		f64, err := DatetimeMaxPrecision.ToFloat64(v)
+		if err != nil {
+			return 0, sql.InRange, err
+		}
+		return uint64(f64), sql.InRange, nil
 	case int:
 		if v < 0 {
 			return uint64(v), sql.Underflow, nil
@@ -1128,27 +1133,29 @@ func convertToUint64(t NumberTypeImpl_, v any, round Round) (uint64, sql.Convert
 		}
 		return uint64(math.Round(float64(v))), sql.InRange, nil
 	case float64:
+		if math.IsNaN(v) {
+			return 0, sql.InRange, sql.ErrInvalidValue.New(v, t.String())
+		}
 		if v >= float64(math.MaxUint64) {
 			return math.MaxUint64, sql.Overflow, nil
 		}
 		if v < 0 {
 			return uint64(math.MaxUint64 - uint(-v-1)), sql.Underflow, nil
 		}
-		if !IsValidFloat(v) {
-			return 0, sql.InRange, sql.ErrInvalidValue.New(v, t.String())
-		}
 		return uint64(math.Round(v)), sql.InRange, nil
-	case decimal.Decimal:
-		if v.GreaterThan(dec_uint64_max) {
+	case *apd.Decimal:
+		if v.Cmp(DecimalMaxUint64) > 0 {
 			return math.MaxUint64, sql.Overflow, nil
 		}
-		if v.LessThan(dec_zero) {
-			ret, _ := dec_uint64_max.Sub(v).Float64()
-			return uint64(math.Round(ret)), sql.Underflow, nil
+		if v.Cmp(apd.New(0, 0)) < 0 {
+			newVal := new(apd.Decimal)
+			_, err := sql.DecimalCtx.Sub(newVal, DecimalMaxUint64, v)
+			if err != nil {
+				return math.MaxUint64, sql.Overflow, err
+			}
+			return DecimalIntPartUint64(newVal), sql.Underflow, nil
 		}
-		// TODO: If we ever internally switch to using Decimal for large numbers, this will need to be updated
-		f, _ := v.Float64()
-		return uint64(math.Round(f)), sql.InRange, nil
+		return DecimalIntPartUint64(v), sql.InRange, nil
 	case []byte:
 		i, err := strconv.ParseUint(hex.EncodeToString(v), 16, 64)
 		if err != nil {
@@ -1158,7 +1165,7 @@ func convertToUint64(t NumberTypeImpl_, v any, round Round) (uint64, sql.Convert
 	case string:
 		var err error
 		if round {
-			truncStr, didTrunc := TruncateStringToDouble(v)
+			truncStr, didTrunc := TruncateStringToDouble(v, false)
 			if didTrunc {
 				err = sql.ErrTruncatedIncorrect.New(t, v)
 			}
@@ -1211,7 +1218,9 @@ func convertToUint64(t NumberTypeImpl_, v any, round Round) (uint64, sql.Convert
 func convertToFloat64(t NumberTypeImpl_, v interface{}) (float64, error) {
 	switch v := v.(type) {
 	case time.Time:
-		return float64(v.UTC().Unix()), nil
+		// TODO: types.TypeAwareConversion() should be used a majority of the time as the original precision should be
+		//  preserved. Use MaxDatetimePrecision to cover cases that avoid that code path for now.
+		return DatetimeMaxPrecision.ToFloat64(v)
 	case int:
 		return float64(v), nil
 	case int8:
@@ -1235,11 +1244,8 @@ func convertToFloat64(t NumberTypeImpl_, v interface{}) (float64, error) {
 	case float32:
 		return float64(v), nil
 	case float64:
-		if !IsValidFloat(v) {
-			return v, sql.ErrInvalidValue.New(v, t.String())
-		}
 		return v, nil
-	case decimal.Decimal:
+	case *apd.Decimal:
 		f, _ := v.Float64()
 		return f, nil
 	case []byte:
@@ -1250,7 +1256,7 @@ func convertToFloat64(t NumberTypeImpl_, v interface{}) (float64, error) {
 		return float64(i), nil
 	case string:
 		var err error
-		truncStr, didTrunc := TruncateStringToDouble(v)
+		truncStr, didTrunc := TruncateStringToDouble(v, true)
 		if didTrunc {
 			err = sql.ErrTruncatedIncorrect.New(t, v)
 		}
@@ -1314,13 +1320,13 @@ func convertValueToInt64(ctx *sql.Context, v sql.Value) (int64, sql.ConvertInRan
 		return int64(math.Round(x)), sql.InRange, nil
 	case sqltypes.Decimal:
 		x := values.ReadDecimal(v.Val)
-		if x.GreaterThan(dec_int64_max) {
+		if x.Cmp(DecimalMaxInt64) > 0 {
 			return math.MaxInt64, sql.Overflow, nil
 		}
-		if x.LessThan(dec_int64_min) {
+		if x.Cmp(DecimalMinInt64) < 0 {
 			return math.MinInt64, sql.Underflow, nil
 		}
-		return x.Round(0).IntPart(), sql.InRange, nil
+		return DecimalRoundedIntPart(x), sql.InRange, nil
 	case sqltypes.Bit:
 		x := values.ReadUint64(v.Val)
 		if x > math.MaxInt64 {
@@ -1376,14 +1382,18 @@ func convertValueToUint64(ctx *sql.Context, v sql.Value) (uint64, sql.ConvertInR
 		return uint64(math.Round(x)), sql.InRange, nil
 	case sqltypes.Decimal:
 		x := values.ReadDecimal(v.Val)
-		if x.GreaterThan(dec_uint64_max) {
+		if x.Cmp(DecimalMaxUint64) > 0 {
 			return math.MaxUint64, sql.Overflow, nil
 		}
-		if x.LessThan(dec_zero) {
-			ret, _ := dec_uint64_max.Sub(x).Float64()
-			return uint64(math.Round(ret)), sql.Underflow, nil
+		if x.Cmp(apd.New(0, 0)) < 0 {
+			newVal := new(apd.Decimal)
+			_, err := sql.DecimalCtx.Sub(newVal, DecimalMaxUint64, x)
+			if err != nil {
+				return math.MaxUint64, sql.Overflow, err
+			}
+			return DecimalIntPartUint64(newVal), sql.Underflow, nil
 		}
-		return uint64(x.Round(0).IntPart()), sql.InRange, nil
+		return DecimalIntPartUint64(x), sql.InRange, nil
 	case sqltypes.Bit:
 		return values.ReadUint64(v.Val), sql.InRange, nil
 	case sqltypes.Year:
@@ -1464,7 +1474,7 @@ const (
 	IntCutSet = " \t"
 
 	// NumericCutSet is the set of characters to trim from a string before converting it to a number.
-	NumericCutSet = " \t\n\r"
+	NumericCutSet = " \t\n\r\v\f"
 )
 
 // TruncateStringToInt trims any whitespace from s, then truncates the string to the left most characters that make
@@ -1490,11 +1500,20 @@ func TruncateStringToInt(s string) (string, bool) {
 	return s[:i], i != n
 }
 
-// TruncateStringToDouble trims any whitespace from s, then truncates the string to the left most characters that make
-// up a valid double. Empty strings are converted "0". Additionally, returns a flag indicating if truncation occurred.
-func TruncateStringToDouble(s string) (string, bool) {
-	var signIndex int
-	var seenDigit, seenDot, seenExp bool
+// TruncateStringToDouble returns the longest prefix of |s| that is a
+// valid double, after trimming surrounding whitespace, and reports
+// whether any characters after that prefix were truncated.
+//
+// The prefix is "0" if |s| does not begin with a number.
+//
+// An exponent marker and optional sign with no digits after them
+// are dropped from the prefix, and count as truncation only if
+// |truncExp| is true.
+func TruncateStringToDouble(s string, truncExp bool) (prefix string, truncated bool) {
+	// expIndex is the exponent marker's position. It follows a digit,
+	// so 0 means no exponent has been seen.
+	var signIndex, expIndex int
+	var seenDigit, seenDot bool
 	s = strings.Trim(s, NumericCutSet)
 	i, n := 0, len(s)
 	for ; i < n; i++ {
@@ -1503,12 +1522,13 @@ func TruncateStringToDouble(s string) (string, bool) {
 			seenDigit = true
 			continue
 		}
-		if char == '.' && !seenDot {
+		// A decimal point is only valid before the exponent.
+		if char == '.' && !seenDot && expIndex == 0 {
 			seenDot = true
 			continue
 		}
-		if (char == 'e' || char == 'E') && !seenExp && seenDigit {
-			seenExp = true
+		if (char == 'e' || char == 'E') && expIndex == 0 && seenDigit {
+			expIndex = i
 			signIndex = i + 1 // allow a sign following exponent
 			continue
 		}
@@ -1520,27 +1540,10 @@ func TruncateStringToDouble(s string) (string, bool) {
 	if !seenDigit {
 		return "0", i != n
 	}
-	return s[:i], i != n
-}
-
-// ConvertHexBlobToDecimalForNumericContext converts byte array value to unsigned int value if originType is BLOB type.
-// This function is called when convertTo type is number type only. The hex literal values are parsed into blobs as
-// binary string as default, but for numeric context, the value should be a number.
-// Byte arrays of other SQL types are not handled here.
-func ConvertHexBlobToDecimalForNumericContext(val interface{}, originType sql.Type) (interface{}, error) {
-	if bin, isBinary := val.([]byte); isBinary && IsBlobType(originType) {
-		stringVal := hex.EncodeToString(bin)
-		decimalNum, err := strconv.ParseUint(stringVal, 16, 64)
-		if err != nil {
-			return nil, errors.New("failed to convert hex blob value to unsigned int")
-		}
-		val = decimalNum
+	// The scan ended on the exponent marker or its sign, so the
+	// exponent has no digits.
+	if expIndex != 0 && !unicode.IsDigit(rune(s[i-1])) {
+		return s[:expIndex], i != n || truncExp
 	}
-	return val, nil
-}
-
-// IsValidFloat returns false in go-mysql-server if a float is NaN or infinity. Since NaN and infinity values are
-// allowed in Doltgres, this function is replaced there.
-var IsValidFloat = func(f float64) bool {
-	return !math.IsNaN(f) && !math.IsInf(f, 0)
+	return s[:i], i != n
 }

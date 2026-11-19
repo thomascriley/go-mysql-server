@@ -26,17 +26,19 @@ import (
 	"github.com/dolthub/go-mysql-server/sql/plan"
 )
 
-// replaceCountStar replaces count(*) expressions with count(1) expressions, which are semantically equivalent and
-// lets us prune all the unused columns from the target tables.
+// replaceCountStar uses exact table row counts for single ungrouped counts
+// when available, avoiding a row scan.
+//
+// It also rewrites COUNT(*) as COUNT(1) so unused columns can be pruned.
 func replaceCountStar(ctx *sql.Context, a *Analyzer, n sql.Node, _ *plan.Scope, _ RuleSelector, qFlags *sql.QueryFlags) (sql.Node, transform.TreeIdentity, error) {
 	if plan.IsDDLNode(n) {
 		return n, transform.SameTree, nil
 	}
 
-	return transform.Node(n, func(n sql.Node) (sql.Node, transform.TreeIdentity, error) {
+	return transform.Node(ctx, n, func(ctx *sql.Context, n sql.Node) (sql.Node, transform.TreeIdentity, error) {
 		if agg, ok := n.(*plan.GroupBy); ok {
-			if len(agg.GroupByExprs) == 0 && !qFlags.JoinIsSet() && !qFlags.SubqueryIsSet() && !qFlags.IsSet(sql.QFlagAnyAgg) && !qFlags.IsSet(sql.QFlagAnalyzeProcedure) {
-				// top-level aggregation with a single group and no "any_value" functions can only return one row
+			if len(agg.GroupByExprs) == 0 && !qFlags.JoinIsSet() && !qFlags.SubqueryIsSet() && !qFlags.IsSet(sql.QFlagAnalyzeProcedure) {
+				// top-level aggregation with a single group can only return one row
 				qFlags.Set(sql.QFlagMax1Row)
 			}
 
@@ -65,7 +67,7 @@ func replaceCountStar(ctx *sql.Context, a *Analyzer, n sql.Node, _ *plan.Scope, 
 						rt = t
 					}
 				}
-				if rt == nil || sql.IsKeyless(rt.Table.Schema()) {
+				if rt == nil || sql.IsKeyless(rt.Table.Schema(ctx)) {
 					return n, transform.SameTree, nil
 				}
 
@@ -77,7 +79,7 @@ func replaceCountStar(ctx *sql.Context, a *Analyzer, n sql.Node, _ *plan.Scope, 
 				case *expression.GetField:
 					var matched bool
 					var otherPk bool
-					for _, col := range rt.Schema() {
+					for _, col := range rt.Schema(ctx) {
 						if col.PrimaryKey {
 							if strings.EqualFold(col.Name, e.Name()) {
 								matched = true
@@ -98,9 +100,12 @@ func replaceCountStar(ctx *sql.Context, a *Analyzer, n sql.Node, _ *plan.Scope, 
 				if statsTable, ok := getStatisticsTable(rt.Table, nil); ok {
 					rowCnt, exact, err := statsTable.RowCount(ctx)
 					if err == nil && exact {
+						// [plan.NewTableCount] supplies the result column name. Another alias
+						// with the field's column ID would create a self-reference.
 						return plan.NewProject(
+							ctx,
 							[]sql.Expression{
-								expression.NewAlias(name, expression.NewGetFieldWithTable(int(cnt.Id()), 0, types.Int64, rt.Database().Name(), statsTable.Name(), name, false)).WithId(cnt.Id()),
+								expression.NewGetFieldWithTable(0, 0, types.Int64, rt.Database().Name(), statsTable.Name(), name, false).WithId(cnt.Id()),
 							},
 							plan.NewTableCount(name, rt.SqlDatabase, statsTable, rowCnt, cnt.Id()),
 						), transform.NewTree, nil
@@ -110,10 +115,10 @@ func replaceCountStar(ctx *sql.Context, a *Analyzer, n sql.Node, _ *plan.Scope, 
 
 		}
 
-		return transform.NodeExprs(n, func(e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
+		return transform.NodeExprs(ctx, n, func(ctx *sql.Context, e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
 			if count, ok := e.(*aggregation.Count); ok {
 				if _, ok := count.Child.(*expression.Star); ok {
-					count, err := count.WithChildren(expression.NewLiteral(int64(1), types.Int64))
+					count, err := count.WithChildren(ctx, expression.NewLiteral(int64(1), types.Int64))
 					if err != nil {
 						return nil, transform.SameTree, err
 					}

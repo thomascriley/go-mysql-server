@@ -26,7 +26,6 @@ import (
 	"time"
 
 	"github.com/dolthub/vitess/go/mysql"
-	"github.com/dolthub/vitess/go/netutil"
 	"github.com/dolthub/vitess/go/sqltypes"
 	querypb "github.com/dolthub/vitess/go/vt/proto/query"
 	"github.com/dolthub/vitess/go/vt/sqlparser"
@@ -37,7 +36,6 @@ import (
 
 	sqle "github.com/dolthub/go-mysql-server"
 	"github.com/dolthub/go-mysql-server/errguard"
-	"github.com/dolthub/go-mysql-server/internal/sockstate"
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/analyzer"
 	"github.com/dolthub/go-mysql-server/sql/iters"
@@ -56,8 +54,6 @@ var ErrConnectionWasClosed = errors.NewKind("connection was closed")
 var verboseErrorLogging = false
 
 const rowsBatch = 128
-
-var tcpCheckerSleepDuration time.Duration = 5 * time.Second
 
 type MultiStmtMode int
 
@@ -84,36 +80,56 @@ var _ mysql.Handler = (*Handler)(nil)
 var _ mysql.ExtendedHandler = (*Handler)(nil)
 var _ mysql.BinlogReplicaHandler = (*Handler)(nil)
 
-// NewConnection reports that a new connection has been established.
+func (h *Handler) statusVariables() sql.StatusVariableRegistry {
+	return h.e.Variables().Status
+}
+
+// NewConnection registers a newly accepted client connection.
 func (h *Handler) NewConnection(c *mysql.Conn) {
 	if h.sel != nil {
 		h.sel.ClientConnected()
 	}
 
 	h.sm.AddConn(c)
-	updateMaxUsedConnectionsStatusVariable()
-	sql.StatusVariables.IncrementGlobal("Connections", 1)
+	status := h.statusVariables()
+	updateMaxUsedConnectionsStatusVariable(status)
+	status.IncrementGlobal("Connections", 1)
 
 	c.DisableClientMultiStatements = h.disableMultiStmts
-	logrus.WithField(sql.ConnectionIdLogField, c.ConnectionID).WithField("DisableClientMultiStatements", c.DisableClientMultiStatements).Infof("NewConnection")
 }
 
 func (h *Handler) ConnectionAborted(_ *mysql.Conn, _ string) error {
-	sql.StatusVariables.IncrementGlobal("Aborted_connects", 1)
+	h.statusVariables().IncrementGlobal("Aborted_connects", 1)
 	return nil
 }
 
-// Called when a new connection successfully
-// authenticated. Responsible for creating the session associated with
-// the connection in the session manager and updating processlist with
-// the authenticated user and remote address.
+// ConnectionAuthenticated registers the authenticated SQL session and logs the new connection.
 func (h *Handler) ConnectionAuthenticated(c *mysql.Conn) error {
-	err := h.sm.ConnReady(context.Background(), c)
-	if err != nil {
+	if err := h.sm.ConnReady(context.Background(), c); err != nil {
 		logrus.Errorf("unable to register new authenticated connection: %s", err.Error())
-		err = sql.CastSQLError(err)
+		return sql.CastSQLError(err)
 	}
-	return err
+
+	user := c.User
+	if account, ok := c.UserData.(sql.MysqlConnectionUser); ok {
+		user = account.User
+	}
+
+	var clientAddress string
+	addr := c.RemoteAddr()
+	if tcpAddr, ok := addr.(*net.TCPAddr); ok {
+		clientAddress = tcpAddr.IP.String()
+	} else {
+		clientAddress = addr.String()
+	}
+
+	logrus.WithFields(logrus.Fields{
+		sql.ConnectionIdLogField:       c.ConnectionID,
+		"DisableClientMultiStatements": c.DisableClientMultiStatements,
+		"user":                         user,
+		"clientAddress":                clientAddress,
+	}).Info("NewConnection")
+	return nil
 }
 
 func (h *Handler) ComInitDB(c *mysql.Conn, schemaName string) error {
@@ -161,11 +177,11 @@ func (h *Handler) ComPrepare(ctx context.Context, c *mysql.Conn, query string, p
 	}
 
 	// A nil result signals to the handler that the query is not a SELECT statement.
-	if nodeReturnsOkResultSchema(analyzed) || types.IsOkResultSchema(analyzed.Schema()) {
+	if nodeReturnsOkResultSchema(analyzed) || types.IsOkResultSchema(analyzed.Schema(sqlCtx)) {
 		return nil, nil
 	}
 
-	return schemaToFields(sqlCtx, analyzed.Schema()), nil
+	return schemaToFields(sqlCtx, analyzed.Schema(sqlCtx)), nil
 }
 
 // These nodes will eventually return an OK result, but their intermediate forms here return a different schema
@@ -211,10 +227,10 @@ func (h *Handler) ComPrepareParsed(ctx context.Context, c *mysql.Conn, query str
 	var fields []*querypb.Field
 	// The return result fields should only be directly translated if it doesn't correspond to an OK result.
 	// See comment in ComPrepare
-	if !(nodeReturnsOkResultSchema(analyzed) || types.IsOkResultSchema(analyzed.Schema())) {
+	if !(nodeReturnsOkResultSchema(analyzed) || types.IsOkResultSchema(analyzed.Schema(sqlCtx))) {
 		fields = nil
 	} else {
-		fields = schemaToFields(sqlCtx, analyzed.Schema())
+		fields = schemaToFields(sqlCtx, analyzed.Schema(sqlCtx))
 	}
 
 	return analyzed, fields, nil
@@ -251,7 +267,7 @@ func (h *Handler) ComBind(ctx context.Context, c *mysql.Conn, query string, pars
 		return nil, nil, err
 	}
 
-	return queryPlan, schemaToFields(sqlCtx, queryPlan.Schema()), nil
+	return queryPlan, schemaToFields(sqlCtx, queryPlan.Schema(sqlCtx)), nil
 }
 
 func (h *Handler) ComExecuteBound(ctx context.Context, conn *mysql.Conn, query string, boundQuery mysql.BoundQuery, callback mysql.ResultSpoolFn) error {
@@ -386,7 +402,10 @@ func (h *Handler) ComRegisterReplica(c *mysql.Conn, replicaHost string, replicaP
 		return nil
 	}
 
-	newCtx := sql.NewEmptyContext()
+	newCtx, err := h.sm.NewContextWithQuery(context.Background(), c, "")
+	if err != nil {
+		return err
+	}
 	primaryController := h.e.Analyzer.Catalog.GetBinlogPrimaryController()
 	return primaryController.RegisterReplica(newCtx, c, replicaHost, replicaPort)
 }
@@ -402,7 +421,10 @@ func (h *Handler) ComBinlogDumpGTID(c *mysql.Conn, logFile string, logPos uint64
 		Debug("Handling COM_BINLOG_DUMP_GTID")
 
 	// TODO: is logfile and logpos ever actually needed for COM_BINLOG_DUMP_GTID?
-	newCtx := sql.NewEmptyContext()
+	newCtx, err := h.sm.NewContextWithQuery(context.Background(), c, "")
+	if err != nil {
+		return err
+	}
 	primaryController := h.e.Analyzer.Catalog.GetBinlogPrimaryController()
 	return primaryController.BinlogDumpGtid(newCtx, c, gtidSet)
 }
@@ -421,13 +443,35 @@ func (h *Handler) doQuery(
 	callback func(*sqltypes.Result, bool) error,
 	qFlags *sql.QueryFlags,
 ) (remainder string, err error) {
+	// Wrap the incoming context so the disconnect watcher can abort the query if
+	// the client connection goes away while we're executing it. cancelQuery
+	// cancels everything derived from this context, including the sqlCtx built
+	// next and the errgroups spun up by the resultFor* helpers.
+	ctx, cancelQuery := context.WithCancelCause(ctx)
+	defer cancelQuery(nil)
+
+	// The root span for the query covers everything until doQuery returns.
+	ctx, span := h.sm.tracer.Start(ctx, "query")
+	defer span.End()
+
 	var sqlCtx *sql.Context
-	sqlCtx, err = h.sm.NewContextWithQuery(ctx, c, query)
+	var watch *connState
+	sqlCtx, watch, err = h.sm.newContextAndWatch(ctx, c, query)
 	if err != nil {
 		return "", err
 	}
-	// TODO: it would be nice to put this logic in the engine, not the handler, but we don't want the process to be
-	//  marked done until we're done spooling rows over the wire
+
+	// Notify the disconnect watcher that a query is in flight. If it runs long
+	// enough, the background sweeper starts an outstanding-read watch on the
+	// socket and cancels this query (via cancelQuery) if the client goes away.
+	// Fast queries finish before the start delay and never engage the watch at
+	// all. QueryEnded must run before doQuery returns (and thus before the
+	// command loop issues its next read on the connection); pairing it with
+	// QueryStarted here keeps the slot from leaking on any early return below.
+	watch.QueryStarted(cancelQuery)
+	defer watch.QueryEnded()
+	// The process is not marked done, and its context is not canceled, until doQuery returns, after all rows have
+	// been spooled over the wire.
 	sqlCtx, err = sqlCtx.ProcessList.BeginQuery(sqlCtx, query)
 	if err != nil {
 		return remainder, err
@@ -509,6 +553,9 @@ func (h *Handler) doQuery(
 		r, err = resultForMax1RowIter(sqlCtx, schema, rowIter, resultFields, buf)
 	} else if vr, ok := rowIter.(sql.ValueRowIter); ok && vr.IsValueRowIter(sqlCtx) {
 		r, processedAtLeastOneBatch, err = h.resultForValueRowIter(sqlCtx, c, schema, vr, resultFields, buf, callback, more)
+	} else if vr, ok := rowIter.(sql.ValueRowWriter); ok && vr.IsValueRowWriter(sqlCtx) {
+		iter := sql.ProjectValueRowWriter(vr)
+		r, processedAtLeastOneBatch, err = h.resultForValueRowIter(sqlCtx, c, schema, iter, resultFields, buf, callback, more)
 	} else {
 		r, processedAtLeastOneBatch, err = h.resultForDefaultIter(sqlCtx, c, schema, rowIter, callback, resultFields, more, buf)
 	}
@@ -634,13 +681,6 @@ func (h *Handler) resultForDefaultIter(ctx *sql.Context, c *mysql.Conn, schema s
 	defer trace.StartRegion(ctx, "Handler.resultForDefaultIter").End()
 
 	eg, ctx := ctx.NewErrgroup()
-	// TODO: poll for closed connections should obviously also run even if
-	// we're doing something with an OK result or a single row result, etc.
-	// This should be in the caller.
-	pollCtx, cancelF := ctx.NewSubContext()
-	errguard.Go(eg, func() error {
-		return h.pollForClosedConnection(pollCtx, c)
-	})
 
 	// Default waitTime is one minute if there is no timeout configured, in which case
 	// it will loop to iterate again unless the socket died by the OS timeout or other problems.
@@ -760,7 +800,6 @@ func (h *Handler) resultForDefaultIter(ctx *sql.Context, c *mysql.Conn, schema s
 	// Drain sqltypes.Result from resChan and call callback (send to client and potentially reset buffer)
 	var processedAtLeastOneBatch bool
 	errguard.Go(eg, func() (err error) {
-		defer cancelF()
 		defer wg.Done()
 		for {
 			select {
@@ -779,8 +818,7 @@ func (h *Handler) resultForDefaultIter(ctx *sql.Context, c *mysql.Conn, schema s
 		}
 	})
 
-	// Close() kills this PID in the process list,
-	// wait until all rows have be sent over the wire
+	// Wait until all rows have been sent over the wire before closing the iterator.
 	errguard.Go(eg, func() error {
 		wg.Wait()
 		return iter.Close(ctx)
@@ -801,13 +839,6 @@ func (h *Handler) resultForValueRowIter(ctx *sql.Context, c *mysql.Conn, schema 
 	defer trace.StartRegion(ctx, "Handler.resultForValueRowIter").End()
 
 	eg, ctx := ctx.NewErrgroup()
-	// TODO: poll for closed connections should obviously also run even if
-	// we're doing something with an OK result or a single row result, etc.
-	// This should be in the caller.
-	pollCtx, cancelF := ctx.NewSubContext()
-	errguard.Go(eg, func() error {
-		return h.pollForClosedConnection(pollCtx, c)
-	})
 
 	// Default waitTime is one minute if there is no timeout configured, in which case
 	// it will loop to iterate again unless the socket died by the OS timeout or other problems.
@@ -917,7 +948,6 @@ func (h *Handler) resultForValueRowIter(ctx *sql.Context, c *mysql.Conn, schema 
 	// Drain sqltypes.Result from resChan and call callback (send to client and reset buffer)
 	var processedAtLeastOneBatch bool
 	errguard.Go(eg, func() (err error) {
-		defer cancelF()
 		defer wg.Done()
 		for {
 			select {
@@ -936,8 +966,7 @@ func (h *Handler) resultForValueRowIter(ctx *sql.Context, c *mysql.Conn, schema 
 		}
 	})
 
-	// Close() kills this PID in the process list,
-	// wait until all rows have be sent over the wire
+	// Wait until all rows have been sent over the wire before closing the iterator.
 	errguard.Go(eg, func() error {
 		wg.Wait()
 		return iter.Close(ctx)
@@ -1039,70 +1068,6 @@ func (h *Handler) errorWrappedComExec(
 	return err
 }
 
-// Periodically polls the connection socket to determine if it is has been closed by the client, returning an error
-// if it has been. Meant to be run in an errgroup from the query handler routine. Returns immediately with no error
-// on platforms that can't support TCP socket checks.
-func (h *Handler) pollForClosedConnection(ctx *sql.Context, c *mysql.Conn) error {
-	tcpConn, ok := maybeGetTCPConn(c.Conn)
-	if !ok {
-		ctx.GetLogger().Trace("Connection checker exiting, connection isn't TCP")
-		return nil
-	}
-
-	inode, err := sockstate.GetConnInode(tcpConn)
-	if err != nil || inode == 0 {
-		if !sockstate.ErrSocketCheckNotImplemented.Is(err) {
-			ctx.GetLogger().Trace("Connection checker exiting, connection isn't TCP")
-		}
-		return nil
-	}
-
-	t, ok := tcpConn.LocalAddr().(*net.TCPAddr)
-	if !ok {
-		ctx.GetLogger().Trace("Connection checker exiting, could not get local port")
-		return nil
-	}
-
-	timer := time.NewTimer(tcpCheckerSleepDuration)
-	defer timer.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-timer.C:
-		}
-
-		st, err := sockstate.GetInodeSockState(t.Port, inode)
-		switch st {
-		case sockstate.Broken:
-			ctx.GetLogger().Warn("socket state is broken, returning error")
-			return ErrConnectionWasClosed.New()
-		case sockstate.Error:
-			ctx.GetLogger().WithError(err).Warn("Connection checker exiting, got err checking sockstate")
-			return nil
-		default: // Established
-			// (juanjux) this check is not free, each iteration takes about 9 milliseconds to run on my machine
-			// thus the small wait between checks
-			timer.Reset(tcpCheckerSleepDuration)
-		}
-	}
-}
-
-func maybeGetTCPConn(conn net.Conn) (*net.TCPConn, bool) {
-	wrap, ok := conn.(netutil.ConnWithTimeouts)
-	if ok {
-		conn = wrap.Conn
-	}
-
-	tcp, ok := conn.(*net.TCPConn)
-	if ok {
-		return tcp, true
-	}
-
-	return nil, false
-}
-
 func resultFromOkResult(result types.OkResult) *sqltypes.Result {
 	infoStr := ""
 	if result.Info != nil {
@@ -1131,8 +1096,8 @@ func (h *Handler) WarningCount(c *mysql.Conn) uint16 {
 // getMaxUsedConnections returns the maximum number of connections that have been established at the same time for
 // this sql-server, as tracked by the Max_used_connections status variable. If any error is encountered, it will be
 // logged and 0 will be returned.
-func getMaxUsedConnections() uint64 {
-	_, maxUsedConnectionsValue, ok := sql.StatusVariables.GetGlobal("Max_used_connections")
+func getMaxUsedConnections(registry sql.StatusVariableRegistry) uint64 {
+	_, maxUsedConnectionsValue, ok := registry.GetGlobal("Max_used_connections")
 	if !ok {
 		logrus.Errorf("unable to find Max_used_connections status variable")
 		return 0
@@ -1147,8 +1112,8 @@ func getMaxUsedConnections() uint64 {
 
 // getThreadsConnected returns the current number of connected threads, as tracked by the Threads_connected status
 // variable. If any error is encountered, it will be logged and 0 will be returned.
-func getThreadsConnected() uint64 {
-	_, threadsConnectedValue, ok := sql.StatusVariables.GetGlobal("Threads_connected")
+func getThreadsConnected(registry sql.StatusVariableRegistry) uint64 {
+	_, threadsConnectedValue, ok := registry.GetGlobal("Threads_connected")
 	if !ok {
 		logrus.Errorf("unable to find Threads_connected status variable")
 		return 0
@@ -1164,12 +1129,13 @@ func getThreadsConnected() uint64 {
 // updateMaxUsedConnectionsStatusVariable updates the Max_used_connections status
 // variables if the current number of connected threads is greater than the current
 // value of Max_used_connections.
-func updateMaxUsedConnectionsStatusVariable() {
+func updateMaxUsedConnectionsStatusVariable(registry sql.StatusVariableRegistry) {
 	go func() {
-		maxUsedConnections := getMaxUsedConnections()
-		threadsConnected := getThreadsConnected()
+		defer errguard.RecoverAndLog("Max_used_connections status variable update")
+		maxUsedConnections := getMaxUsedConnections(registry)
+		threadsConnected := getThreadsConnected(registry)
 		if threadsConnected > maxUsedConnections {
-			sql.StatusVariables.SetGlobal("Max_used_connections", threadsConnected)
+			registry.SetGlobal("Max_used_connections", threadsConnected)
 			// TODO: When Max_used_connections is updated, we should also update
 			//       Max_used_connections_time with the current time, but our status
 			//       variables support currently only supports Uint values.
@@ -1239,7 +1205,11 @@ func RowValueToSQLValues(ctx *sql.Context, sch sql.Schema, row sql.ValueRow, buf
 				outVals[i] = sqltypes.NULL
 				continue
 			}
-			outVals[i] = sqltypes.MakeTrusted(row[i].Typ, row[i].Val)
+			unwrappedVal, err := row[i].Unwrap(ctx)
+			if err != nil {
+				return nil, err
+			}
+			outVals[i] = sqltypes.MakeTrusted(row[i].Typ, unwrappedVal)
 			continue
 		}
 		if buf == nil {
@@ -1268,8 +1238,10 @@ func schemaToFields(ctx *sql.Context, s sql.Schema) []*querypb.Field {
 		}
 
 		// Binary types always use a binary collation, but non-binary types must
-		// respect character_set_results if it is set.
-		if types.IsBinaryType(c.Type) {
+		// respect character_set_results if it is set. BIT is not a string type,
+		// but MySQL advertises it with the binary charset so that clients render
+		// its values as binary data rather than text.
+		if types.IsBinaryType(c.Type) || types.IsBit(c.Type) {
 			charset = uint32(sql.Collation_binary)
 		} else if charSetResults != sql.CharacterSet_Unspecified {
 			charset = uint32(charSetResults)
@@ -1301,17 +1273,26 @@ func schemaToFields(ctx *sql.Context, s sql.Schema) []*querypb.Field {
 			Flags:        uint32(flags),
 		}
 
-		if types.IsDecimal(c.Type) {
-			decimalType := c.Type.(sql.DecimalType)
-			fields[i].Decimals = uint32(decimalType.Scale())
-		} else if types.IsDatetimeType(c.Type) {
-			dtType := c.Type.(sql.DatetimeType)
-			fields[i].Decimals = uint32(dtType.Precision())
+		if types.IsFloat(c.Type) {
+			fields[i].Decimals = notFixedDecimals
+		}
+
+		switch typ := c.Type.(type) {
+		case sql.DecimalType:
+			fields[i].Decimals = uint32(typ.Scale())
+		case sql.DatetimeType:
+			fields[i].Decimals = uint32(typ.Precision())
+		case types.TimeType:
+			fields[i].Decimals = uint32(typ.Precision())
 		}
 	}
 
 	return fields
 }
+
+// notFixedDecimals is the column decimals MySQL reports for floating-point values that have no fixed scale (NOT_FIXED_DEC).
+// Clients such as PHP's mysqlnd round binary-protocol FLOAT values to this many places, so reporting 0 truncates them.
+const notFixedDecimals = 31
 
 func (h *Handler) observeQuery(ctx *sql.Context, query string) func(err error) {
 	span, ctx := ctx.Span("query", otel.WithAttributes(attribute.String("query", query)))

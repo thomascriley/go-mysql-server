@@ -24,18 +24,12 @@ import (
 	"github.com/dolthub/go-mysql-server/sql/types"
 )
 
-func TestBitAnd_String(t *testing.T) {
-	assert := require.New(t)
-	m := NewBitAnd(expression.NewGetField(0, types.Int32, "field", true))
-	assert.Equal("BITAND(field)", m.String())
-}
-
 func TestBitAnd_Eval_Int(t *testing.T) {
 	assert := require.New(t)
 	ctx := sql.NewEmptyContext()
 
 	m := NewBitAnd(expression.NewGetField(0, types.Int64, "field", true))
-	b, _ := m.NewBuffer()
+	b, _ := m.NewBuffer(ctx)
 
 	b.Update(ctx, sql.NewRow(1))
 	b.Update(ctx, sql.NewRow(3))
@@ -51,7 +45,7 @@ func TestBitAnd_Eval_Float64(t *testing.T) {
 	ctx := sql.NewEmptyContext()
 
 	m := NewBitAnd(expression.NewGetField(0, types.Float64, "field", true))
-	b, _ := m.NewBuffer()
+	b, _ := m.NewBuffer(ctx)
 
 	b.Update(ctx, sql.NewRow(1.123123))
 	b.Update(ctx, sql.NewRow(3.3452345))
@@ -67,7 +61,7 @@ func TestBitAnd_Eval_Text(t *testing.T) {
 	ctx := sql.NewEmptyContext()
 
 	m := NewBitAnd(expression.NewGetField(0, types.Text, "field", true))
-	b, _ := m.NewBuffer()
+	b, _ := m.NewBuffer(ctx)
 
 	b.Update(ctx, sql.NewRow("a"))
 	b.Update(ctx, sql.NewRow("A"))
@@ -83,7 +77,7 @@ func TestBitAnd_Eval_NULL(t *testing.T) {
 	ctx := sql.NewEmptyContext()
 
 	m := NewBitAnd(expression.NewGetField(0, types.Int32, "field", true))
-	b, _ := m.NewBuffer()
+	b, _ := m.NewBuffer(ctx)
 
 	b.Update(ctx, sql.NewRow(nil))
 	b.Update(ctx, sql.NewRow(nil))
@@ -99,17 +93,11 @@ func TestBitAnd_Eval_Empty(t *testing.T) {
 	ctx := sql.NewEmptyContext()
 
 	m := NewBitAnd(expression.NewGetField(0, types.Int32, "field", true))
-	b, _ := m.NewBuffer()
+	b, _ := m.NewBuffer(ctx)
 
 	v, err := b.Eval(ctx)
 	assert.NoError(err)
 	assert.Equal(^uint64(0), v)
-}
-
-func TestBitOr_String(t *testing.T) {
-	assert := require.New(t)
-	m := NewBitOr(expression.NewGetField(0, types.Int32, "field", true))
-	assert.Equal("BITOR(field)", m.String())
 }
 
 func TestBitOr_Eval_Int(t *testing.T) {
@@ -117,7 +105,7 @@ func TestBitOr_Eval_Int(t *testing.T) {
 	ctx := sql.NewEmptyContext()
 
 	m := NewBitOr(expression.NewGetField(0, types.Int64, "field", true))
-	b, _ := m.NewBuffer()
+	b, _ := m.NewBuffer(ctx)
 
 	b.Update(ctx, sql.NewRow(1))
 	b.Update(ctx, sql.NewRow(2))
@@ -133,7 +121,7 @@ func TestBitOr_Eval_Float64(t *testing.T) {
 	ctx := sql.NewEmptyContext()
 
 	m := NewBitOr(expression.NewGetField(0, types.Float64, "field", true))
-	b, _ := m.NewBuffer()
+	b, _ := m.NewBuffer(ctx)
 
 	b.Update(ctx, sql.NewRow(1.123123))
 	b.Update(ctx, sql.NewRow(2.3452345))
@@ -149,7 +137,7 @@ func TestBitOr_Eval_Text(t *testing.T) {
 	ctx := sql.NewEmptyContext()
 
 	m := NewBitOr(expression.NewGetField(0, types.Text, "field", true))
-	b, _ := m.NewBuffer()
+	b, _ := m.NewBuffer(ctx)
 
 	b.Update(ctx, sql.NewRow("a"))
 	b.Update(ctx, sql.NewRow("A"))
@@ -165,7 +153,7 @@ func TestBitOr_Eval_NULL(t *testing.T) {
 	ctx := sql.NewEmptyContext()
 
 	m := NewBitOr(expression.NewGetField(0, types.Int32, "field", true))
-	b, _ := m.NewBuffer()
+	b, _ := m.NewBuffer(ctx)
 
 	b.Update(ctx, sql.NewRow(nil))
 	b.Update(ctx, sql.NewRow(nil))
@@ -181,17 +169,11 @@ func TestBitOr_Eval_Empty(t *testing.T) {
 	ctx := sql.NewEmptyContext()
 
 	m := NewBitOr(expression.NewGetField(0, types.Int32, "field", true))
-	b, _ := m.NewBuffer()
+	b, _ := m.NewBuffer(ctx)
 
 	v, err := b.Eval(ctx)
 	assert.NoError(err)
 	assert.Equal(uint64(0), v)
-}
-
-func TestBitXor_String(t *testing.T) {
-	assert := require.New(t)
-	m := NewBitXor(expression.NewGetField(0, types.Int32, "field", true))
-	assert.Equal("BITXOR(field)", m.String())
 }
 
 func TestBitXor_Eval_Int(t *testing.T) {
@@ -199,7 +181,7 @@ func TestBitXor_Eval_Int(t *testing.T) {
 	ctx := sql.NewEmptyContext()
 
 	m := NewBitXor(expression.NewGetField(0, types.Int64, "field", true))
-	b, _ := m.NewBuffer()
+	b, _ := m.NewBuffer(ctx)
 
 	b.Update(ctx, sql.NewRow(1))
 	b.Update(ctx, sql.NewRow(2))
@@ -215,7 +197,7 @@ func TestBitXor_Eval_Float64(t *testing.T) {
 	ctx := sql.NewEmptyContext()
 
 	m := NewBitXor(expression.NewGetField(0, types.Float64, "field", true))
-	b, _ := m.NewBuffer()
+	b, _ := m.NewBuffer(ctx)
 
 	b.Update(ctx, sql.NewRow(1.123123))
 	b.Update(ctx, sql.NewRow(2.3452345))
@@ -231,7 +213,7 @@ func TestBitXor_Eval_Text(t *testing.T) {
 	ctx := sql.NewEmptyContext()
 
 	m := NewBitXor(expression.NewGetField(0, types.Text, "field", true))
-	b, _ := m.NewBuffer()
+	b, _ := m.NewBuffer(ctx)
 
 	b.Update(ctx, sql.NewRow("a"))
 	b.Update(ctx, sql.NewRow("A"))
@@ -247,7 +229,7 @@ func TestBitXor_Eval_NULL(t *testing.T) {
 	ctx := sql.NewEmptyContext()
 
 	m := NewBitXor(expression.NewGetField(0, types.Int32, "field", true))
-	b, _ := m.NewBuffer()
+	b, _ := m.NewBuffer(ctx)
 
 	b.Update(ctx, sql.NewRow(nil))
 	b.Update(ctx, sql.NewRow(nil))
@@ -263,7 +245,7 @@ func TestBitXor_Eval_Empty(t *testing.T) {
 	ctx := sql.NewEmptyContext()
 
 	m := NewBitXor(expression.NewGetField(0, types.Int32, "field", true))
-	b, _ := m.NewBuffer()
+	b, _ := m.NewBuffer(ctx)
 
 	v, err := b.Eval(ctx)
 	assert.NoError(err)

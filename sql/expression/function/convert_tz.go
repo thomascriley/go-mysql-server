@@ -16,6 +16,7 @@ package function
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/types"
@@ -31,7 +32,7 @@ var _ sql.FunctionExpression = (*ConvertTz)(nil)
 var _ sql.CollationCoercible = (*ConvertTz)(nil)
 
 // NewConvertTz returns an implementation of the CONVERT_TZ() function.
-func NewConvertTz(dt, fromTz, toTz sql.Expression) sql.Expression {
+func NewConvertTz(ctx *sql.Context, dt, fromTz, toTz sql.Expression) sql.Expression {
 	return &ConvertTz{
 		dt:     dt,
 		fromTz: fromTz,
@@ -60,7 +61,7 @@ func (c *ConvertTz) String() string {
 }
 
 // Type implements the sql.Expression interface.
-func (c *ConvertTz) Type() sql.Type {
+func (c *ConvertTz) Type(ctx *sql.Context) sql.Type {
 	return types.DatetimeMaxPrecision
 }
 
@@ -70,7 +71,7 @@ func (*ConvertTz) CollationCoercibility(ctx *sql.Context) (collation sql.Collati
 }
 
 // IsNullable implements the sql.Expression interface.
-func (c *ConvertTz) IsNullable() bool {
+func (c *ConvertTz) IsNullable(ctx *sql.Context) bool {
 	return true
 }
 
@@ -86,16 +87,20 @@ func (c *ConvertTz) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 		return nil, err
 	}
 
-	dt, err := c.dt.Eval(ctx, row)
+	dtVal, err := c.dt.Eval(ctx, row)
 	if err != nil {
 		return nil, err
 	}
 
 	// If either the date, or the timezones/offsets are not correct types we return NULL.
-	datetime, err := types.DatetimeMaxPrecision.ConvertWithoutRangeCheck(ctx, dt)
+	dtVal, _, err = types.DatetimeMaxPrecision.Convert(ctx, dtVal)
 	if err != nil {
 		return nil, nil
 	}
+	if dtVal == nil {
+		return nil, nil
+	}
+	dt := dtVal.(time.Time)
 
 	fromStr, ok := from.(string)
 	if !ok {
@@ -115,12 +120,12 @@ func (c *ConvertTz) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 		toStr = sql.SystemTimezoneOffset()
 	}
 
-	converted, success := sql.ConvertTimeZone(datetime, fromStr, toStr)
+	converted, success := sql.ConvertTimeZone(dt, fromStr, toStr)
 	if !success {
 		return nil, nil
 	}
 
-	return types.DatetimeMaxPrecision.ConvertWithoutRangeCheck(ctx, converted)
+	return converted, nil
 }
 
 // Children implements the sql.Expression interface.
@@ -129,10 +134,10 @@ func (c *ConvertTz) Children() []sql.Expression {
 }
 
 // WithChildren implements the sql.Expression interface.
-func (c *ConvertTz) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (c *ConvertTz) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 3 {
 		return nil, sql.ErrInvalidChildrenNumber.New(c, len(children), 3)
 	}
 
-	return NewConvertTz(children[0], children[1], children[2]), nil
+	return NewConvertTz(ctx, children[0], children[1], children[2]), nil
 }

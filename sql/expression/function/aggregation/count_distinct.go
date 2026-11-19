@@ -16,6 +16,7 @@ package aggregation
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/dolthub/go-mysql-server/sql/expression"
 	"github.com/dolthub/go-mysql-server/sql/transform"
@@ -43,7 +44,7 @@ func NewCountDistinct(exprs ...sql.Expression) *CountDistinct {
 }
 
 // Type implements the Expression interface.
-func (a *CountDistinct) Type() sql.Type {
+func (a *CountDistinct) Type(ctx *sql.Context) sql.Type {
 	return types.Int64
 }
 
@@ -53,7 +54,7 @@ func (*CountDistinct) CollationCoercibility(ctx *sql.Context) (collation sql.Col
 }
 
 // IsNullable implements the Expression interface.
-func (a *CountDistinct) IsNullable() bool {
+func (a *CountDistinct) IsNullable(ctx *sql.Context) bool {
 	return false
 }
 
@@ -80,7 +81,7 @@ func (a *CountDistinct) Children() []sql.Expression {
 }
 
 // WithChildren implements the Expression interface.
-func (a *CountDistinct) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (a *CountDistinct) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	return NewCountDistinct(children...), nil
 }
 
@@ -95,10 +96,10 @@ func (a *CountDistinct) Description() string {
 }
 
 // NewBuffer implements the Aggregation interface.
-func (a *CountDistinct) NewBuffer() (sql.AggregationBuffer, error) {
+func (a *CountDistinct) NewBuffer(ctx *sql.Context) (sql.AggregationBuffer, error) {
 	exprs := make([]sql.Expression, len(a.ChildExpressions))
 	for i, expr := range a.ChildExpressions {
-		child, err := transform.Clone(expr)
+		child, err := transform.Clone(ctx, expr)
 		if err != nil {
 			return nil, err
 		}
@@ -108,7 +109,7 @@ func (a *CountDistinct) NewBuffer() (sql.AggregationBuffer, error) {
 }
 
 // WithWindow implements the Aggregation interface.
-func (a *CountDistinct) WithWindow(window *sql.WindowDefinition) sql.WindowAdaptableExpression {
+func (a *CountDistinct) WithWindow(ctx *sql.Context, window *sql.WindowDefinition) sql.WindowAdaptableExpression {
 	na := *a
 	na.window = window
 	return &na
@@ -121,14 +122,22 @@ func (a *CountDistinct) Window() *sql.WindowDefinition {
 
 // String implements the ValueStats interface.
 func (a *CountDistinct) String() string {
-	return fmt.Sprintf("COUNTDISTINCT(%s)", a.ChildExpressions)
+	children := make([]string, len(a.ChildExpressions))
+	for i, child := range a.ChildExpressions {
+		children[i] = child.String()
+	}
+	ret := fmt.Sprintf("COUNT(DISTINCT %s)", strings.Join(children, ", "))
+	if a.window != nil {
+		ret += " " + a.window.String()
+	}
+	return ret
 }
 
 // NewWindowFunction implements the WindowAdaptableExpression interface.
-func (a *CountDistinct) NewWindowFunction() (sql.WindowFunction, error) {
-	child, err := transform.Clone(a.NaryExpression.ChildExpressions[0])
+func (a *CountDistinct) NewWindowFunction(ctx *sql.Context) (sql.WindowFunction, error) {
+	child, err := transform.Clone(ctx, a.NaryExpression.ChildExpressions[0])
 	if err != nil {
 		return nil, err
 	}
-	return NewCountDistinctAgg(child).WithWindow(a.Window())
+	return NewCountDistinctAgg(child).WithWindow(ctx, a.Window())
 }

@@ -15,12 +15,14 @@
 package expression
 
 import (
+	"context"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/cockroachdb/apd/v3"
 	"github.com/dolthub/vitess/go/vt/proto/query"
 	"github.com/dolthub/vitess/go/vt/sqlparser"
-	"github.com/shopspring/decimal"
 
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/types"
@@ -66,12 +68,15 @@ func (lit *Literal) Resolved() bool {
 }
 
 // IsNullable implements the Expression interface.
-func (lit *Literal) IsNullable() bool {
+func (lit *Literal) IsNullable(ctx *sql.Context) bool {
 	return lit.Val == nil
 }
 
 // Type implements the Expression interface.
-func (lit *Literal) Type() sql.Type {
+func (lit *Literal) Type(ctx *sql.Context) sql.Type {
+	if lit.Typ == nil {
+		return types.Null
+	}
 	return lit.Typ
 }
 
@@ -94,20 +99,34 @@ func (lit *Literal) String() string {
 	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
 		return fmt.Sprintf("%d", litVal)
 	case string:
-		switch lit.Typ.Type() {
-		// utf8 charset cannot encode binary string
-		case query.Type_VARBINARY, query.Type_BINARY:
-			return fmt.Sprintf("'0x%X'", litVal)
+		if lit.Typ != nil {
+			switch lit.Typ.Type() {
+			// utf8 charset cannot encode binary string
+			case query.Type_VARBINARY, query.Type_BINARY:
+				return fmt.Sprintf("0x%X", litVal)
+			}
 		}
-		// Conversion of \' to \'\' required as this string will be interpreted by the sql engine.
-		// Backslash chars also need to be replaced.
-		escaped := strings.ReplaceAll(litVal, "'", "''")
-		escaped = strings.ReplaceAll(escaped, "\\", "\\\\")
-		return fmt.Sprintf("'%s'", escaped)
-	case decimal.Decimal:
-		return litVal.StringFixed(litVal.Exponent() * -1)
+		return quoteSQLString(litVal)
+	case *apd.Decimal:
+		return litVal.Text('f')
 	case []byte:
 		return fmt.Sprintf("0x%X", litVal)
+	case time.Time:
+		if lit.Typ != nil && lit.Typ.Type() == query.Type_DATE {
+			return quoteSQLString(litVal.Format("2006-01-02"))
+		}
+		return quoteSQLString(litVal.Format(sql.TimestampDatetimeLayout))
+	case types.Timespan:
+		return quoteSQLString(litVal.String())
+	case sql.JSONWrapper:
+		jsonString, err := types.JsonToMySqlString(context.Background(), litVal)
+		if err == nil {
+			return fmt.Sprintf("CAST(%s AS JSON)", quoteSQLString(jsonString))
+		}
+		return quoteSQLString(fmt.Sprint(litVal))
+	case types.GeometryValue:
+		serialized := litVal.Serialize()
+		return fmt.Sprintf("ST_GeomFromWKB(0x%X, %d)", serialized[types.SRIDSize:], litVal.GetSRID())
 	case nil:
 		return "NULL"
 	default:
@@ -115,7 +134,14 @@ func (lit *Literal) String() string {
 	}
 }
 
-func (lit *Literal) DebugString() string {
+func quoteSQLString(value string) string {
+	// Conversion of \' to \'\' is required because this string will be interpreted by the SQL engine.
+	escaped := strings.ReplaceAll(value, "'", "''")
+	escaped = strings.ReplaceAll(escaped, "\\", "\\\\")
+	return fmt.Sprintf("'%s'", escaped)
+}
+
+func (lit *Literal) DebugString(ctx *sql.Context) string {
 	typeStr := lit.Typ.String()
 	switch v := lit.Val.(type) {
 	case string:
@@ -130,13 +156,15 @@ func (lit *Literal) DebugString() string {
 		return fmt.Sprintf("%f (%s)", v, typeStr)
 	case bool:
 		return fmt.Sprintf("%t (%s)", v, typeStr)
+	case *apd.Decimal:
+		return fmt.Sprintf("%s (%s)", v.Text('f'), typeStr)
 	default:
 		return fmt.Sprintf("%s (%s)", v, typeStr)
 	}
 }
 
 // WithChildren implements the Expression interface.
-func (lit *Literal) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (lit *Literal) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 0 {
 		return nil, sql.ErrInvalidChildrenNumber.New(lit, len(children), 0)
 	}
@@ -154,7 +182,7 @@ func (lit *Literal) EvalValue(ctx *sql.Context, row sql.ValueRow) (sql.Value, er
 }
 
 // IsValueExpression implements the ValueExpression interface.
-func (lit *Literal) IsValueExpression() bool {
+func (lit *Literal) IsValueExpression(ctx *sql.Context) bool {
 	return types.IsInteger(lit.Typ)
 }
 
@@ -163,7 +191,7 @@ func (lit *Literal) Value() interface{} {
 	return lit.Val
 }
 
-func (lit *Literal) WithResolvedChildren(children []any) (any, error) {
+func (lit *Literal) WithResolvedChildren(ctx context.Context, children []any) (any, error) {
 	if len(children) != 0 {
 		return nil, sql.ErrInvalidChildrenNumber.New(lit, len(children), 0)
 	}

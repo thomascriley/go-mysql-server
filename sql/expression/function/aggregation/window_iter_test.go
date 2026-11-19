@@ -16,6 +16,7 @@ package aggregation
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -26,17 +27,29 @@ import (
 	"github.com/dolthub/go-mysql-server/sql/types"
 )
 
+type closeTrackingIter struct {
+	sql.RowIter
+	closeCount int
+	closeErr   error
+}
+
+// Close records the call and returns the configured error.
+func (i *closeTrackingIter) Close(*sql.Context) error {
+	i.closeCount++
+	return i.closeErr
+}
+
 var (
 	partitionByX = []sql.Expression{
 		expression.NewGetFieldWithTable(1, 0, types.Text, "mydb", "a", "x", false),
 	}
-	sortByW = sql.SortFields{{
-		Column: expression.NewGetFieldWithTable(0, 0, types.Int64, "mydb", "a", "w", false),
+	sortByW = sql.SortConditions{{
+		Expr: expression.NewGetFieldWithTable(0, 0, types.Int64, "mydb", "a", "w", false),
 	}}
-	sortByWDesc = sql.SortFields{
+	sortByWDesc = sql.SortConditions{
 		{
-			Column: expression.NewGetFieldWithTable(0, 0, types.Int64, "mydb", "a", "w", false),
-			Order:  sql.Descending,
+			Expr:  expression.NewGetFieldWithTable(0, 0, types.Int64, "mydb", "a", "w", false),
+			Order: sql.Descending,
 		},
 	}
 	lastX  = NewLastAgg(expression.NewGetField(1, types.Text, "x", true))
@@ -97,6 +110,49 @@ func TestWindowIter(t *testing.T) {
 			res, err := sql.RowIterToRows(ctx, i)
 			require.NoError(t, err)
 			require.Equal(t, tt.Expected, res)
+		})
+	}
+}
+
+// TestWindowIterClose verifies that closing a window iterator releases its child and partitions.
+func TestWindowIterClose(t *testing.T) {
+	ctx := sql.NewEmptyContext()
+	closeErr := errors.New("close error")
+	child := &closeTrackingIter{closeErr: closeErr}
+	partition := NewWindowPartitionIter(&WindowPartition{})
+	partition.input = sql.WindowBuffer{{1}}
+
+	iter := NewWindowIter([]*WindowPartitionIter{partition}, [][]int{{0}}, child)
+	require.ErrorIs(t, iter.Close(ctx), closeErr)
+	require.Equal(t, 1, child.closeCount)
+	require.Nil(t, partition.input)
+}
+
+// closeTrackingRowIter records whether the child iterator is released, including when Close fails.
+type closeTrackingRowIter struct {
+	sql.RowIter
+	closed   bool
+	closeErr error
+}
+
+func (i *closeTrackingRowIter) Close(*sql.Context) error {
+	i.closed = true
+	return i.closeErr
+}
+
+func TestWindowIterClosesChild(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		err  error
+	}{
+		{name: "success"},
+		{name: "child close error", err: errors.New("child close failed")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			child := &closeTrackingRowIter{closeErr: tt.err}
+			iter := NewWindowIter(nil, nil, child)
+			require.Equal(t, tt.err, iter.Close(sql.NewEmptyContext()))
+			require.True(t, child.closed)
 		})
 	}
 }

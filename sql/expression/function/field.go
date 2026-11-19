@@ -31,7 +31,7 @@ var _ sql.FunctionExpression = (*Field)(nil)
 var _ sql.CollationCoercible = (*Field)(nil)
 
 // NewField creates a new Field UDF.
-func NewField(args ...sql.Expression) (sql.Expression, error) {
+func NewField(ctx *sql.Context, args ...sql.Expression) (sql.Expression, error) {
 	if len(args) < 2 {
 		return nil, sql.ErrInvalidArgumentNumber.New("FIELD", "2 or more", len(args))
 	}
@@ -50,25 +50,17 @@ func (f *Field) Description() string {
 }
 
 // Type implements the Expression interface.
-func (f *Field) Type() sql.Type {
+func (f *Field) Type(ctx *sql.Context) sql.Type {
 	return types.Int64
 }
 
 // CollationCoercibility implements the interface sql.CollationCoercible.
 func (f *Field) CollationCoercibility(ctx *sql.Context) (sql.CollationID, byte) {
-	if len(f.args) == 0 {
-		return sql.Collation_binary, 6
-	}
-	collation, coercibility := sql.GetCoercibility(ctx, f.args[0])
-	for i := 1; i < len(f.args); i++ {
-		nextCollation, nextCoercibility := sql.GetCoercibility(ctx, f.args[i])
-		collation, coercibility = sql.ResolveCoercibility(collation, coercibility, nextCollation, nextCoercibility)
-	}
-	return collation, coercibility
+	return sql.ResolveCoercibilityExpressions(ctx, f.args...)
 }
 
 // IsNullable implements the Expression interface.
-func (f *Field) IsNullable() bool {
+func (f *Field) IsNullable(ctx *sql.Context) bool {
 	return false
 }
 
@@ -82,8 +74,8 @@ func (f *Field) String() string {
 }
 
 // WithChildren implements the Expression interface.
-func (*Field) WithChildren(children ...sql.Expression) (sql.Expression, error) {
-	return NewField(children...)
+func (*Field) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
+	return NewField(ctx, children...)
 }
 
 // Resolved implements the Expression interface.

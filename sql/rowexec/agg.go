@@ -45,33 +45,12 @@ func (i *groupByIter) Next(ctx *sql.Context) (sql.Row, error) {
 		return nil, io.EOF
 	}
 
-	// special case for any_value
 	var err error
-	onlyAnyValue := true
 	for j, a := range i.selectedExprs {
-		i.buf[j], err = newAggregationBuffer(a)
+		i.buf[j], err = newAggregationBuffer(ctx, a)
 		if err != nil {
 			return nil, err
 		}
-		if agg, ok := a.(sql.Aggregation); ok {
-			if _, ok = agg.(*aggregation.AnyValue); !ok {
-				onlyAnyValue = false
-			}
-		}
-	}
-
-	// if no aggregate functions other than any_value, it's just a normal select
-	if onlyAnyValue {
-		row, err := i.child.Next(ctx)
-		if err != nil {
-			i.done = true
-			return nil, err
-		}
-
-		if err := updateBuffers(ctx, i.buf, row); err != nil {
-			return nil, err
-		}
-		return evalBuffers(ctx, i.buf)
 	}
 	i.done = true
 
@@ -97,15 +76,15 @@ func (i *groupByIter) Next(ctx *sql.Context) (sql.Row, error) {
 }
 
 func (i *groupByIter) Close(ctx *sql.Context) error {
-	i.Dispose()
+	i.Dispose(ctx)
 	i.buf = nil
 	return i.child.Close(ctx)
 }
 
-func (i *groupByIter) Dispose() {
+func (i *groupByIter) Dispose(ctx *sql.Context) {
 	for _, b := range i.buf {
 		if b != nil {
-			b.Dispose()
+			b.Dispose(ctx)
 		}
 	}
 }
@@ -130,7 +109,7 @@ func newGroupByGroupingIter(
 ) *groupByGroupingIter {
 	keySch := make(sql.Schema, len(groupByExprs))
 	for i := range groupByExprs {
-		keySch[i] = &sql.Column{Type: groupByExprs[i].Type()}
+		keySch[i] = &sql.Column{Type: groupByExprs[i].Type(ctx)}
 	}
 	return &groupByGroupingIter{
 		selectedExprs: selectedExprs,
@@ -143,7 +122,7 @@ func newGroupByGroupingIter(
 
 func (i *groupByGroupingIter) Next(ctx *sql.Context) (sql.Row, error) {
 	if i.aggregations == nil {
-		i.aggregations, i.dispose = ctx.Memory.NewHistoryCache()
+		i.aggregations, i.dispose = ctx.Memory.NewHistoryCache(ctx)
 		if err := i.compute(ctx); err != nil {
 			return nil, err
 		}
@@ -181,7 +160,11 @@ func (i *groupByGroupingIter) compute(ctx *sql.Context) error {
 				}
 				return err
 			}
-			rowChan <- row
+			select {
+			case rowChan <- row:
+			case <-subCtx.Done():
+				return subCtx.Err()
+			}
 		}
 	})
 
@@ -200,7 +183,7 @@ func (i *groupByGroupingIter) compute(ctx *sql.Context) error {
 			if errors.Is(err, sql.ErrKeyNotFound) {
 				buf = make([]sql.AggregationBuffer, len(i.selectedExprs))
 				for j, a := range i.selectedExprs {
-					buf[j], err = newAggregationBuffer(a)
+					buf[j], err = newAggregationBuffer(ctx, a)
 					if err != nil {
 						return err
 					}
@@ -243,7 +226,7 @@ func (i *groupByGroupingIter) put(key uint64, val []sql.AggregationBuffer) error
 }
 
 func (i *groupByGroupingIter) Close(ctx *sql.Context) error {
-	i.Dispose()
+	i.Dispose(ctx)
 	i.aggregations = nil
 	if i.dispose != nil {
 		i.dispose()
@@ -253,12 +236,12 @@ func (i *groupByGroupingIter) Close(ctx *sql.Context) error {
 	return i.child.Close(ctx)
 }
 
-func (i *groupByGroupingIter) Dispose() {
+func (i *groupByGroupingIter) Dispose(ctx *sql.Context) {
 	for _, k := range i.keys {
 		bs, _ := i.get(k)
 		if bs != nil {
 			for _, b := range bs {
-				b.Dispose()
+				b.Dispose(ctx)
 			}
 		}
 	}
@@ -272,8 +255,10 @@ func (i *groupByGroupingIter) groupingKey(ctx *sql.Context, row sql.Row) (uint64
 		}
 
 		// TODO: this should be moved into hash.HashOf
-		typ := expr.Type()
-		if extTyp, isExtTyp := typ.(sql.ExtendedType); isExtTyp {
+		// Serialized values can differ for values that compare as equal, so we only serialize values that HashOf can't
+		// hash canonically by itself.
+		typ := expr.Type(ctx)
+		if extTyp, isExtTyp := typ.(sql.ExtendedType); isExtTyp && !hash.HashesCanonically(v) {
 			val, vErr := extTyp.SerializeValue(ctx, v)
 			if vErr != nil {
 				return 0, vErr
@@ -286,14 +271,14 @@ func (i *groupByGroupingIter) groupingKey(ctx *sql.Context, row sql.Row) (uint64
 	return hash.HashOf(ctx, i.keySch, i.keyRow)
 }
 
-func newAggregationBuffer(expr sql.Expression) (sql.AggregationBuffer, error) {
+func newAggregationBuffer(ctx *sql.Context, expr sql.Expression) (sql.AggregationBuffer, error) {
 	switch n := expr.(type) {
 	case sql.Aggregation:
-		return n.NewBuffer()
+		return n.NewBuffer(ctx)
 	default:
 		// The semantics for a non-aggregation expression in a group by node is First.
 		// When ONLY_FULL_GROUP_BY is enabled, this is an error, but it's allowed otherwise.
-		return aggregation.NewFirst(expr).NewBuffer()
+		return aggregation.NewFirst(expr).NewBuffer(ctx)
 	}
 }
 

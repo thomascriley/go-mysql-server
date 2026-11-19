@@ -46,6 +46,7 @@ type TableData struct {
 	partitionKeys           [][]byte
 	autoColIdx              int
 	autoIncVal              uint64
+	targetRowSize           uint64
 	collation               sql.CollationID
 }
 
@@ -130,7 +131,7 @@ func (td TableData) partition(ctx *sql.Context, row sql.Row) (int, error) {
 
 		t, isStringType := td.schema.Schema[keyColumns[i]].Type.(sql.StringType)
 		if isStringType && v != nil {
-			v, err = types.ConvertToString(ctx, v, t, nil)
+			v, _, err = types.ConvertToString(ctx, v, t, nil)
 			if err == nil {
 				err = t.Collation().WriteWeightString(hash, v.(string))
 			}
@@ -146,7 +147,7 @@ func (td TableData) partition(ctx *sql.Context, row sql.Row) (int, error) {
 	return int(sum64 % uint64(len(td.partitionKeys))), nil
 }
 
-func (td *TableData) truncate(schema sql.PrimaryKeySchema) *TableData {
+func (td *TableData) truncate(ctx *sql.Context, schema sql.PrimaryKeySchema, renames ...sql.ColumnRename) *TableData {
 	var keys [][]byte
 	var partitions = map[string][]sql.Row{}
 	numParts := len(td.partitionKeys)
@@ -161,7 +162,7 @@ func (td *TableData) truncate(schema sql.PrimaryKeySchema) *TableData {
 	td.partitions = partitions
 	td.schema = schema
 
-	td.indexes = rewriteIndexes(td.indexes, schema)
+	td.indexes = rewriteIndexes(ctx, td.indexes, schema, renames...)
 	td.secondaryIndexStorage = make(map[indexName][]sql.Row)
 
 	td.autoIncVal = 0
@@ -180,10 +181,10 @@ func (td *TableData) truncate(schema sql.PrimaryKeySchema) *TableData {
 
 // rewriteIndexes returns a new set of indexes appropriate for the new schema provided. Index expressions are adjusted
 // as necessary, and any indexes for columns that no longer exist are removed from the set.
-func rewriteIndexes(indexes map[string]sql.Index, schema sql.PrimaryKeySchema) map[string]sql.Index {
+func rewriteIndexes(ctx *sql.Context, indexes map[string]sql.Index, schema sql.PrimaryKeySchema, renames ...sql.ColumnRename) map[string]sql.Index {
 	newIdxes := make(map[string]sql.Index)
 	for name, idx := range indexes {
-		newIdx := rewriteIndex(idx.(*Index), schema)
+		newIdx := rewriteIndex(ctx, idx.(*Index), schema, renames...)
 		if newIdx != nil {
 			newIdxes[name] = newIdx
 		}
@@ -193,16 +194,25 @@ func rewriteIndexes(indexes map[string]sql.Index, schema sql.PrimaryKeySchema) m
 
 // rewriteIndex returns a new index appropriate for the new schema provided, or nil if no columns remain to be indexed
 // in the schema
-func rewriteIndex(idx *Index, schema sql.PrimaryKeySchema) *Index {
+func rewriteIndex(ctx *sql.Context, idx *Index, schema sql.PrimaryKeySchema, renames ...sql.ColumnRename) *Index {
 	var newExprs []sql.Expression
 	for _, expr := range idx.Exprs {
-		newE, _, _ := transform.Expr(expr, func(e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
+		newE, _, _ := transform.Expr(ctx, expr, func(ctx *sql.Context, e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
 			if gf, ok := e.(*expression.GetField); ok {
+				for _, rename := range renames {
+					if strings.EqualFold(gf.Name(), rename.Before) {
+						gf = gf.WithName(rename.After)
+						break
+					}
+				}
+
 				newIdx := schema.IndexOfColName(gf.Name())
 				if newIdx < 0 {
 					return nil, transform.SameTree, nil
 				}
-				return gf.WithIndex(newIdx), transform.NewTree, nil
+
+				col := schema.Schema[newIdx]
+				return expression.NewGetFieldWithTable(newIdx, int(gf.TableId()), col.Type, gf.Database(), gf.Table(), col.Name, col.Nullable), transform.NewTree, nil
 			}
 
 			return e, transform.SameTree, nil
@@ -334,9 +344,26 @@ Top:
 	}
 }
 
-func (td *TableData) indexColsForTableEditor() ([][]int, [][]uint16) {
+// indexColsForTableEditor returns three parallel slices describing the unique
+// indexes defined on this table, for use when constructing a tableEditor.
+//
+// The first return value is the column ordinals: for each unique index, a
+// slice of 0-based positions of the indexed columns within the table schema.
+//
+// The second return value is the prefix lengths: for each unique index, a
+// slice of per-column prefix lengths (uint16). A value of 0 means the full
+// column value is indexed with no prefix truncation.
+//
+// The third return value is the index names: the lowercased ID of each unique
+// index, in the same order as the first two slices.
+//
+// Indexes that are not unique, and indexes whose columns are absent from the
+// current schema (which can occur during a table rewrite), are silently
+// omitted from all three slices.
+func (td *TableData) indexColsForTableEditor() ([][]int, [][]uint16, []string) {
 	var uniqIdxCols [][]int
 	var prefixLengths [][]uint16
+	var idxNames []string
 	for _, idx := range td.indexes {
 		if !idx.IsUnique() {
 			continue
@@ -354,8 +381,9 @@ func (td *TableData) indexColsForTableEditor() ([][]int, [][]uint16) {
 		}
 		uniqIdxCols = append(uniqIdxCols, colIdxs)
 		prefixLengths = append(prefixLengths, idx.PrefixLengths())
+		idxNames = append(idxNames, strings.ToLower(idx.ID()))
 	}
-	return uniqIdxCols, prefixLengths
+	return uniqIdxCols, prefixLengths, idxNames
 }
 
 // Sorts the rows in the partitions of the table to be in primary key order.
@@ -395,20 +423,25 @@ func (td *TableData) sortSecondaryIndexes(ctx *sql.Context) {
 		for i, idx := range fieldIndexes {
 			types[i] = td.schema.Schema[idx].Type
 		}
-		sort.Slice(idxStorage, func(i, j int) bool {
+		sort.SliceStable(idxStorage, func(i, j int) bool {
 			for t, typ := range types {
+				var colOrder sql.IndexColumnOrder
+				if t < len(idx.ColOrders) {
+					colOrder = idx.ColOrders[t]
+				}
 				left := idxStorage[i][t]
 				right := idxStorage[j][t]
 
 				// Compare doesn't handle nil values, so we need to handle that case. Nils sort before other values
+				// unless the column stores them last
 				if left == nil {
 					if right == nil {
 						continue
 					} else {
-						return true
+						return !colOrder.NullsLast
 					}
 				} else if right == nil {
-					return false
+					return colOrder.NullsLast
 				}
 
 				compare, err := typ.Compare(ctx, left, right)
@@ -416,7 +449,7 @@ func (td *TableData) sortSecondaryIndexes(ctx *sql.Context) {
 					panic(err)
 				}
 				if compare != 0 {
-					return compare < 0
+					return (compare < 0) != colOrder.Descending
 				}
 			}
 			return false

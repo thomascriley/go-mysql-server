@@ -15,9 +15,10 @@ func TestAggGen(t *testing.T) {
 		defines: AggDefs{
 			[]AggDef{
 				{
-					Name:    "Test",
-					Desc:    "Test description",
-					RetType: "sql.Float64",
+					Name:          "Test",
+					Desc:          "Test description",
+					RetType:       "sql.Float64",
+					WindowSqlName: "test_window",
 				},
 			},
 		},
@@ -36,6 +37,7 @@ func TestAggGen(t *testing.T) {
 
         var _ sql.FunctionExpression = (*Test)(nil)
         var _ sql.Aggregation = (*Test)(nil)
+        var _ sql.Describable = (*Test)(nil)
         var _ sql.WindowAdaptableExpression = (*Test)(nil)
 
         func NewTest(e sql.Expression) *Test {
@@ -48,43 +50,49 @@ func TestAggGen(t *testing.T) {
             }
         }
 
-        func (a *Test) Type() sql.Type {
+        func (a *Test) Type(ctx *sql.Context) sql.Type {
             return sql.Float64
         }
 
-        func (a *Test) IsNullable() bool {
+        func (a *Test) IsNullable(ctx *sql.Context) bool {
             return false
         }
 
         func (a *Test) String() string {
           if a.window != nil {
-            pr := sql.NewTreePrinter()
-            _ = pr.WriteNode("TEST")
-        	    children := []string{a.window.String(), a.Child.String()}
-            pr.WriteChildren(children...)
-            return pr.String()
+	        return "TEST_WINDOW(" + a.Child.String() + ") " + a.window.String()
           }
-          return "TEST(" + a.Child.String() + ")"
+	      return "TEST(" + a.Child.String() + ")"
         }
 
-        func (a *Test) DebugString() string {
+        func (a *Test) Describe(ctx *sql.Context, options sql.DescribeOptions) string {
+          if options.Debug {
+            if a.window != nil {
+              pr := sql.NewTreePrinter()
+              _ = pr.WriteNode("TEST")
+	      children := []string{sql.Describe(ctx, a.window, options), sql.Describe(ctx, a.Child, options)}
+              pr.WriteChildren(children...)
+              return pr.String()
+            }
+            return fmt.Sprintf("TEST(%s)", sql.Describe(ctx, a.Child, options))
+          }
           if a.window != nil {
-            pr := sql.NewTreePrinter()
-            _ = pr.WriteNode("TEST")
-        	    children := []string{sql.DebugString(a.window), sql.DebugString(a.Child)}
-            pr.WriteChildren(children...)
-            return pr.String()
+            return "TEST_WINDOW(" + sql.Describe(ctx, a.Child, options) + ") " + sql.Describe(ctx, a.window, options)
           }
-          return fmt.Sprintf("TEST(%s)", sql.DebugString(a.Child))
+          return "TEST(" + sql.Describe(ctx, a.Child, options) + ")"
         }
 
-        func (a *Test) WithWindow(window *sql.WindowDefinition) sql.WindowAdaptableExpression {
-            res := a.unaryAggBase.WithWindow(window)
+        func (a *Test) DebugString(ctx *sql.Context) string {
+          return a.Describe(ctx, sql.DescribeOptions{Debug: true})
+        }
+
+        func (a *Test) WithWindow(ctx *sql.Context, window *sql.WindowDefinition) sql.WindowAdaptableExpression {
+            res := a.unaryAggBase.WithWindow(ctx, window)
             return &Test{unaryAggBase: *res.(*unaryAggBase)}
         }
 
-        func (a *Test) WithChildren(children ...sql.Expression) (sql.Expression, error) {
-            res, err := a.unaryAggBase.WithChildren(children...)
+        func (a *Test) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
+            res, err := a.unaryAggBase.WithChildren(ctx, children...)
             return &Test{unaryAggBase: *res.(*unaryAggBase)}, err
         }
 
@@ -93,20 +101,20 @@ func TestAggGen(t *testing.T) {
             return &Test{unaryAggBase: *res.(*unaryAggBase)}
         }
 
-        func (a *Test) NewBuffer() (sql.AggregationBuffer, error) {
-            child, err := transform.Clone(a.Child)
+        func (a *Test) NewBuffer(ctx *sql.Context) (sql.AggregationBuffer, error) {
+            child, err := transform.Clone(ctx, a.Child)
             if err != nil {
                 return nil, err
             }
             return NewTestBuffer(child), nil
         }
 
-        func (a *Test) NewWindowFunction() (sql.WindowFunction, error) {
-            child, err := transform.Clone(a.Child)
+        func (a *Test) NewWindowFunction(ctx *sql.Context) (sql.WindowFunction, error) {
+            child, err := transform.Clone(ctx, a.Child)
             if err != nil {
                 return nil, err
             }
-            return NewTestAgg(child).WithWindow(a.Window())
+            return NewTestAgg(child).WithWindow(ctx, a.Window())
         }
 		`,
 	}

@@ -74,7 +74,7 @@ func (b *BaseBuilder) buildDescribeQuery(ctx *sql.Context, n *plan.DescribeQuery
 
 	var rows []sql.Row
 	if n.Format.Plan {
-		formatString := sql.Describe(n.Child, n.Format)
+		formatString := sql.Describe(ctx, n.Child, n.Format)
 		formatString = strings.Replace(formatString, "\r", "", -1)
 		for _, l := range strings.Split(formatString, "\n") {
 			if strings.TrimSpace(l) != "" {
@@ -444,12 +444,18 @@ func (b *BaseBuilder) buildShowColumns(ctx *sql.Context, n *plan.ShowColumns, ro
 	span, _ := ctx.Span("plan.ShowColumns")
 
 	schema := n.TargetSchema()
-	var rows = make([]sql.Row, len(schema))
-	for i, col := range schema {
+	var rows = make([]sql.Row, 0, len(schema))
+	for _, col := range schema {
+		if col.HiddenSystem && !n.Extended {
+			continue
+		}
+
 		var row sql.Row
 		var collation interface{}
-		if types.IsTextOnly(col.Type) {
-			collation = sql.Collation_Default.String()
+		if twc, ok := col.Type.(sql.TypeWithCollation); ok && !types.IsBinaryType(col.Type) {
+			if colCollation := twc.Collation(); colCollation != sql.Collation_binary {
+				collation = colCollation.String()
+			}
 		}
 
 		var null = "NO"
@@ -462,11 +468,11 @@ func (b *BaseBuilder) buildShowColumns(ctx *sql.Context, n *plan.ShowColumns, ro
 		case *plan.ResolvedTable:
 			if col.PrimaryKey {
 				key = "PRI"
-			} else if isPriCol(n, col, table) {
+			} else if isPriCol(ctx, n, col, table) {
 				key = "PRI"
-			} else if isUnqCol(n, col, table) {
+			} else if isUnqCol(ctx, n, col, table) {
 				key = "UNI"
-			} else if isMulCol(n, col, table) {
+			} else if isMulCol(ctx, n, col, table) {
 				key = "MUL"
 			}
 		case *plan.SubqueryAlias:
@@ -485,11 +491,7 @@ func (b *BaseBuilder) buildShowColumns(ctx *sql.Context, n *plan.ShowColumns, ro
 			defaultVal = nil
 		}
 
-		extra := col.Extra
-		// If extra is not defined, fill it here.
-		if extra == "" && !col.Default.IsLiteral() {
-			extra = "DEFAULT_GENERATED"
-		}
+		extra := sql.FormatColumnExtra(col)
 
 		if n.Full {
 			row = sql.Row{
@@ -514,7 +516,7 @@ func (b *BaseBuilder) buildShowColumns(ctx *sql.Context, n *plan.ShowColumns, ro
 			}
 		}
 
-		rows[i] = row
+		rows = append(rows, row)
 	}
 
 	return sql.NewSpanIter(span, sql.RowsToRowIter(rows...)), nil
@@ -525,7 +527,7 @@ func (b *BaseBuilder) buildShowVariables(ctx *sql.Context, n *plan.ShowVariables
 	var sysVars map[string]interface{}
 
 	if n.Global {
-		sysVars = sql.SystemVariables.GetAllGlobalVariables()
+		sysVars = ctx.SystemVariables().GetAllGlobalVariables()
 	} else {
 		sysVars = ctx.GetAllSessionVariables()
 	}
@@ -604,7 +606,7 @@ func (b *BaseBuilder) buildShowTriggers(ctx *sql.Context, n *plan.ShowTriggers, 
 }
 
 func (b *BaseBuilder) buildDescribe(ctx *sql.Context, n *plan.Describe, row sql.Row) (sql.RowIter, error) {
-	return &describeIter{schema: n.Child.Schema()}, nil
+	return &describeIter{schema: n.Child.Schema(ctx)}, nil
 }
 
 func (b *BaseBuilder) buildShowDatabases(ctx *sql.Context, n *plan.ShowDatabases, row sql.Row) (sql.RowIter, error) {
@@ -805,6 +807,8 @@ func (b *BaseBuilder) buildShowReplicaStatus(ctx *sql.Context, n *plan.ShowRepli
 
 	replicateDoTables := strings.Join(status.ReplicateDoTables, ",")
 	replicateIgnoreTables := strings.Join(status.ReplicateIgnoreTables, ",")
+	replicateWildDoTables := strings.Join(status.ReplicateWildDoTables, ",")
+	replicateWildIgnoreTables := strings.Join(status.ReplicateWildIgnoreTables, ",")
 
 	lastIoErrorTimestamp := formatReplicaStatusTimestamp(status.LastIoErrorTimestamp)
 	lastSqlErrorTimestamp := formatReplicaStatusTimestamp(status.LastSqlErrorTimestamp)
@@ -815,61 +819,61 @@ func (b *BaseBuilder) buildShowReplicaStatus(ctx *sql.Context, n *plan.ShowRepli
 	}
 
 	row = sql.Row{
-		"",                       // Replica_IO_State
-		status.SourceHost,        // Source_Host
-		status.SourceUser,        // Source_User
-		status.SourcePort,        // Source_Port
-		status.ConnectRetry,      // Connect_Retry
-		"INVALID",                // Source_Log_File
-		0,                        // Read_Source_Log_Pos
-		nil,                      // Relay_Log_File
-		nil,                      // Relay_Log_Pos
-		"INVALID",                // Relay_Source_Log_File
-		status.ReplicaIoRunning,  // Replica_IO_Running
-		status.ReplicaSqlRunning, // Replica_SQL_Running
-		nil,                      // Replicate_Do_DB
-		nil,                      // Replicate_Ignore_DB
-		replicateDoTables,        // Replicate_Do_Table
-		replicateIgnoreTables,    // Replicate_Ignore_Table
-		nil,                      // Replicate_Wild_Do_Table
-		nil,                      // Replicate_Wild_Ignore_Table
-		status.LastSqlErrNumber,  // Last_Errno
-		status.LastSqlError,      // Last_Error
-		nil,                      // Skip_Counter
-		0,                        // Exec_Source_Log_Pos
-		nil,                      // Relay_Log_Space
-		"None",                   // Until_Condition
-		nil,                      // Until_Log_File
-		nil,                      // Until_Log_Pos
-		sslAllowed,               // Source_SSL_Allowed
-		nil,                      // Source_SSL_CA_File
-		nil,                      // Source_SSL_CA_Path
-		nil,                      // Source_SSL_Cert
-		nil,                      // Source_SSL_Cipher
-		nil,                      // Source_SSL_CRL_File
-		nil,                      // Source_SSL_CRL_Path
-		nil,                      // Source_SSL_Key
-		nil,                      // Source_SSL_Verify_Server_Cert
-		0,                        // Seconds_Behind_Source
-		status.LastIoErrNumber,   // Last_IO_Errno
-		status.LastIoError,       // Last_IO_Error
-		status.LastSqlErrNumber,  // Last_SQL_Errno
-		status.LastSqlError,      // Last_SQL_Error
-		nil,                      // Replicate_Ignore_Server_Ids
-		status.SourceServerId,    // Source_Server_Id
-		status.SourceServerUuid,  // Source_UUID
-		nil,                      // Source_Info_File
-		0,                        // SQL_Delay
-		0,                        // SQL_Remaining_Delay
-		nil,                      // Replica_SQL_Running_State
-		status.SourceRetryCount,  // Source_Retry_Count
-		nil,                      // Source_Bind
-		lastIoErrorTimestamp,     // Last_IO_Error_Timestamp
-		lastSqlErrorTimestamp,    // Last_SQL_Error_Timestamp
-		status.RetrievedGtidSet,  // Retrieved_Gtid_Set
-		status.ExecutedGtidSet,   // Executed_Gtid_Set
-		status.AutoPosition,      // Auto_Position
-		nil,                      // Replicate_Rewrite_DB
+		"",                        // Replica_IO_State
+		status.SourceHost,         // Source_Host
+		status.SourceUser,         // Source_User
+		status.SourcePort,         // Source_Port
+		status.ConnectRetry,       // Connect_Retry
+		"INVALID",                 // Source_Log_File
+		0,                         // Read_Source_Log_Pos
+		nil,                       // Relay_Log_File
+		nil,                       // Relay_Log_Pos
+		"INVALID",                 // Relay_Source_Log_File
+		status.ReplicaIoRunning,   // Replica_IO_Running
+		status.ReplicaSqlRunning,  // Replica_SQL_Running
+		nil,                       // Replicate_Do_DB
+		nil,                       // Replicate_Ignore_DB
+		replicateDoTables,         // Replicate_Do_Table
+		replicateIgnoreTables,     // Replicate_Ignore_Table
+		replicateWildDoTables,     // Replicate_Wild_Do_Table
+		replicateWildIgnoreTables, // Replicate_Wild_Ignore_Table
+		status.LastSqlErrNumber,   // Last_Errno
+		status.LastSqlError,       // Last_Error
+		nil,                       // Skip_Counter
+		0,                         // Exec_Source_Log_Pos
+		nil,                       // Relay_Log_Space
+		"None",                    // Until_Condition
+		nil,                       // Until_Log_File
+		nil,                       // Until_Log_Pos
+		sslAllowed,                // Source_SSL_Allowed
+		nil,                       // Source_SSL_CA_File
+		nil,                       // Source_SSL_CA_Path
+		nil,                       // Source_SSL_Cert
+		nil,                       // Source_SSL_Cipher
+		nil,                       // Source_SSL_CRL_File
+		nil,                       // Source_SSL_CRL_Path
+		nil,                       // Source_SSL_Key
+		nil,                       // Source_SSL_Verify_Server_Cert
+		0,                         // Seconds_Behind_Source
+		status.LastIoErrNumber,    // Last_IO_Errno
+		status.LastIoError,        // Last_IO_Error
+		status.LastSqlErrNumber,   // Last_SQL_Errno
+		status.LastSqlError,       // Last_SQL_Error
+		nil,                       // Replicate_Ignore_Server_Ids
+		status.SourceServerId,     // Source_Server_Id
+		status.SourceServerUuid,   // Source_UUID
+		nil,                       // Source_Info_File
+		0,                         // SQL_Delay
+		0,                         // SQL_Remaining_Delay
+		nil,                       // Replica_SQL_Running_State
+		status.SourceRetryCount,   // Source_Retry_Count
+		nil,                       // Source_Bind
+		lastIoErrorTimestamp,      // Last_IO_Error_Timestamp
+		lastSqlErrorTimestamp,     // Last_SQL_Error_Timestamp
+		status.RetrievedGtidSet,   // Retrieved_Gtid_Set
+		status.ExecutedGtidSet,    // Executed_Gtid_Set
+		status.AutoPosition,       // Auto_Position
+		nil,                       // Replicate_Rewrite_DB
 	}
 
 	return sql.RowsToRowIter(row), nil

@@ -43,7 +43,7 @@ func (d *Distinct) Resolved() bool {
 }
 
 // WithChildren implements the Node interface.
-func (d *Distinct) WithChildren(children ...sql.Node) (sql.Node, error) {
+func (d *Distinct) WithChildren(ctx *sql.Context, children ...sql.Node) (sql.Node, error) {
 	if len(children) != 1 {
 		return nil, sql.ErrInvalidChildrenNumber.New(d, len(children), 1)
 	}
@@ -62,7 +62,7 @@ func (d *Distinct) Expressions() []sql.Expression {
 }
 
 // WithExpressions implements the interface sql.Expressioner.
-func (d *Distinct) WithExpressions(exprs ...sql.Expression) (sql.Node, error) {
+func (d *Distinct) WithExpressions(ctx *sql.Context, exprs ...sql.Expression) (sql.Node, error) {
 	return NewDistinct(d.Child, exprs...), nil
 }
 
@@ -76,15 +76,15 @@ func (d *Distinct) CollationCoercibility(ctx *sql.Context) (collation sql.Collat
 }
 
 // Describe implements sql.Describable
-func (d Distinct) Describe(options sql.DescribeOptions) string {
+func (d *Distinct) Describe(ctx *sql.Context, options sql.DescribeOptions) string {
 	p := sql.NewTreePrinter()
 	_ = p.WriteNode("Distinct")
-	_ = p.WriteChildren(sql.Describe(d.Child, options))
+	_ = p.WriteChildren(sql.Describe(ctx, d.Child, options))
 	return p.String()
 }
 
 // String implements fmt.Stringer
-func (d Distinct) String() string {
+func (d *Distinct) String() string {
 	p := sql.NewTreePrinter()
 	_ = p.WriteNode("Distinct")
 	_ = p.WriteChildren(d.Child.String())
@@ -92,29 +92,37 @@ func (d Distinct) String() string {
 }
 
 // DebugString implements sql.DebugStringer
-func (d Distinct) DebugString() string {
+func (d *Distinct) DebugString(ctx *sql.Context) string {
 	p := sql.NewTreePrinter()
 	_ = p.WriteNode("Distinct")
-	_ = p.WriteChildren(sql.DebugString(d.Child))
+	_ = p.WriteChildren(sql.DebugString(ctx, d.Child))
 	return p.String()
 }
 
 // Hasher returns a new DistinctHasher created from this Distinct node.
-func (d *Distinct) Hasher() DistinctHasher {
-	var hashingRow sql.Row
-	if len(d.distinctOn) > 0 {
-		hashingRow = make(sql.Row, len(d.distinctOn))
-	}
-	return DistinctHasher{
-		distinctOn: d.distinctOn,
-		hashingRow: hashingRow,
-	}
+func (d *Distinct) Hasher(ctx *sql.Context) DistinctHasher {
+	return NewDistinctHasher(d.distinctOn, d.Child.Schema(ctx))
 }
 
 // DistinctHasher handles hashing for Distinct nodes, taking any non-expression projections into account.
 type DistinctHasher struct {
 	distinctOn []sql.Expression
+	sch        sql.Schema
 	hashingRow sql.Row
+}
+
+func NewDistinctHasher(distinctOn []sql.Expression, sch sql.Schema) DistinctHasher {
+	var hashingRow sql.Row
+	if len(distinctOn) > 0 {
+		hashingRow = make(sql.Row, len(distinctOn))
+	} else {
+		hashingRow = make(sql.Row, len(sch))
+	}
+	return DistinctHasher{
+		distinctOn: distinctOn,
+		hashingRow: hashingRow,
+		sch:        sch,
+	}
 }
 
 // HashOf handles the hashing of the given row, taking any expressions into account.
@@ -127,9 +135,9 @@ func (dh DistinctHasher) HashOf(ctx *sql.Context, row sql.Row) (uint64, error) {
 				return 0, err
 			}
 		}
-		return hash.HashOf(ctx, nil, dh.hashingRow)
+		return hash.HashOf(ctx, dh.sch, dh.hashingRow)
 	}
-	return hash.HashOf(ctx, nil, row)
+	return hash.HashOf(ctx, dh.sch, row)
 }
 
 // OrderedDistinct is a Distinct node optimized for sorted row sets.
@@ -157,7 +165,7 @@ func (d *OrderedDistinct) Resolved() bool {
 }
 
 // WithChildren implements the Node interface.
-func (d *OrderedDistinct) WithChildren(children ...sql.Node) (sql.Node, error) {
+func (d *OrderedDistinct) WithChildren(ctx *sql.Context, children ...sql.Node) (sql.Node, error) {
 	if len(children) != 1 {
 		return nil, sql.ErrInvalidChildrenNumber.New(d, len(children), 1)
 	}
@@ -181,9 +189,9 @@ func (d OrderedDistinct) String() string {
 	return p.String()
 }
 
-func (d OrderedDistinct) DebugString() string {
+func (d OrderedDistinct) DebugString(ctx *sql.Context) string {
 	p := sql.NewTreePrinter()
 	_ = p.WriteNode("OrderedDistinct")
-	_ = p.WriteChildren(sql.DebugString(d.Child))
+	_ = p.WriteChildren(sql.DebugString(ctx, d.Child))
 	return p.String()
 }

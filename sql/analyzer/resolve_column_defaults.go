@@ -15,6 +15,8 @@
 package analyzer
 
 import (
+	"strings"
+
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/expression"
 	"github.com/dolthub/go-mysql-server/sql/information_schema"
@@ -29,11 +31,11 @@ func validateColumnDefaults(ctx *sql.Context, _ *Analyzer, n sql.Node, _ *plan.S
 	span, ctx := ctx.Span("validateColumnDefaults")
 	defer span.End()
 
-	return transform.Node(n, func(n sql.Node) (sql.Node, transform.TreeIdentity, error) {
+	return transform.Node(ctx, n, func(ctx *sql.Context, n sql.Node) (sql.Node, transform.TreeIdentity, error) {
 		switch node := n.(type) {
 		case *plan.AlterDefaultSet:
-			table := getResolvedTable(node)
-			sch := table.Schema()
+			table := getResolvedTable(ctx, node)
+			sch := table.Schema(ctx)
 			index := sch.IndexOfColName(node.ColumnName)
 			if index == -1 {
 				return nil, transform.SameTree, sql.ErrColumnNotFound.New(node.ColumnName)
@@ -70,7 +72,7 @@ func validateColumnDefaults(ctx *sql.Context, _ *Analyzer, n sql.Node, _ *plan.S
 			// There may be multiple DDL nodes in the plan (ALTER TABLE statements can have many clauses), and for each of them
 			// we need to count the column indexes in the very hacky way outlined above.
 			i := 0
-			return transform.NodeExprs(n, func(e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
+			return transform.NodeExprs(ctx, n, func(ctx *sql.Context, e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
 				eWrapper, ok := e.(*expression.Wrapper)
 				if !ok {
 					return e, transform.SameTree, nil
@@ -92,6 +94,12 @@ func validateColumnDefaults(ctx *sql.Context, _ *Analyzer, n sql.Node, _ *plan.S
 				col, err := lookupColumnForTargetSchema(ctx, node, i)
 				if err != nil {
 					return nil, transform.SameTree, err
+				}
+
+				// A dropped column's default and generated expressions are going away, so don't reject the drop
+				// because they are invalid. Dropping the column is how a table with such an expression is repaired.
+				if dc, ok := node.(*plan.DropColumn); ok && strings.EqualFold(dc.Column, col.Name) {
+					return e, transform.SameTree, nil
 				}
 
 				err = validateColumnDefault(ctx, col, colDefault)
@@ -122,11 +130,11 @@ func stripTableNamesFromColumnDefaults(ctx *sql.Context, _ *Analyzer, n sql.Node
 	span, ctx := ctx.Span("stripTableNamesFromColumnDefaults")
 	defer span.End()
 
-	return transform.Node(n, func(n sql.Node) (sql.Node, transform.TreeIdentity, error) {
+	return transform.Node(ctx, n, func(ctx *sql.Context, n sql.Node) (sql.Node, transform.TreeIdentity, error) {
 		switch node := n.(type) {
 		case *plan.AlterDefaultSet:
 			eWrapper := expression.WrapExpression(node.Default)
-			newExpr, same, err := stripTableNamesFromDefault(eWrapper)
+			newExpr, same, err := stripTableNamesFromDefault(ctx, eWrapper)
 			if err != nil {
 				return node, transform.SameTree, err
 			}
@@ -139,14 +147,47 @@ func stripTableNamesFromColumnDefaults(ctx *sql.Context, _ *Analyzer, n sql.Node
 				return node, transform.SameTree, err
 			}
 			return newNode, transform.NewTree, nil
+		case *plan.AlterIndex:
+			// AlterIndex.Expressions() only exposes per-column defaults from TargetSchema, not
+			// AlterIndex.Expression (the functional index expression). Strip table qualifiers from
+			// it explicitly so the expression is stored without a table name (e.g. "lower(email)"
+			// instead of "lower(users.email)"), matching what stripTableNamesFromDefault does for
+			// regular generated column defaults.
+			np := *node
+			allSame := transform.SameTree
+			for i, idxCol := range node.Columns {
+				if idxCol.Expression == nil {
+					continue
+				}
+
+				newExpr, same, err := transform.Expr(ctx, idxCol.Expression, func(ctx *sql.Context, e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
+					if gf, ok := e.(*expression.GetField); ok {
+						return gf.WithTable(""), transform.NewTree, nil
+					}
+					return e, transform.SameTree, nil
+				})
+				if err != nil {
+					return node, transform.SameTree, err
+				}
+
+				allSame = allSame && same
+				if !same {
+					np.Columns[i].Expression = newExpr
+				}
+			}
+
+			if allSame {
+				return node, transform.SameTree, nil
+			}
+			return &np, transform.NewTree, nil
 		case sql.SchemaTarget:
-			return transform.NodeExprs(n, func(e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
+			return transform.NodeExprs(ctx, n, func(ctx *sql.Context, e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
 				eWrapper, ok := e.(*expression.Wrapper)
 				if !ok {
 					return e, transform.SameTree, nil
 				}
 
-				return stripTableNamesFromDefault(eWrapper)
+				return stripTableNamesFromDefault(ctx, eWrapper)
 			})
 		case *plan.ResolvedTable:
 			ct, ok := node.Table.(*information_schema.ColumnsTable)
@@ -159,13 +200,13 @@ func stripTableNamesFromColumnDefaults(ctx *sql.Context, _ *Analyzer, n sql.Node
 				return nil, transform.SameTree, err
 			}
 
-			allDefaults, same, err := transform.Exprs(transform.WrappedColumnDefaults(allColumns), func(e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
+			allDefaults, same, err := transform.Exprs(ctx, transform.WrappedColumnDefaults(allColumns), func(ctx *sql.Context, e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
 				eWrapper, ok := e.(*expression.Wrapper)
 				if !ok {
 					return e, transform.SameTree, nil
 				}
 
-				return stripTableNamesFromDefault(eWrapper)
+				return stripTableNamesFromDefault(ctx, eWrapper)
 			})
 
 			if err != nil {
@@ -231,7 +272,7 @@ func validateColumnDefault(ctx *sql.Context, col *sql.Column, colDefault *sql.Co
 	}
 
 	var err error
-	sql.Inspect(colDefault.Expr, func(e sql.Expression) bool {
+	sql.Inspect(ctx, colDefault.Expr, func(ctx *sql.Context, e sql.Expression) bool {
 		switch e.(type) {
 		case *expression.UserVar, *expression.SystemVar:
 			err = sql.ErrColumnDefaultUserVariable.New(col.Name)
@@ -321,7 +362,7 @@ func validateEnumLiteralDefault(enumType sql.EnumType, colDefault *sql.ColumnDef
 	}
 }
 
-func stripTableNamesFromDefault(e *expression.Wrapper) (sql.Expression, transform.TreeIdentity, error) {
+func stripTableNamesFromDefault(ctx *sql.Context, e *expression.Wrapper) (sql.Expression, transform.TreeIdentity, error) {
 	newDefault, ok := e.Unwrap().(*sql.ColumnDefaultValue)
 	if !ok {
 		return e, transform.SameTree, nil
@@ -331,7 +372,7 @@ func stripTableNamesFromDefault(e *expression.Wrapper) (sql.Expression, transfor
 		return e, transform.SameTree, nil
 	}
 
-	newExpr, same, err := transform.Expr(newDefault.Expr, func(e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
+	newExpr, same, err := transform.Expr(ctx, newDefault.Expr, func(ctx *sql.Context, e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
 		if expr, ok := e.(*expression.GetField); ok {
 			return expr.WithTable(""), transform.NewTree, nil
 		}
@@ -354,11 +395,11 @@ func quoteDefaultColumnValueNames(ctx *sql.Context, a *Analyzer, n sql.Node, _ *
 	span, ctx := ctx.Span("quoteDefaultColumnValueNames")
 	defer span.End()
 
-	return transform.Node(n, func(n sql.Node) (sql.Node, transform.TreeIdentity, error) {
+	return transform.Node(ctx, n, func(ctx *sql.Context, n sql.Node) (sql.Node, transform.TreeIdentity, error) {
 		switch node := n.(type) {
 		case *plan.AlterDefaultSet:
 			eWrapper := expression.WrapExpression(node.Default)
-			newExpr, same, err := quoteIdentifiers(a.SchemaFormatter, eWrapper)
+			newExpr, same, err := quoteIdentifiers(ctx, a.SchemaFormatter, eWrapper)
 			if err != nil {
 				return node, transform.SameTree, err
 			}
@@ -372,13 +413,13 @@ func quoteDefaultColumnValueNames(ctx *sql.Context, a *Analyzer, n sql.Node, _ *
 			}
 			return newNode, transform.NewTree, nil
 		case sql.SchemaTarget:
-			return transform.NodeExprs(n, func(e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
+			return transform.NodeExprs(ctx, n, func(ctx *sql.Context, e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
 				eWrapper, ok := e.(*expression.Wrapper)
 				if !ok {
 					return e, transform.SameTree, nil
 				}
 
-				return quoteIdentifiers(a.SchemaFormatter, eWrapper)
+				return quoteIdentifiers(ctx, a.SchemaFormatter, eWrapper)
 			})
 		case *plan.ResolvedTable:
 			ct, ok := node.Table.(*information_schema.ColumnsTable)
@@ -391,13 +432,13 @@ func quoteDefaultColumnValueNames(ctx *sql.Context, a *Analyzer, n sql.Node, _ *
 				return nil, transform.SameTree, err
 			}
 
-			allDefaults, same, err := transform.Exprs(transform.WrappedColumnDefaults(allColumns), func(e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
+			allDefaults, same, err := transform.Exprs(ctx, transform.WrappedColumnDefaults(allColumns), func(ctx *sql.Context, e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
 				eWrapper, ok := e.(*expression.Wrapper)
 				if !ok {
 					return e, transform.SameTree, nil
 				}
 
-				return quoteIdentifiers(a.SchemaFormatter, eWrapper)
+				return quoteIdentifiers(ctx, a.SchemaFormatter, eWrapper)
 			})
 
 			if err != nil {
@@ -419,7 +460,7 @@ func quoteDefaultColumnValueNames(ctx *sql.Context, a *Analyzer, n sql.Node, _ *
 	})
 }
 
-func quoteIdentifiers(schemaFormatter sql.SchemaFormatter, wrap *expression.Wrapper) (sql.Expression, transform.TreeIdentity, error) {
+func quoteIdentifiers(ctx *sql.Context, schemaFormatter sql.SchemaFormatter, wrap *expression.Wrapper) (sql.Expression, transform.TreeIdentity, error) {
 	newDefault, ok := wrap.Unwrap().(*sql.ColumnDefaultValue)
 	if !ok {
 		return wrap, transform.SameTree, nil
@@ -429,7 +470,7 @@ func quoteIdentifiers(schemaFormatter sql.SchemaFormatter, wrap *expression.Wrap
 		return wrap, transform.SameTree, nil
 	}
 
-	newExpr, same, err := transform.Expr(newDefault.Expr, func(expr sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
+	newExpr, same, err := transform.Expr(ctx, newDefault.Expr, func(ctx *sql.Context, expr sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
 		if e, isGf := expr.(*expression.GetField); isGf {
 			return e.WithQuotedNames(schemaFormatter, true), transform.NewTree, nil
 		}
@@ -456,10 +497,10 @@ func normalizeDefault(ctx *sql.Context, colDefault *sql.ColumnDefaultValue) (sql
 	if !colDefault.IsLiteral() {
 		return colDefault, transform.SameTree, nil
 	}
-	if types.IsNull(colDefault.Expr) {
+	if types.IsNull(ctx, colDefault.Expr) {
 		return colDefault, transform.SameTree, nil
 	}
-	typ := colDefault.Type()
+	typ := colDefault.Type(ctx)
 	if skipDefaultNormalizationForType(typ) {
 		return colDefault, transform.SameTree, nil
 	}
@@ -468,7 +509,7 @@ func normalizeDefault(ctx *sql.Context, colDefault *sql.ColumnDefaultValue) (sql
 		return colDefault, transform.SameTree, nil
 	}
 
-	newDefault, err := colDefault.WithChildren(expression.NewLiteral(val, typ))
+	newDefault, err := colDefault.WithChildren(ctx, expression.NewLiteral(val, typ))
 	if err != nil {
 		return nil, transform.SameTree, err
 	}

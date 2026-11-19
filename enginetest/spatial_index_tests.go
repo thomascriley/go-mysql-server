@@ -354,7 +354,7 @@ var SpatialIndexTests = []SpatialIndexPlanTest{
 func TestSpatialIndexPlans(t *testing.T, harness Harness) {
 	for _, tt := range SpatialIndexTests {
 		t.Run(tt.name, func(t *testing.T) {
-			e := mustNewEngine(t, harness)
+			e := MustNewEngine(t, harness)
 			defer e.Close()
 			for _, statement := range tt.setup {
 				if sh, ok := harness.(SkippingHarness); ok {
@@ -367,9 +367,8 @@ func TestSpatialIndexPlans(t *testing.T, harness Harness) {
 			}
 			for _, tt := range tt.tests {
 				evalSpatialIndexPlanCorrectness(t, harness, e, tt.q, tt.q, tt.exp, tt.skip)
-				if !IsServerEngine(e) {
-					evalSpatialIndexPlanTest(t, harness, e, tt.q, tt.skip, tt.noIdx)
-				}
+				// Plan inspection is not supported for server engines.
+				evalSpatialIndexPlanTest(t, harness, e, tt.q, tt.skip || IsServerEngine(e), tt.noIdx)
 			}
 		})
 	}
@@ -387,7 +386,7 @@ func evalSpatialIndexPlanTest(t *testing.T, harness Harness, e QueryEngine, quer
 		require.NoError(t, err)
 
 		hasFilter, hasIndex, hasRightOrder := false, false, false
-		transform.InspectWithOpaque(a, func(n sql.Node) bool {
+		transform.InspectWithOpaque(ctx, a, func(ctx *sql.Context, n sql.Node) bool {
 			if n == nil {
 				return false
 			}
@@ -409,7 +408,7 @@ func evalSpatialIndexPlanTest(t *testing.T, harness Harness, e QueryEngine, quer
 		if noIdx {
 			require.False(t, hasIndex, "indextableaccess should not be in plan")
 		} else {
-			require.True(t, hasIndex, "indextableaccess node was missing from plan:\n %s", sql.DebugString(a))
+			require.True(t, hasIndex, "indextableaccess node was missing from plan:\n %s", sql.DebugString(ctx, a))
 			require.True(t, hasRightOrder, "filter node was not above indextableaccess")
 		}
 	})

@@ -30,7 +30,7 @@ import (
 // BenchmarkRegexpSubstr-14    	     100	  95661410 ns/op
 // BenchmarkRegexpSubstr-14    	   10000	    999559 ns/op
 func BenchmarkRegexpSubstr(b *testing.B) {
-	ctx := sql.NewEmptyContext()
+	ctx := newRegexpTestContext()
 	data := make([]sql.Row, 100)
 	for i := range data {
 		data[i] = sql.Row{fmt.Sprintf("test%d", i)}
@@ -38,6 +38,7 @@ func BenchmarkRegexpSubstr(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		f, err := NewRegexpSubstr(
+			ctx,
 			expression.NewGetField(0, types.LongText, "text", false),
 			expression.NewLiteral("^test[0-9]$", types.LongText),
 		)
@@ -51,6 +52,6 @@ func BenchmarkRegexpSubstr(b *testing.B) {
 			}
 		}
 		require.Equal(b, 10, total)
-		f.(*RegexpSubstr).Dispose()
+		f.(*RegexpSubstr).Dispose(ctx)
 	}
 }

@@ -29,15 +29,15 @@ const (
 	validateGroupById                           // validateGroupBy
 
 	// default
-	flattenTableAliasesId          // flattenTableAliases
-	pushdownSubqueryAliasFiltersId // pushdownSubqueryAliasFilters
-	replaceSubqueriesId            // replaceSubqueries
-	validateCheckConstraintId      // validateCheckConstraints
-	replaceCountStarId             // replaceCountStar
-	replaceCrossJoinsId            // replaceCrossJoins
-	moveJoinCondsToFilterId        // moveJoinConditionsToFilter
-	simplifyFiltersId              // simplifyFilters
-	pushNotFiltersId               // pushNotFilters
+	flattenTableAliasesId           // flattenTableAliases
+	pushdownSubqueryAliasFiltersId  // pushdownSubqueryAliasFilters
+	replaceSubqueriesId             // replaceSubqueries
+	validateCheckConstraintId       // validateCheckConstraints
+	replaceCountStarId              // replaceCountStar
+	replaceCrossJoinsId             // replaceCrossJoins
+	simplifyFiltersId               // simplifyFilters
+	pushNotFiltersId                // pushNotFilters
+	validateNoHiddenSystemColumnsId // validateNoHiddenSystemColumns
 
 	// after default
 	hoistOutOfScopeFiltersId     // hoistOutOfScopeFilters
@@ -57,7 +57,7 @@ const (
 	inlineSubqueryAliasRefsId    // inlineSubqueryAliasRefs
 	eraseProjectionId            // eraseProjection
 	flattenDistinctId            // flattenDistinct
-	replaceAggId                 // replaceAgg
+	replaceMinMaxId              // replaceSortedMinMax
 	replaceIdxSortId             // replaceIdxSort
 	insertTopNId                 // insertTopNNodes
 	replaceIdxOrderByDistanceId  // replaceIdxOrderByDistance

@@ -55,7 +55,7 @@ func (s *ShowStatus) String() string {
 }
 
 // Schema implements sql.Node interface.
-func (s *ShowStatus) Schema() sql.Schema {
+func (s *ShowStatus) Schema(ctx *sql.Context) sql.Schema {
 	return sql.Schema{
 		{
 			Name: ShowStatusVariableCol,
@@ -84,7 +84,7 @@ func (s *ShowStatus) Children() []sql.Node {
 func (s *ShowStatus) RowIter(ctx *sql.Context, _ sql.Row) (sql.RowIter, error) {
 	// Session scope has visibility into both GLOBAL and SESSION variables.
 	// Global scope has visibility only into GLOBAL variables.
-	vars := sql.StatusVariables.NewGlobalMap()
+	vars := ctx.StatusVariables().NewGlobalMap()
 	if !s.isGlobal {
 		// Variables with both GLOBAL and SESSION scope are overridden by SESSION scope.
 		sessVars := ctx.Session.GetAllStatusVariables(ctx)
@@ -107,7 +107,7 @@ func (s *ShowStatus) RowIter(ctx *sql.Context, _ sql.Row) (sql.RowIter, error) {
 }
 
 // WithChildren implements sql.Node interface.
-func (s *ShowStatus) WithChildren(node ...sql.Node) (sql.Node, error) {
+func (s *ShowStatus) WithChildren(ctx *sql.Context, children ...sql.Node) (sql.Node, error) {
 	return NewShowStatus(s.isGlobal), nil
 }
 

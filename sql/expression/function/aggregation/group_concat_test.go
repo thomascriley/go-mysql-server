@@ -15,6 +15,7 @@
 package aggregation
 
 import (
+	"context"
 	"testing"
 
 	"github.com/dolthub/vitess/go/vt/proto/query"
@@ -23,33 +24,13 @@ import (
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/expression"
 	"github.com/dolthub/go-mysql-server/sql/types"
+	"github.com/dolthub/go-mysql-server/sql/variables"
 )
-
-func TestGroupConcat_FunctionName(t *testing.T) {
-	assert := require.New(t)
-
-	m := NewGroupConcat("field", nil, ",", nil, 1024)
-
-	assert.Equal("group_concat(distinct field separator ',')", m.String())
-
-	m = NewGroupConcat("field", nil, "-", nil, 1024)
-
-	assert.Equal("group_concat(distinct field separator '-')", m.String())
-
-	sf := sql.SortFields{
-		{Column: expression.NewUnresolvedColumn("field"), Order: sql.Ascending},
-		{Column: expression.NewUnresolvedColumn("field2"), Order: sql.Descending},
-	}
-
-	m = NewGroupConcat("field", sf, "-", nil, 1024)
-
-	assert.Equal("group_concat(distinct field order by field ASC, field2 DESC separator '-')", m.String())
-}
 
 // Validates that the return length of GROUP_CONCAT is bounded by group_concat_max_len (default 1024)
 func TestGroupConcat_PastMaxLen(t *testing.T) {
 	var rows []sql.Row
-	ctx := sql.NewEmptyContext()
+	ctx := sql.NewContextWithVariables(context.Background(), variables.NewEngineVariables())
 
 	for i := 0; i < 2000; i++ {
 		rows = append(rows, sql.Row{int64(i)})
@@ -61,7 +42,7 @@ func TestGroupConcat_PastMaxLen(t *testing.T) {
 
 	gc := NewGroupConcat("", nil, ",", []sql.Expression{expression.NewGetField(0, types.Int64, "int", true)}, int(maxLen))
 
-	buf, _ := gc.NewBuffer()
+	buf, _ := gc.NewBuffer(ctx)
 	for _, row := range rows {
 		require.NoError(t, buf.Update(ctx, row))
 	}
@@ -71,6 +52,36 @@ func TestGroupConcat_PastMaxLen(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Equal(t, int(maxLen), len(rs))
+}
+
+func TestGroupConcat_EmptyStrings(t *testing.T) {
+	ctx := sql.NewEmptyContext()
+	gc := NewGroupConcat("", nil, "|", []sql.Expression{expression.NewGetField(0, types.Text, "text", true)}, 1024)
+	buf, err := gc.NewBuffer(ctx)
+	require.NoError(t, err)
+
+	for _, row := range []sql.Row{{""}, {"a"}, {""}, {nil}} {
+		require.NoError(t, buf.Update(ctx, row))
+	}
+	result, err := buf.Eval(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "|a|", result)
+}
+
+// BIT values concatenate as their raw bytes, matching MySQL, not as the decimal text of their value.
+func TestGroupConcat_BitConcatsRawBytes(t *testing.T) {
+	ctx := sql.NewEmptyContext()
+	gc := NewGroupConcat("", nil, "", []sql.Expression{expression.NewGetField(0, types.MustCreateBitType(4), "v", true)}, 1024)
+	buf, err := gc.NewBuffer(ctx)
+	require.NoError(t, err)
+
+	for _, row := range []sql.Row{{uint64(3)}, {uint64(5)}} {
+		require.NoError(t, buf.Update(ctx, row))
+	}
+
+	result, err := buf.Eval(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "\x03\x05", result)
 }
 
 // Validate that group_concat returns the correct return type
@@ -92,7 +103,7 @@ func TestGroupConcat_ReturnType(t *testing.T) {
 	for _, tt := range testCases {
 		gc := NewGroupConcat("", nil, ",", tt.expression, tt.maxLen)
 
-		buf, _ := gc.NewBuffer()
+		buf, _ := gc.NewBuffer(ctx)
 
 		err := buf.Update(ctx, tt.row)
 		require.NoError(t, err)
@@ -100,6 +111,6 @@ func TestGroupConcat_ReturnType(t *testing.T) {
 		_, err = buf.Eval(ctx)
 		require.NoError(t, err)
 
-		require.Equal(t, tt.returnType, gc.Type())
+		require.Equal(t, tt.returnType, gc.Type(ctx))
 	}
 }

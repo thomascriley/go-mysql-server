@@ -15,19 +15,20 @@
 package harness
 
 import (
+	"context"
 	"fmt"
-	"io"
 	"strconv"
 	"strings"
 	"sync/atomic"
 
+	"github.com/cockroachdb/apd/v3"
 	"github.com/dolthub/vitess/go/vt/proto/query"
-	"github.com/shopspring/decimal"
 
 	sqle "github.com/dolthub/go-mysql-server"
 	"github.com/dolthub/go-mysql-server/enginetest"
 	"github.com/dolthub/go-mysql-server/memory"
 	"github.com/dolthub/go-mysql-server/sql"
+	"github.com/dolthub/go-mysql-server/sql/types"
 )
 
 type memoryHarness struct {
@@ -59,8 +60,20 @@ func (h *memoryHarness) ExecuteStatement(statement string) error {
 	if err != nil {
 		return err
 	}
+	defer closeOnPanic(ctx, rowIter)
 
-	return enginetest.DrainIterator(ctx, rowIter)
+	_, err = sql.RowIterToRows(ctx, rowIter)
+	return err
+}
+
+// closeOnPanic closes |iter| if the calling function is panicking, then continues the panic. The logictest runner
+// recovers from panics and keeps running queries against the same engine, so the iterator's resources must be
+// released. Must be called directly via defer.
+func closeOnPanic(ctx *sql.Context, iter sql.RowIter) {
+	if r := recover(); r != nil {
+		iter.Close(ctx)
+		panic(r)
+	}
 }
 
 var pid uint32
@@ -72,20 +85,28 @@ func (h *memoryHarness) newContext() *sql.Context {
 	return ctx
 }
 
+func (h *memoryHarness) ExecuteStatementContext(_ context.Context, statement string) error {
+	return h.ExecuteStatement(statement)
+}
+
+func (h *memoryHarness) ExecuteQueryContext(_ context.Context, statement string) (schema string, results []string, err error) {
+	return h.ExecuteQuery(statement)
+}
+
+func (h *memoryHarness) GetTimeout() int64 {
+	return 0
+}
+
 func (h *memoryHarness) ExecuteQuery(statement string) (schema string, results []string, err error) {
 	ctx := h.newContext()
 
-	var sch sql.Schema
-	var rowIter sql.RowIter
-	defer func() {
-		if r := recover(); r != nil {
-			// Panics leave the engine in a bad state that we have to clean up
-			h.engine.ProcessList.Kill(pid)
-			panic(r)
-		}
-	}()
+	sch, rowIter, _, err := h.engine.Query(ctx, statement)
+	if err != nil {
+		return "", nil, err
+	}
+	defer closeOnPanic(ctx, rowIter)
 
-	sch, rowIter, _, err = h.engine.Query(ctx, statement)
+	rows, err := sql.RowIterToRows(ctx, rowIter)
 	if err != nil {
 		return "", nil, err
 	}
@@ -95,34 +116,18 @@ func (h *memoryHarness) ExecuteQuery(statement string) (schema string, results [
 		return "", nil, err
 	}
 
-	results, err = rowsToResultStrings(ctx, rowIter)
-	if err != nil {
-		return "", nil, err
-	}
-
-	return schemaString, results, nil
+	return schemaString, rowsToResultStrings(rows), nil
 }
 
-// Returns the rows in the iterator given as an array of their string representations, as expected by the test files
-func rowsToResultStrings(ctx *sql.Context, iter sql.RowIter) ([]string, error) {
+// Returns the rows given as an array of their string representations, as expected by the test files
+func rowsToResultStrings(rows []sql.Row) []string {
 	var results []string
-	if iter == nil {
-		return results, nil
-	}
-
-	for {
-		row, err := iter.Next(ctx)
-		if err == io.EOF {
-			return results, nil
-		} else if err != nil {
-			enginetest.DrainIteratorIgnoreErrors(ctx, iter)
-			return nil, err
-		} else {
-			for _, col := range row {
-				results = append(results, toSqlString(col))
-			}
+	for _, row := range rows {
+		for _, col := range row {
+			results = append(results, toSqlString(col))
 		}
 	}
+	return results
 }
 
 func toSqlString(val interface{}) string {
@@ -134,9 +139,10 @@ func toSqlString(val interface{}) string {
 	case float32, float64:
 		// exactly 3 decimal points for floats
 		return fmt.Sprintf("%.3f", v)
-	case decimal.Decimal:
+	case *apd.Decimal:
 		// exactly 3 decimal points for floats
-		return v.StringFixed(3)
+		d := types.DecimalTruncate(v, 3)
+		return d.Text('f')
 	case int:
 		return strconv.Itoa(v)
 	case uint:

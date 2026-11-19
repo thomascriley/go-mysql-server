@@ -15,11 +15,18 @@
 package hash
 
 import (
+	"encoding/binary"
 	"fmt"
+	"io"
+	"reflect"
 	"strconv"
+	"strings"
 	"sync"
+	"time"
+	"unicode/utf8"
 
 	"github.com/cespare/xxhash/v2"
+	"github.com/cockroachdb/apd/v3"
 
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/types"
@@ -31,13 +38,25 @@ var digestPool = sync.Pool{
 	},
 }
 
+// Hashable is implemented by values that can have more than one representation that compares as equal, such as
+// intervals in which "1 day" equals "24 hours". HashOf and HashOfSimple hash these values with WriteHashKey rather than
+// with their printed form, so that values that compare as equal hash the same. Slices whose elements are Hashable are
+// hashed element by element.
+type Hashable interface {
+	// WriteHashKey writes a canonical representation of the value to |w|. Values that compare as equal must write
+	// identical bytes.
+	WriteHashKey(ctx *sql.Context, w io.Writer) error
+}
+
+var hashableType = reflect.TypeOf((*Hashable)(nil)).Elem()
+
 // ExprsToSchema converts a list of sql.Expression to a sql.Schema.
 // This is used for functions that use HashOf, but don't already have a schema.
 // The generated schema ONLY contains the types of the expressions without any column names or any other info.
-func ExprsToSchema(exprs ...sql.Expression) sql.Schema {
+func ExprsToSchema(ctx *sql.Context, exprs ...sql.Expression) sql.Schema {
 	var sch sql.Schema
 	for _, expr := range exprs {
-		sch = append(sch, &sql.Column{Type: expr.Type()})
+		sch = append(sch, &sql.Column{Type: expr.Type(ctx)})
 	}
 	return sch
 }
@@ -69,27 +88,47 @@ func HashOf(ctx *sql.Context, sch sql.Schema, row sql.Row) (uint64, error) {
 
 		// TODO: we may not always have the type information available, so we check schema length.
 		//  Then, defer to original behavior
-		if i < len(sch) {
+		if i < len(sch) && sch[i] != nil {
 			switch typ := sch[i].Type.(type) {
-			case sql.ExtendedType:
-				// TODO: Doltgres follows Postgres conventions which don't align with the expectations of MySQL,
-				//  so we're using the old (probably incorrect) behavior for now
-				_, err := hash.WriteString(fmt.Sprintf("%v", v))
-				if err != nil {
-					return 0, err
-				}
-				continue
 			case types.StringType:
 				var strVal string
-				strVal, err = types.ConvertToString(ctx, v, typ, nil)
+				strVal, _, err = types.ConvertToString(ctx, v, typ, nil)
 				if err != nil {
 					return 0, err
 				}
-				err = typ.Collation().WriteWeightString(hash, strVal)
+				coll := typ.Collation()
+				if types.IsChar(typ) || coll.IsPadSpace() {
+					strVal = strings.TrimRight(strVal, " ")
+				}
+				if len(row) > 1 {
+					var length int
+					if coll == sql.Collation_binary {
+						length = len(strVal)
+					} else {
+						length = utf8.RuneCountInString(strVal)
+					}
+					if err := writeLengthPrefix(hash, length); err != nil {
+						return 0, err
+					}
+				}
+				err = coll.WriteWeightString(hash, strVal)
 				if err != nil {
 					return 0, err
 				}
 				continue
+			}
+		}
+
+		if len(row) > 1 {
+			var length int
+			switch v := v.(type) {
+			case string:
+				length = len(v)
+			case []byte:
+				length = len(v)
+			}
+			if err := writeLengthPrefix(hash, length); err != nil {
+				return 0, err
 			}
 		}
 		switch v := v.(type) {
@@ -125,18 +164,42 @@ func HashOf(ctx *sql.Context, sch sql.Schema, row sql.Row) (uint64, error) {
 				str = "0"
 			}
 			_, err = hash.WriteString(str)
+		case *apd.Decimal:
+			_, err = hash.WriteString(decimalHashString(v))
 		case string:
 			_, err = hash.WriteString(v)
 		case []byte:
 			_, err = hash.Write(v)
+		case time.Time:
+			err = writeTimeHash(hash, v)
+		case Hashable:
+			err = v.WriteHashKey(ctx, hash)
+		case []any:
+			err = writeSliceHash(ctx, hash, v)
 		default:
-			_, err = hash.WriteString(fmt.Sprintf("%v", v))
+			if elems, ok := hashableSliceElements(v); ok {
+				err = writeSliceHash(ctx, hash, elems)
+			} else {
+				_, err = hash.WriteString(fmt.Sprintf("%v", v))
+			}
 		}
 		if err != nil {
 			return 0, err
 		}
 	}
 	return hash.Sum64(), nil
+}
+
+// writeLengthPrefix writes a 64-bit little-endian length prefix to w when
+// length is positive, keeping multi-column values distinct across boundaries.
+func writeLengthPrefix(w io.Writer, length int) error {
+	if length <= 0 {
+		return nil
+	}
+	var lenBuf [8]byte
+	binary.LittleEndian.PutUint64(lenBuf[:], uint64(length))
+	_, err := w.Write(lenBuf[:])
+	return err
 }
 
 // HashOfSimple returns a hash for a single interface value
@@ -147,22 +210,9 @@ func HashOfSimple(ctx *sql.Context, i any, t sql.Type) (uint64, sql.ConvertInRan
 
 	var str string
 	var inRange sql.ConvertInRange
-	coll := sql.Collation_Default
-	if types.IsTuple(t) {
-		tup := i.([]any)
-		tupType := t.(types.TupleType)
-		hashes := make([]uint64, len(tup))
-		for idx, v := range tup {
-			// TODO: handle out of range conversions here?
-			h, _, err := HashOfSimple(ctx, v, tupType[idx])
-			if err != nil {
-				return 0, sql.InRange, err
-			}
-			hashes[idx] = h
-		}
-		str = fmt.Sprintf("%v", hashes)
-	} else if types.IsTextOnly(t) {
-		coll = t.(sql.StringType).Collation()
+	if types.IsTextOnly(t) {
+		// Collated strings that are equivalent may have different runes, so we must make them hash to the same value
+		coll := t.(sql.StringType).Collation()
 		if s, ok := i.(string); ok {
 			str = s
 		} else {
@@ -175,35 +225,186 @@ func HashOfSimple(ctx *sql.Context, i any, t sql.Type) (uint64, sql.ConvertInRan
 				return 0, sql.InRange, err
 			}
 		}
-	} else {
-		var val any
-		var err error
-		val, inRange, err = types.ConvertOrTruncate(ctx, i, t.Promote())
+		if types.IsChar(t) {
+			str = strings.TrimRight(str, " ")
+		}
+		h, err := coll.HashToUint(str)
 		if err != nil {
 			return 0, sql.InRange, err
 		}
-
-		// Remove trailing 0s from floats
-		switch v := val.(type) {
-		case float32:
-			str = strconv.FormatFloat(float64(v), 'f', -1, 32)
-			if str == "-0" {
-				str = "0"
-			}
-		case float64:
-			str = strconv.FormatFloat(v, 'f', -1, 64)
-			if str == "-0" {
-				str = "0"
-			}
-		default:
-			str = fmt.Sprintf("%v", v)
-		}
+		return h, inRange, nil
 	}
 
-	// Collated strings that are equivalent may have different runes, so we must make them hash to the same value
-	h, err := coll.HashToUint(str)
+	hash := digestPool.Get().(*xxhash.Digest)
+	hash.Reset()
+	defer digestPool.Put(hash)
+
+	if types.IsTuple(t) {
+		tup := i.([]any)
+		tupType := t.(types.TupleType)
+		hashes := make([]uint64, len(tup))
+		for idx, v := range tup {
+			// TODO: handle out of range conversions here?
+			h, _, err := HashOfSimple(ctx, v, tupType[idx])
+			if err != nil {
+				return 0, sql.InRange, err
+			}
+			hashes[idx] = h
+		}
+		str = fmt.Sprintf("%v", hashes) // TODO: avoid Sprintf for performance
+		_, err := hash.WriteString(str)
+		if err != nil {
+			return 0, sql.InRange, err
+		}
+		return hash.Sum64(), inRange, nil
+	}
+
+	var val any
+	var err error
+	val, inRange, err = types.ConvertOrTruncate(ctx, i, t.Promote())
 	if err != nil {
 		return 0, sql.InRange, err
 	}
-	return h, inRange, nil
+
+	// TODO: use strconv.Append...() and a byte buffer
+	switch v := val.(type) {
+	case time.Time:
+		if err = writeTimeHash(hash, v); err != nil {
+			return 0, sql.InRange, err
+		}
+		return hash.Sum64(), inRange, nil
+	case Hashable:
+		if err = v.WriteHashKey(ctx, hash); err != nil {
+			return 0, sql.InRange, err
+		}
+		return hash.Sum64(), inRange, nil
+	case []any:
+		if err = writeSliceHash(ctx, hash, v); err != nil {
+			return 0, sql.InRange, err
+		}
+		return hash.Sum64(), inRange, nil
+	case int:
+		str = strconv.FormatInt(int64(v), 10)
+	case int8:
+		str = strconv.FormatInt(int64(v), 10)
+	case int16:
+		str = strconv.FormatInt(int64(v), 10)
+	case int32:
+		str = strconv.FormatInt(int64(v), 10)
+	case int64:
+		str = strconv.FormatInt(v, 10)
+	case uint:
+		str = strconv.FormatUint(uint64(v), 10)
+	case uint8:
+		str = strconv.FormatUint(uint64(v), 10)
+	case uint16:
+		str = strconv.FormatUint(uint64(v), 10)
+	case uint32:
+		str = strconv.FormatUint(uint64(v), 10)
+	case uint64:
+		str = strconv.FormatUint(v, 10)
+	case float32:
+		str = strconv.FormatFloat(float64(v), 'f', -1, 32)
+		if str == "-0" {
+			str = "0"
+		}
+	case float64:
+		str = strconv.FormatFloat(v, 'f', -1, 64)
+		if str == "-0" {
+			str = "0"
+		}
+	case *apd.Decimal:
+		str = decimalHashString(v)
+	default:
+		str = fmt.Sprintf("%v", v) // TODO: avoid Sprintf for performance
+	}
+
+	_, err = hash.WriteString(str)
+	if err != nil {
+		return 0, sql.InRange, err
+	}
+	return hash.Sum64(), inRange, nil
+}
+
+// decimalHashString returns a normalized decimal string used for hashing.
+// Trailing 0s and trailing decimal points are removed. Negative 0 is normalized to positive 0.
+func decimalHashString(v *apd.Decimal) string {
+	res := new(apd.Decimal)
+	res, _ = res.Reduce(v)
+	return res.Text('f')
+}
+
+// HashesCanonically returns whether HashOf hashes |v| the same as every value that compares as equal to it, without
+// needing to know its type. This holds for Hashable values, decimals, times, slices of Hashable values, and slices of
+// such values and other primitives.
+// Callers that otherwise hash a value's serialized form, which can differ for equal values, should prefer HashOf for
+// these values.
+func HashesCanonically(v any) bool {
+	switch v := v.(type) {
+	case Hashable, *apd.Decimal, time.Time:
+		return true
+	case []any:
+		for _, elem := range v {
+			switch elem.(type) {
+			case nil, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64, string, []byte:
+				continue
+			}
+
+			if !HashesCanonically(elem) {
+				return false
+			}
+		}
+		return true
+	default:
+		_, ok := hashableSliceElements(v)
+		return ok
+	}
+}
+
+// writeTimeHash writes the instant of |t| to |w|, so that times that are equal hash the same regardless of their
+// location.
+func writeTimeHash(w io.Writer, t time.Time) error {
+	var buf [12]byte
+	binary.LittleEndian.PutUint64(buf[:8], uint64(t.Unix()))
+	binary.LittleEndian.PutUint32(buf[8:], uint32(t.Nanosecond()))
+	_, err := w.Write(buf[:])
+	return err
+}
+
+// hashableSliceElements returns the elements of |v| when it is a slice of a type that implements Hashable, such as a
+// slice of an integrator's own value type.
+func hashableSliceElements(v any) ([]any, bool) {
+	rv := reflect.ValueOf(v)
+	if rv.Kind() != reflect.Slice || !rv.Type().Elem().Implements(hashableType) {
+		return nil, false
+	}
+
+	elems := make([]any, rv.Len())
+	for i := range elems {
+		elems[i] = rv.Index(i).Interface()
+	}
+	return elems, true
+}
+
+// writeSliceHash writes the hash of each element of |vals| to |w|, so that slices whose elements compare as equal hash
+// the same even when the elements have different printed forms.
+func writeSliceHash(ctx *sql.Context, w io.Writer, vals []any) error {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], uint64(len(vals)))
+	if _, err := w.Write(buf[:]); err != nil {
+		return err
+	}
+
+	for _, v := range vals {
+		h, err := HashOf(ctx, nil, sql.Row{v})
+		if err != nil {
+			return err
+		}
+
+		binary.LittleEndian.PutUint64(buf[:], h)
+		if _, err = w.Write(buf[:]); err != nil {
+			return err
+		}
+	}
+	return nil
 }

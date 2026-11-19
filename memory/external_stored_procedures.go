@@ -19,7 +19,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/shopspring/decimal"
+	"github.com/cockroachdb/apd/v3"
 
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/types"
@@ -128,8 +128,50 @@ var (
 			ReadOnly:  false,
 			AdminOnly: true,
 		},
+		{
+			Name:                     "memory_ends_transaction",
+			Schema:                   externalSPSchemaInt,
+			Function:                 variadic_add,
+			NotAllowedInSubStatement: true,
+		},
+		{
+			Name:     "memory_set_generated_expression",
+			Schema:   nil,
+			Function: set_generated_expression,
+		},
 	}
 )
+
+// set_generated_expression overwrites the stored generated expression of |column| in |table| of the current database
+// without validating it, simulating a schema written before DDL validation rejected such expressions, or one that
+// arrived some other way (e.g. a merge in an integrator).
+func set_generated_expression(ctx *sql.Context, table, column, expr string) (sql.RowIter, error) {
+	db, err := SessionFromContext(ctx).dbProvider.Database(ctx, ctx.GetCurrentDatabase())
+	if err != nil {
+		return nil, err
+	}
+	tbl, ok, err := db.GetTableInsensitive(ctx, table)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, sql.ErrTableNotFound.New(table)
+	}
+	sch := tbl.Schema(ctx)
+	idx := sch.IndexOfColName(column)
+	if idx < 0 {
+		return nil, sql.ErrTableColumnNotFound.New(table, column)
+	}
+	if sch[idx].Generated == nil {
+		return nil, fmt.Errorf("column %s of table %s is not a generated column", column, table)
+	}
+	newCol := sch[idx].Copy()
+	newCol.Generated = sql.NewUnresolvedColumnDefaultValue(expr)
+	if err = tbl.(sql.AlterableTable).ModifyColumn(ctx, sch[idx].Name, newCol, nil); err != nil {
+		return nil, err
+	}
+	return sql.RowsToRowIter(), nil
+}
 
 func inout_add(_ *sql.Context, a *int64, b int64) (sql.RowIter, error) {
 	*a = *a + b
@@ -166,12 +208,12 @@ func overloaded_type_test1(
 }
 func overloaded_type_test2(
 	_ *sql.Context,
-	aa bool, ab string, ac []byte, ad time.Time, ae decimal.Decimal,
-	ba *bool, bb *string, bc *[]byte, bd *time.Time, be *decimal.Decimal,
+	aa bool, ab string, ac []byte, ad time.Time, ae *apd.Decimal,
+	ba *bool, bb *string, bc *[]byte, bd *time.Time, be **apd.Decimal,
 ) (sql.RowIter, error) {
 	return sql.RowsToRowIter(sql.Row{
 		fmt.Sprintf(`aa:%v,ba:%v,ab:"%s",bb:"%s",ac:%v,bc:%v,ad:%s,bd:%s,ae:%s,be:%s`,
-			aa, *ba, ab, *bb, ac, *bc, ad.Format("2006-01-02"), (*bd).Format("2006-01-02"), ae.String(), (*be).String()),
+			aa, *ba, ab, *bb, ac, *bc, ad.Format("2006-01-02"), (*bd).Format("2006-01-02"), ae.Text('f'), (*be).Text('f')),
 	}), nil
 }
 

@@ -31,9 +31,9 @@ type aliasDisambiguator struct {
 	disambiguationIndex int
 }
 
-func (ad *aliasDisambiguator) GetAliases() (TableAliases, error) {
+func (ad *aliasDisambiguator) GetAliases(ctx *sql.Context) (TableAliases, error) {
 	if ad.aliases == nil {
-		aliases, err := getTableAliases(ad.n, ad.scope)
+		aliases, err := getTableAliases(ctx, ad.n, ad.scope)
 		if err != nil {
 			return TableAliases{}, err
 		}
@@ -42,8 +42,8 @@ func (ad *aliasDisambiguator) GetAliases() (TableAliases, error) {
 	return *ad.aliases, nil
 }
 
-func (ad *aliasDisambiguator) Disambiguate(alias string) (string, error) {
-	nodeAliases, err := ad.GetAliases()
+func (ad *aliasDisambiguator) Disambiguate(ctx *sql.Context, alias string) (string, error) {
+	nodeAliases, err := ad.GetAliases(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -88,7 +88,7 @@ func unnestExistsSubqueries(
 }
 
 func unnestSelectExistsHelper(ctx *sql.Context, scope *plan.Scope, a *Analyzer, n sql.Node, aliasDisambig *aliasDisambiguator, qFlags *sql.QueryFlags) (sql.Node, transform.TreeIdentity, error) {
-	return transform.Node(n, func(n sql.Node) (sql.Node, transform.TreeIdentity, error) {
+	return transform.Node(ctx, n, func(ctx *sql.Context, n sql.Node) (sql.Node, transform.TreeIdentity, error) {
 		f, ok := n.(*plan.Filter)
 		if !ok {
 			return n, transform.SameTree, nil
@@ -106,7 +106,14 @@ func simplifyPartialJoinParents(n sql.Node) (sql.Node, bool) {
 		switch n := ret.(type) {
 		case *plan.Having:
 			return nil, false
-		case *plan.Project, *plan.GroupBy, *plan.Sort, *plan.Distinct, *plan.TopN, *plan.Limit:
+		case *plan.GroupBy:
+			// An aggregate without grouping expressions produces one row even when its child is empty. Removing it
+			// would therefore change the result of the existence check.
+			if len(n.GroupByExprs) == 0 {
+				return nil, false
+			}
+			ret = n.Child
+		case *plan.Project, *plan.Sort, *plan.Distinct, *plan.TopN, *plan.Limit, *plan.Window:
 			// TODO: In most cases, it's necessary to remove *plan.Limit because child Filter nodes will have been
 			//  hoisted out. But what if Limit.Limit evals to 0? https://github.com/dolthub/dolt/issues/10493
 			ret = n.Children()[0]
@@ -123,7 +130,7 @@ func unnestExistSubqueries(ctx *sql.Context, scope *plan.Scope, a *Analyzer, fil
 	ret := filter.Child
 	var retFilters []sql.Expression
 	same := transform.SameTree
-	for _, f := range expression.SplitConjunction(filter.Expression) {
+	for _, f := range expression.SplitConjunction(ctx, filter.Expression) {
 		var s *hoistSubquery
 		var err error
 
@@ -149,7 +156,7 @@ func unnestExistSubqueries(ctx *sql.Context, scope *plan.Scope, a *Analyzer, fil
 		// TODO: We're currently not able to decorrelate outer columns because we are pushing outerscope/correlated
 		//  filters below SubqueryAliases. We likely need to rearrange the ordering of our rules.
 		//  https://github.com/dolthub/dolt/issues/10490
-		s, err = decorrelateOuterCols(sq.Query, aliasDisambig, sq.Correlated())
+		s, err = decorrelateOuterCols(ctx, sq.Query, aliasDisambig, sq.Correlated())
 		if err != nil {
 			return nil, transform.SameTree, err
 		}
@@ -189,7 +196,7 @@ func unnestExistSubqueries(ctx *sql.Context, scope *plan.Scope, a *Analyzer, fil
 			case plan.JoinTypeAntiIncludeNulls:
 				// ret will be all rows
 			case plan.JoinTypeSemi:
-				ret = plan.NewEmptyTableWithSchema(ret.Schema())
+				ret = plan.NewEmptyTableWithSchema(ret.Schema(ctx))
 			default:
 				return filter, transform.SameTree, fmt.Errorf("hoistSelectExists failed on unexpected join type")
 			}
@@ -202,15 +209,15 @@ func unnestExistSubqueries(ctx *sql.Context, scope *plan.Scope, a *Analyzer, fil
 			limited := plan.NewLimit(expression.NewLiteral(1, types.Int64), s.inner)
 			switch joinType {
 			case plan.JoinTypeAntiIncludeNulls:
-				ret = plan.NewAntiJoinIncludingNulls(ret, limited, nil).WithComment(comment)
+				ret = plan.NewAntiJoinIncludingNulls(ctx, ret, limited, nil).WithComment(comment)
 				qFlags.Set(sql.QFlagInnerJoin)
 			case plan.JoinTypeSemi:
 				if sq.Correlated().Empty() {
-					ret = plan.NewCrossJoin(ret, limited).WithComment(comment)
+					ret = plan.NewCrossJoin(ctx, ret, limited).WithComment(comment)
 				} else {
 					// TODO: when does this actually happen? Should we account for this in an AntiJoin? What about when
 					//  there are join filters?
-					ret = plan.NewLateralCrossJoin(ret, limited).WithComment(comment)
+					ret = plan.NewLateralCrossJoin(ctx, ret, limited).WithComment(comment)
 				}
 				qFlags.Set(sql.QFlagCrossJoin)
 			default:
@@ -220,14 +227,14 @@ func unnestExistSubqueries(ctx *sql.Context, scope *plan.Scope, a *Analyzer, fil
 		}
 
 		outerFilters := s.joinFilters
-		if referencesOuterScope(outerFilters, scope) {
+		if referencesOuterScope(ctx, outerFilters, scope) {
 			retFilters = append(retFilters, f)
 			continue
 		}
 
 		switch joinType {
 		case plan.JoinTypeAntiIncludeNulls, plan.JoinTypeSemi:
-			ret = plan.NewJoin(ret, s.inner, joinType, expression.JoinAnd(outerFilters...)).WithComment(comment)
+			ret = plan.NewJoin(ctx, ret, s.inner, joinType, expression.JoinAnd(outerFilters...)).WithComment(comment)
 			qFlags.Set(sql.QFlagInnerJoin)
 		default:
 			return filter, transform.SameTree, fmt.Errorf("hoistSelectExists failed on unexpected join type")
@@ -238,18 +245,18 @@ func unnestExistSubqueries(ctx *sql.Context, scope *plan.Scope, a *Analyzer, fil
 		return filter, transform.SameTree, nil
 	}
 	if len(retFilters) > 0 {
-		ret = plan.NewFilter(expression.JoinAnd(retFilters...), ret)
+		ret = plan.NewFilter(ctx, expression.JoinAnd(retFilters...), ret)
 	}
 	return ret, transform.NewTree, nil
 }
 
 // referencesOuterScope returns true if a filter in the set is from an outer scope
-func referencesOuterScope(filters []sql.Expression, scope *plan.Scope) bool {
+func referencesOuterScope(ctx *sql.Context, filters []sql.Expression, scope *plan.Scope) bool {
 	if scope == nil {
 		return false
 	}
 	for _, e := range filters {
-		if transform.InspectExpr(e, func(e sql.Expression) bool {
+		if transform.InspectExpr(ctx, e, func(ctx *sql.Context, e sql.Expression) bool {
 			gf, ok := e.(*expression.GetField)
 			return ok && scope.Correlated().Contains(gf.Id())
 		}) {
@@ -265,57 +272,55 @@ type hoistSubquery struct {
 	emptyScope  bool
 }
 
-// decorrelateOuterCols returns an optionally modified subquery and extracted filters referencing an outer scope.
-// If the subquery has aliases that conflict with outside aliases, the internal aliases will be renamed to avoid
-// name collisions.
-func decorrelateOuterCols(sqChild sql.Node, aliasDisambig *aliasDisambiguator, corr sql.ColSet) (*hoistSubquery, error) {
+// decorrelateOuterCols extracts correlated JOIN and WHERE predicates
+// from |sqChild| referencing outer columns in |corr|, returning the
+// rewritten subquery child and extracted filters.
+//
+// If |sqChild| contains aliases conflicting with outside aliases,
+// conflicting aliases in the returned subtree and filters are renamed
+// via |aliasDisambig|.
+//
+// It returns nil and a nil error if decorrelation cannot proceed
+// safely, such as when an offset is encountered.
+func decorrelateOuterCols(ctx *sql.Context, sqChild sql.Node, aliasDisambig *aliasDisambiguator, corr sql.ColSet) (*hoistSubquery, error) {
 	var joinFilters []sql.Expression
 	var filtersToKeep []sql.Expression
 	var emptyScope bool
 	var cantDecorrelate bool
-	n, _, _ := transform.Node(sqChild, func(n sql.Node) (sql.Node, transform.TreeIdentity, error) {
+	n, _, _ := transform.NodeWithCtx(ctx, sqChild, decorrelateSelector, func(ctx *sql.Context, c transform.Context) (sql.Node, transform.TreeIdentity, error) {
 		if emptyScope {
-			return n, transform.SameTree, nil
+			return c.Node, transform.SameTree, nil
 		}
-		switch f := n.(type) {
+		switch f := c.Node.(type) {
 		case *plan.Offset:
 			cantDecorrelate = true
-			return n, transform.SameTree, nil
+			return c.Node, transform.SameTree, nil
 		case *plan.EmptyTable:
 			emptyScope = true
-			return n, transform.SameTree, nil
+			return c.Node, transform.SameTree, nil
 		case *plan.Filter:
-			filters := expression.SplitConjunction(f.Expression)
-			for _, f := range filters {
-				outerRef := transform.InspectExpr(f, func(e sql.Expression) bool {
-					if gf, ok := e.(*expression.GetField); ok && corr.Contains(gf.Id()) {
-						return true
-					}
-					if sq, ok := e.(*plan.Subquery); ok {
-						if !sq.Correlated().Intersection(corr).Empty() {
-							return true
-						}
-					}
-					return false
-				})
-
-				// based on the GetField analysis, decide where to put the filter
-				if outerRef {
-					joinFilters = append(joinFilters, f)
-				} else {
-					filtersToKeep = append(filtersToKeep, f)
-				}
-			}
-
-			// avoid updating the tree if we don't move any filters
-			if len(filtersToKeep) == len(filters) {
-				filtersToKeep = nil
+			extracted, keep := decorrelateCondition(ctx, f.Expression, corr)
+			if len(extracted) == 0 {
 				return f, transform.SameTree, nil
 			}
-
+			joinFilters = append(joinFilters, extracted...)
+			filtersToKeep = append(filtersToKeep, keep...)
 			return f.Child, transform.NewTree, nil
+		case *plan.JoinNode:
+			// Outer join conditions cannot be hoisted: hoisting them
+			// turns an optional match into a mandatory filter on
+			// preserved rows, dropping rows that should survive.
+			if !f.JoinType().IsInner() || f.Filter == nil {
+				return c.Node, transform.SameTree, nil
+			}
+			extracted, keep := decorrelateCondition(ctx, f.Filter, corr)
+			if len(extracted) == 0 {
+				return c.Node, transform.SameTree, nil
+			}
+			joinFilters = append(joinFilters, extracted...)
+			return f.WithFilter(expression.JoinAnd(keep...)), transform.NewTree, nil
 		default:
-			return n, transform.SameTree, nil
+			return c.Node, transform.SameTree, nil
 		}
 	})
 
@@ -329,12 +334,12 @@ func decorrelateOuterCols(sqChild sql.Node, aliasDisambig *aliasDisambiguator, c
 		return nil, nil
 	}
 
-	nodeAliases, err := getTableAliases(n, nil)
+	nodeAliases, err := getTableAliases(ctx, n, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	outsideAliases, err := aliasDisambig.GetAliases()
+	outsideAliases, err := aliasDisambig.GetAliases(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -357,12 +362,12 @@ func decorrelateOuterCols(sqChild sql.Node, aliasDisambig *aliasDisambiguator, c
 		for _, conflict := range conflicts {
 
 			// conflict, need to rename
-			newAlias, err := aliasDisambig.Disambiguate(conflict)
+			newAlias, err := aliasDisambig.Disambiguate(ctx, conflict)
 			if err != nil {
 				return nil, err
 			}
 			same := transform.SameTree
-			n, same, err = renameAliases(n, conflict, newAlias)
+			n, same, err = renameAliases(ctx, n, conflict, newAlias)
 			if err != nil {
 				return nil, err
 			}
@@ -372,18 +377,18 @@ func decorrelateOuterCols(sqChild sql.Node, aliasDisambig *aliasDisambiguator, c
 			}
 
 			// rename the aliases in the expressions
-			joinFilters, err = renameAliasesInExpressions(joinFilters, conflict, newAlias)
+			joinFilters, err = renameAliasesInExpressions(ctx, joinFilters, conflict, newAlias)
 			if err != nil {
 				return nil, err
 			}
 
-			filtersToKeep, err = renameAliasesInExpressions(filtersToKeep, conflict, newAlias)
+			filtersToKeep, err = renameAliasesInExpressions(ctx, filtersToKeep, conflict, newAlias)
 			if err != nil {
 				return nil, err
 			}
 
 			// alias was renamed, need to get the renamed target before adding to the outside aliases collection
-			nodeAliases, err = getTableAliases(n, nil)
+			nodeAliases, err = getTableAliases(ctx, n, nil)
 			if err != nil {
 				return nil, err
 			}
@@ -410,11 +415,58 @@ func decorrelateOuterCols(sqChild sql.Node, aliasDisambig *aliasDisambiguator, c
 		return nil, nil
 	}
 	if len(filtersToKeep) > 0 {
-		n = plan.NewFilter(expression.JoinAnd(filtersToKeep...), n)
+		n = plan.NewFilter(ctx, expression.JoinAnd(filtersToKeep...), n)
 	}
 
 	return &hoistSubquery{
 		inner:       n,
 		joinFilters: joinFilters,
 	}, nil
+}
+
+// decorrelateCondition splits |cond| into correlated predicates
+// referencing outer columns in |corr| and uncorrelated predicates that
+// remain in scope.
+//
+// Predicates referencing any column in |corr| or a subquery correlated
+// with |corr| are returned in |correlated|. All remaining predicates
+// are returned in |inScope|.
+func decorrelateCondition(ctx *sql.Context, cond sql.Expression, corr sql.ColSet) (correlated, inScope []sql.Expression) {
+	preds := expression.SplitConjunction(ctx, cond)
+	if corr.Empty() {
+		return nil, preds
+	}
+	correlated = make([]sql.Expression, 0, len(preds))
+	inScope = make([]sql.Expression, 0, len(preds))
+	for _, pred := range preds {
+		// A condition is correlated if it refers to any column from an
+		// outer query outside this subquery.
+		isCorrelated := transform.InspectExpr(ctx, pred, func(ctx *sql.Context, e sql.Expression) bool {
+			if gf, ok := e.(*expression.GetField); ok && corr.Contains(gf.Id()) {
+				return true
+			}
+			if sq, ok := e.(*plan.Subquery); ok {
+				if !sq.Correlated().Intersection(corr).Empty() {
+					return true
+				}
+			}
+			return false
+		})
+		if isCorrelated {
+			correlated = append(correlated, pred)
+		} else {
+			inScope = append(inScope, pred)
+		}
+	}
+	return correlated, inScope
+}
+
+// decorrelateSelector reports whether traversal in |c| should enter
+// child nodes to extract decorrelated join conditions.
+func decorrelateSelector(_ *sql.Context, c transform.Context) bool {
+	jn, ok := c.Parent.(*plan.JoinNode)
+	if !ok {
+		return true
+	}
+	return jn.JoinType().IsPreservedTable(c.ChildNum)
 }

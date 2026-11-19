@@ -30,6 +30,9 @@ type ExpressionOverriding interface {
 // various engine phases (such as the analysis, node execution, etc.). The empty struct is valid, which will not
 // override any functionality (uses the default MySQL functionality for all applicable situations).
 type EngineOverrides struct {
+	// CountMatchedRowsOnUpdate includes unchanged matched rows in UPDATE counts, including
+	// rows handled by the UPDATE arm of INSERT ... ON DUPLICATE KEY UPDATE.
+	CountMatchedRowsOnUpdate bool
 	// Builder contains functions and variables that can replace, supplement, or override functionality within the builder.
 	Builder BuilderOverrides
 	// SchemaFormatter is the formatter for schema string creation. If nil, this will format in MySQL's style.
@@ -40,6 +43,9 @@ type EngineOverrides struct {
 	// filter expressions. Some expressions may need to be modified or skipped in order to properly apply indexes
 	// for all integrators.
 	CostedIndexScanExpressionFilter ExpressionTreeFilter
+	// UpdateExpressionApplier evaluates UPDATE assignments. If nil, the engine uses
+	// MySQL's sequential assignment evaluation and IGNORE conversion handling.
+	UpdateExpressionApplier UpdateExpressionApplier
 }
 
 // ExpressionTreeFilter is an interface for walking logic expression trees or AND, OR, and leaf nodes.
@@ -55,10 +61,35 @@ type BuilderOverrides struct {
 	// table name creates a match, then this function is called to create an expression. The return value of the created
 	// expression will be used in place of the `GetField` expression used for columns. The input `fields` contains the
 	// `GetField` expressions for all of the table's columns. For standard MySQL compatibility, this should be nil.
-	ParseTableAsColumn func(ctx *Context, tableName string, fields []Expression) (Expression, error)
+	ParseTableAsColumn func(ctx *Context, tableName string, fields []Expression, tblSch []*Column) (Expression, error)
+	// ScalarFunctionAliasAsColumn enables PostgreSQL-compatible aliasing for regular scalar functions used in FROM.
+	// When enabled, an alias without an explicit column list names both the relation and its single output column.
+	// Leave this false for standard MySQL compatibility.
+	ScalarFunctionAliasAsColumn bool
+	// PermitDerivedTableDuplicateColumnNames allows a derived table to expose several columns that share a name, which
+	// some integrators permit. Leave this false for standard MySQL compatibility.
+	PermitDerivedTableDuplicateColumnNames bool
 	// Represents the parser to use. If this is nil, then the MySQL parser will be used.
 	Parser Parser
+	// InsertIgnoreMode controls the error-handling semantics for ignored inserts.
+	InsertIgnoreMode InsertIgnoreMode
+	// ValidateDistinctWindow validates DISTINCT window calls that use built-in expressions without their own
+	// DistinctWindowFunctionValidator. When nil, the call is rejected using MySQL-compatible behavior.
+	ValidateDistinctWindow func(schema, name string, expr Expression) error
+	// FunctionProvider is checked for functions before any other source. If this is nil, then only the
+	// DatabaseProvider's functions and the built-in functions will be used.
+	FunctionProvider FunctionProvider
 }
+
+// InsertIgnoreMode controls which compatibility semantics an ignored insert uses.
+type InsertIgnoreMode uint8
+
+const (
+	// InsertIgnoreModeMySQL preserves MySQL's broad INSERT IGNORE behavior.
+	InsertIgnoreModeMySQL InsertIgnoreMode = iota
+	// InsertIgnoreModeDuplicateKeysOnly suppresses only duplicate-key errors.
+	InsertIgnoreModeDuplicateKeysOnly
+)
 
 // ExecutionHooks contain various hooks that are called within a statement's lifecycle. Each inner struct represents a
 // specific statement.

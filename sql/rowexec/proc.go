@@ -37,7 +37,7 @@ func (b *BaseBuilder) buildCaseStatement(ctx *sql.Context, n *plan.CaseStatement
 		if err != nil {
 			return nil, err
 		}
-		comparison, err := n.Expr.Type().Compare(ctx, caseValue, whenValue)
+		comparison, err := n.Expr.Type(ctx).Compare(ctx, caseValue, whenValue)
 		if err != nil {
 			return nil, err
 		}
@@ -65,7 +65,7 @@ func (b *BaseBuilder) buildCaseIter(ctx *sql.Context, row sql.Row, iterNode sql.
 	}
 	return &ifElseIter{
 		branchIter: branchIter,
-		sch:        bodyNode.Schema(),
+		sch:        bodyNode.Schema(ctx),
 		branchNode: bodyNode,
 	}, nil
 }
@@ -107,7 +107,7 @@ func (b *BaseBuilder) buildIfElseBlock(ctx *sql.Context, n *plan.IfElseBlock, ro
 		}
 		return &ifElseIter{
 			branchIter: branchIter,
-			sch:        ifConditional.Body.Schema(),
+			sch:        ifConditional.Body.Schema(ctx),
 			branchNode: ifConditional.Body,
 		}, nil
 	}
@@ -130,7 +130,7 @@ func (b *BaseBuilder) buildIfElseBlock(ctx *sql.Context, n *plan.IfElseBlock, ro
 	}
 	return &ifElseIter{
 		branchIter: branchIter,
-		sch:        n.Else.Schema(),
+		sch:        n.Else.Schema(ctx),
 		branchNode: n.Else,
 	}, nil
 }
@@ -183,6 +183,11 @@ func (b *BaseBuilder) buildProcedureResolvedTable(ctx *sql.Context, n *plan.Proc
 
 func (b *BaseBuilder) buildCall(ctx *sql.Context, n *plan.Call, row sql.Row) (sql.RowIter, error) {
 	if n.Procedure.ExternalProc != nil {
+		// Statements that call this are rejected before they run (see procedures.SubStatementError). This also covers a
+		// call that wasn't checked, before the procedure has any effect.
+		if ep, ok := n.Procedure.ExternalProc.(*plan.ExternalProcedure); ok && ep.NotAllowedInSubStatement && ctx.IsSubStatement() {
+			return nil, sql.ErrCommitNotAllowedInSubStatement.New()
+		}
 		for i, paramExpr := range n.Params {
 			val, err := paramExpr.Eval(ctx, row)
 			if err != nil {
@@ -229,11 +234,6 @@ func (b *BaseBuilder) buildCall(ctx *sql.Context, n *plan.Call, row sql.Row) (sq
 			spp = spp.Reference
 		}
 	}
-
-	// Preserve existing transaction
-	oldTx := ctx.GetTransaction()
-	defer ctx.SetTransaction(oldTx)
-	ctx.SetTransaction(nil)
 
 	rowIter, _, err := procedures.Call(ctx, n)
 	if err != nil {
@@ -345,12 +345,12 @@ func (b *BaseBuilder) buildLoop(ctx *sql.Context, n *plan.Loop, row sql.Row) (sq
 		includeResultSet := false
 
 		var subIterNode sql.Node = n.Block
-		subIterSch := n.Block.Schema()
+		subIterSch := n.Block.Schema(ctx)
 		if blockRowIter, ok := loopBodyIter.(plan.BlockRowIter); ok {
 			subIterNode = blockRowIter.RepresentingNode()
-			subIterSch = blockRowIter.Schema()
+			subIterSch = blockRowIter.Schema(ctx)
 
-			if plan.NodeRepresentsSelect(subIterNode) {
+			if plan.NodeRepresentsSelect(ctx, subIterNode) {
 				selectSeen = true
 				includeResultSet = true
 				returnNode = subIterNode
@@ -366,7 +366,7 @@ func (b *BaseBuilder) buildLoop(ctx *sql.Context, n *plan.Loop, row sql.Row) (sq
 
 		// Wrap the caching code in an inline function so that we can use defer to safely dispose of the cache
 		err = func() error {
-			rowCache, disposeFunc := ctx.Memory.NewRowsCache()
+			rowCache, disposeFunc := ctx.Memory.NewRowsCache(ctx)
 			defer disposeFunc()
 
 			nextRow, err := loopBodyIter.Next(ctx)

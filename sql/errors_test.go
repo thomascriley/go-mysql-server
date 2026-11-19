@@ -11,14 +11,21 @@ import (
 )
 
 func TestSQLErrorCast(t *testing.T) {
+	integerRangeErr := ErrIntegerOutOfRange.New("BIGINT UNSIGNED", "(value + 1)")
+	assert.Equal(t, "BIGINT UNSIGNED value is out of range in '(value + 1)'", integerRangeErr.Error())
+
 	tests := []struct {
-		err  error
-		code int
+		err      error
+		code     int
+		sqlState string
 	}{
-		{ErrTableNotFound.New("table not found err"), mysql.ERNoSuchTable},
-		{ErrInvalidType.New("unhandled mysql error"), mysql.ERUnknownError},
-		{fmt.Errorf("generic error"), mysql.ERUnknownError},
-		{nil, mysql.ERUnknownError},
+		{ErrTableNotFound.New("table not found err"), mysql.ERNoSuchTable, ""},
+		{integerRangeErr, mysql.ERDataOutOfRange, mysql.SSDataOutOfRange},
+		{ErrPrivilegeCheckFailed.New("'attacker'@'%'"), 1142, "42000"},
+		{ErrInvalidType.New("unhandled mysql error"), mysql.ERUnknownError, ""},
+		{fmt.Errorf("generic error"), mysql.ERUnknownError, ""},
+		{nil, mysql.ERUnknownError, ""},
+		{ErrGeneratedColumnValue.New("g", "t0"), 3105, "HY000"},
 	}
 
 	for _, test := range tests {
@@ -28,6 +35,9 @@ func TestSQLErrorCast(t *testing.T) {
 			if err != nil {
 				require.Error(t, err)
 				assert.Equal(t, err.Number(), test.code)
+				if test.sqlState != "" {
+					assert.Equal(t, test.sqlState, err.SQLState())
+				}
 			} else {
 				assert.Equal(t, err, nilErr)
 			}

@@ -16,6 +16,7 @@ package plan
 
 import (
 	"fmt"
+	"slices"
 
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/types"
@@ -62,15 +63,15 @@ var _ sql.Expressioner = (*RecursiveCte)(nil)
 var _ sql.CollationCoercible = (*RecursiveCte)(nil)
 var _ TableIdNode = (*RecursiveCte)(nil)
 
-func NewRecursiveCte(initial, recursive sql.Node, name string, outputCols []string, deduplicate bool, l sql.Expression, sf sql.SortFields) *RecursiveCte {
+func NewRecursiveCte(initial, recursive sql.Node, name string, outputCols []string, deduplicate bool, l sql.Expression, sc sql.SortConditions) *RecursiveCte {
 	return &RecursiveCte{
 		ColumnNames: outputCols,
 		union: &SetOp{
-			SetOpType:  UnionType,
-			BinaryNode: BinaryNode{left: initial, right: recursive},
-			Distinct:   deduplicate,
-			Limit:      l,
-			SortFields: sf,
+			SetOpType:      UnionType,
+			BinaryNode:     BinaryNode{left: initial, right: recursive},
+			Distinct:       deduplicate,
+			Limit:          l,
+			SortConditions: sc,
 		},
 		name: name,
 	}
@@ -144,14 +145,14 @@ func (r *RecursiveCte) WithWorking(t *RecursiveTable) *RecursiveCte {
 }
 
 // Schema implements sql.Node
-func (r *RecursiveCte) Schema() sql.Schema {
+func (r *RecursiveCte) Schema(ctx *sql.Context) sql.Schema {
 	return r.schema
 }
 
 // WithChildren implements sql.Node
-func (r *RecursiveCte) WithChildren(children ...sql.Node) (sql.Node, error) {
+func (r *RecursiveCte) WithChildren(ctx *sql.Context, children ...sql.Node) (sql.Node, error) {
 	ret := *r
-	s, err := r.union.WithChildren(children...)
+	s, err := r.union.WithChildren(ctx, children...)
 	if err != nil {
 		return nil, err
 	}
@@ -180,9 +181,9 @@ func (r *RecursiveCte) Expressions() []sql.Expression {
 	return r.union.Expressions()
 }
 
-func (r *RecursiveCte) WithExpressions(exprs ...sql.Expression) (sql.Node, error) {
+func (r *RecursiveCte) WithExpressions(ctx *sql.Context, exprs ...sql.Expression) (sql.Node, error) {
 	ret := *r
-	s, err := r.union.WithExpressions(exprs...)
+	s, err := r.union.WithExpressions(ctx, exprs...)
 	if err != nil {
 		return nil, err
 	}
@@ -199,15 +200,15 @@ func (r *RecursiveCte) String() string {
 }
 
 // DebugString implements sql.Node
-func (r *RecursiveCte) DebugString() string {
+func (r *RecursiveCte) DebugString(ctx *sql.Context) string {
 	pr := sql.NewTreePrinter()
 	_ = pr.WriteNode("RecursiveCTE")
-	pr.WriteChildren(sql.DebugString(r.union))
+	pr.WriteChildren(sql.DebugString(ctx, r.union))
 	return pr.String()
 }
 
 // Type implements sql.Node
-func (r *RecursiveCte) Type() sql.Type {
+func (r *RecursiveCte) Type(ctx *sql.Context) sql.Type {
 	cols := r.schema
 	if len(cols) == 1 {
 		return cols[0].Type
@@ -220,7 +221,7 @@ func (r *RecursiveCte) Type() sql.Type {
 }
 
 // IsNullable implements sql.Node
-func (r *RecursiveCte) IsNullable() bool {
+func (r *RecursiveCte) IsNullable(ctx *sql.Context) bool {
 	return true
 }
 
@@ -293,7 +294,7 @@ func (r *RecursiveTable) String() string {
 	return fmt.Sprintf("RecursiveTable(%s)", r.name)
 }
 
-func (r *RecursiveTable) Schema() sql.Schema {
+func (r *RecursiveTable) Schema(ctx *sql.Context) sql.Schema {
 	return r.schema
 }
 
@@ -301,11 +302,39 @@ func (r *RecursiveTable) Children() []sql.Node {
 	return nil
 }
 
-func (r *RecursiveTable) WithChildren(node ...sql.Node) (sql.Node, error) {
+func (r *RecursiveTable) WithChildren(ctx *sql.Context, children ...sql.Node) (sql.Node, error) {
 	return r, nil
 }
 
 // CollationCoercibility implements the interface sql.CollationCoercible.
 func (*RecursiveTable) CollationCoercibility(ctx *sql.Context) (collation sql.CollationID, coercibility byte) {
 	return sql.Collation_binary, 7
+}
+
+// ReferencesOuterRecursiveTable reports whether a relation reads a recursive
+// working table owned by a CTE outside the relation.
+func ReferencesOuterRecursiveTable(node sql.Node) bool {
+	return referencesOuterRecursiveTable(node, nil)
+}
+
+// referencesOuterRecursiveTable tracks the working tables bound by recursive
+// terms so a self-contained recursive CTE can still be cached.
+func referencesOuterRecursiveTable(node sql.Node, bound []*RecursiveTable) bool {
+	switch n := node.(type) {
+	case *RecursiveTable:
+		return !slices.Contains(bound, n)
+	case *RecursiveCte:
+		return referencesOuterRecursiveTable(n.Left(), bound) ||
+			referencesOuterRecursiveTable(n.Right(), append(bound, n.Working))
+	case sql.UnaryNode:
+		return referencesOuterRecursiveTable(n.Child(), bound)
+	case sql.BinaryNode:
+		return referencesOuterRecursiveTable(n.Left(), bound) || referencesOuterRecursiveTable(n.Right(), bound)
+	}
+	for _, child := range node.Children() {
+		if referencesOuterRecursiveTable(child, bound) {
+			return true
+		}
+	}
+	return false
 }

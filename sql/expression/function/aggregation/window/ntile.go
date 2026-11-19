@@ -36,7 +36,7 @@ var _ sql.WindowAggregation = (*NTile)(nil)
 var _ sql.WindowAdaptableExpression = (*NTile)(nil)
 var _ sql.CollationCoercible = (*NTile)(nil)
 
-func NewNTile(expr sql.Expression) sql.Expression {
+func NewNTile(ctx *sql.Context, expr sql.Expression) sql.Expression {
 	return &NTile{
 		bucketExpr: expr,
 	}
@@ -70,7 +70,9 @@ func (n *NTile) Resolved() bool {
 
 func (n *NTile) String() string {
 	sb := strings.Builder{}
-	sb.WriteString("ntile()")
+	sb.WriteString("ntile(")
+	sb.WriteString(n.bucketExpr.String())
+	sb.WriteString(")")
 	if n.window != nil {
 		sb.WriteString(" ")
 		sb.WriteString(n.window.String())
@@ -78,12 +80,14 @@ func (n *NTile) String() string {
 	return sb.String()
 }
 
-func (n *NTile) DebugString() string {
+func (n *NTile) DebugString(ctx *sql.Context) string {
 	sb := strings.Builder{}
-	sb.WriteString("ntile()")
+	sb.WriteString("ntile(")
+	sb.WriteString(sql.DebugString(ctx, n.bucketExpr))
+	sb.WriteString(")")
 	if n.window != nil {
 		sb.WriteString(" ")
-		sb.WriteString(sql.DebugString(n.window))
+		sb.WriteString(sql.DebugString(ctx, n.window))
 	}
 	return sb.String()
 }
@@ -94,7 +98,7 @@ func (n *NTile) FunctionName() string {
 }
 
 // Type implements sql.Expression
-func (n *NTile) Type() sql.Type {
+func (n *NTile) Type(ctx *sql.Context) sql.Type {
 	return types.Float64
 }
 
@@ -104,7 +108,7 @@ func (*NTile) CollationCoercibility(ctx *sql.Context) (collation sql.CollationID
 }
 
 // IsNullable implements sql.Expression
-func (n *NTile) IsNullable() bool {
+func (n *NTile) IsNullable(ctx *sql.Context) bool {
 	return false
 }
 
@@ -119,22 +123,22 @@ func (n *NTile) Children() []sql.Expression {
 }
 
 // WithChildren implements sql.Expression
-func (n *NTile) WithChildren(children ...sql.Expression) (sql.Expression, error) {
-	window, err := n.window.FromExpressions(children)
+func (n *NTile) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
+	window, err := n.window.FromExpressions(ctx, children)
 	if err != nil {
 		return nil, err
 	}
 
-	return n.WithWindow(window), nil
+	return n.WithWindow(ctx, window), nil
 }
 
 // WithWindow implements sql.WindowAggregation
-func (n *NTile) WithWindow(window *sql.WindowDefinition) sql.WindowAdaptableExpression {
+func (n *NTile) WithWindow(ctx *sql.Context, window *sql.WindowDefinition) sql.WindowAdaptableExpression {
 	nr := *n
 	nr.window = window
 	return &nr
 }
 
-func (n *NTile) NewWindowFunction() (sql.WindowFunction, error) {
+func (n *NTile) NewWindowFunction(ctx *sql.Context) (sql.WindowFunction, error) {
 	return aggregation.NewNTile(n.bucketExpr), nil
 }

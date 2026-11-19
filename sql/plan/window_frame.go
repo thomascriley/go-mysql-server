@@ -55,7 +55,7 @@ func (f *windowFrameBase) String() string {
 
 	var endExtent string
 	switch {
-	case f.unboundedPreceding:
+	case f.unboundedFollowing:
 		endExtent = "UNBOUNDED FOLLOWING"
 	case f.endCurrentRow:
 		endExtent = "CURRENT ROW"
@@ -73,7 +73,7 @@ func (f *windowFrameBase) String() string {
 	}
 }
 
-func (f *windowFrameBase) DebugString() string {
+func (f *windowFrameBase) DebugString(ctx *sql.Context) string {
 	if f == nil {
 		return ""
 	}

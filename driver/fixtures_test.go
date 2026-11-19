@@ -15,7 +15,7 @@ type memTable struct {
 }
 
 func (f *memTable) NewSession(ctx context.Context, id uint32, conn *driver.Connector) (sql.Session, error) {
-	return memory.NewSession(sql.NewBaseSession(), f.catalog), nil
+	return memory.NewSession(sql.NewBaseSessionWithVariables(conn.EngineVariables()), f.catalog), nil
 }
 
 var _ driver.Provider = (*memTable)(nil)
@@ -24,7 +24,7 @@ var _ driver.ProviderWithSessionBuilder = (*memTable)(nil)
 func newMemTable(dbName string, tableName string, schema sql.Schema, records Records) *memTable {
 	db := memory.NewDatabase(dbName)
 	pro := memory.NewDBProvider(db)
-	table := memory.NewTable(db, tableName, sql.NewPrimaryKeySchema(schema), nil)
+	table := memory.NewTable(sql.NewEmptyContext(), db, tableName, sql.NewPrimaryKeySchema(schema), nil)
 	db.AddTable(tableName, table)
 
 	ctx := newContext(pro)

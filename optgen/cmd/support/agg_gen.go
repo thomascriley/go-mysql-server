@@ -15,11 +15,12 @@ type AggDefs struct {
 }
 
 type AggDef struct {
-	Name     string `yaml:"name"`
-	SqlName  string `yaml:"sqlName"`
-	Desc     string `yaml:"desc"`
-	RetType  string `yaml:"retType"` // must be valid sql.Type
-	Nullable bool   `yaml:"nullable"`
+	Name          string `yaml:"name"`
+	SqlName       string `yaml:"sqlName"`
+	WindowSqlName string `yaml:"windowSqlName"`
+	Desc          string `yaml:"desc"`
+	RetType       string `yaml:"retType"` // must be valid sql.Type
+	Nullable      bool   `yaml:"nullable"`
 }
 
 var _ GenDefs = ([]AggDef)(nil)
@@ -59,6 +60,7 @@ func (g *AggGen) Generate(defines GenDefs, w io.Writer) {
 		g.genAggConstructor(define)
 		g.genAggPropAccessors(define)
 		g.genAggStringer(define)
+		g.genAggDescriber(define)
 		g.genAggWithWindow(define)
 		g.genAggWithChildren(define)
 		g.genAggWithId(define)
@@ -76,6 +78,7 @@ func (g *AggGen) genAggType(define AggDef) {
 func (g *AggGen) genAggInterfaces(define AggDef) {
 	fmt.Fprintf(g.w, "var _ sql.FunctionExpression = (*%s)(nil)\n", define.Name)
 	fmt.Fprintf(g.w, "var _ sql.Aggregation = (*%s)(nil)\n", define.Name)
+	fmt.Fprintf(g.w, "var _ sql.Describable = (*%s)(nil)\n", define.Name)
 	fmt.Fprintf(g.w, "var _ sql.WindowAdaptableExpression = (*%s)(nil)\n", define.Name)
 	fmt.Fprintf(g.w, "\n")
 
@@ -94,15 +97,15 @@ func (g *AggGen) genAggConstructor(define AggDef) {
 }
 
 func (g *AggGen) genAggPropAccessors(define AggDef) {
-	retType := "a.Child.Type()"
+	retType := "a.Child.Type(ctx)"
 	if define.RetType != "" {
 		retType = define.RetType
 	}
-	fmt.Fprintf(g.w, "func (a *%s) Type() sql.Type {\n", define.Name)
+	fmt.Fprintf(g.w, "func (a *%s) Type(ctx *sql.Context) sql.Type {\n", define.Name)
 	fmt.Fprintf(g.w, "    return %s\n", retType)
 	fmt.Fprintf(g.w, "}\n\n")
 
-	fmt.Fprintf(g.w, "func (a *%s) IsNullable() bool {\n", define.Name)
+	fmt.Fprintf(g.w, "func (a *%s) IsNullable(ctx *sql.Context) bool {\n", define.Name)
 	fmt.Fprintf(g.w, "    return %t\n", define.Nullable)
 	fmt.Fprintf(g.w, "}\n\n")
 }
@@ -113,31 +116,60 @@ func (g *AggGen) genAggStringer(define AggDef) {
 		sqlName = define.SqlName
 	}
 	fmt.Fprintf(g.w, "func (a *%s) String() string {\n", define.Name)
-	fmt.Fprintf(g.w, "  if a.window != nil {\n")
-	fmt.Fprintf(g.w, "    pr := sql.NewTreePrinter()\n")
-	fmt.Fprintf(g.w, "    _ = pr.WriteNode(\"%s\")\n	", strings.ToUpper(sqlName))
-	fmt.Fprintf(g.w, "    children := []string{a.window.String(), a.Child.String()}\n")
-	fmt.Fprintf(g.w, "    pr.WriteChildren(children...)\n")
-	fmt.Fprintf(g.w, "    return pr.String()\n")
+	if define.WindowSqlName != "" {
+		fmt.Fprintf(g.w, "  if a.window != nil {\n")
+		fmt.Fprintf(g.w, "    return \"%s(\" + a.Child.String() + \") \" + a.window.String()\n", strings.ToUpper(define.WindowSqlName))
+		fmt.Fprintf(g.w, "  }\n")
+		fmt.Fprintf(g.w, "  return \"%s(\" + a.Child.String() + \")\"\n", strings.ToUpper(sqlName))
+		fmt.Fprintf(g.w, "}\n\n")
+	} else {
+		fmt.Fprintf(g.w, "  ret := \"%s(\" + a.Child.String() + \")\"\n", strings.ToUpper(sqlName))
+		fmt.Fprintf(g.w, "  if a.window != nil {\n")
+		fmt.Fprintf(g.w, "    ret += \" \" + a.window.String()\n")
+		fmt.Fprintf(g.w, "  }\n")
+		fmt.Fprintf(g.w, "  return ret\n")
+		fmt.Fprintf(g.w, "}\n\n")
+	}
+}
+
+func (g *AggGen) genAggDescriber(define AggDef) {
+	sqlName := define.Name
+	if define.SqlName != "" {
+		sqlName = define.SqlName
+	}
+	fmt.Fprintf(g.w, "func (a *%s) Describe(ctx *sql.Context, options sql.DescribeOptions) string {\n", define.Name)
+	fmt.Fprintf(g.w, "  if options.Debug {\n")
+	fmt.Fprintf(g.w, "    if a.window != nil {\n")
+	fmt.Fprintf(g.w, "      pr := sql.NewTreePrinter()\n")
+	fmt.Fprintf(g.w, "      _ = pr.WriteNode(\"%s\")\n	", strings.ToUpper(sqlName))
+	fmt.Fprintf(g.w, "      children := []string{sql.Describe(ctx, a.window, options), sql.Describe(ctx, a.Child, options)}\n")
+	fmt.Fprintf(g.w, "      pr.WriteChildren(children...)\n")
+	fmt.Fprintf(g.w, "      return pr.String()\n")
+	fmt.Fprintf(g.w, "    }\n")
+	fmt.Fprintf(g.w, "    return fmt.Sprintf(\"%s(%%s)\", sql.Describe(ctx, a.Child, options))\n", strings.ToUpper(sqlName))
 	fmt.Fprintf(g.w, "  }\n")
-	fmt.Fprintf(g.w, " return \"%s(\" + a.Child.String() + \")\"\n", strings.ToUpper(sqlName))
+	if define.WindowSqlName != "" {
+		fmt.Fprintf(g.w, "  if a.window != nil {\n")
+		fmt.Fprintf(g.w, "    return \"%s(\" + sql.Describe(ctx, a.Child, options) + \") \" + sql.Describe(ctx, a.window, options)\n", strings.ToUpper(define.WindowSqlName))
+		fmt.Fprintf(g.w, "  }\n")
+		fmt.Fprintf(g.w, "  return \"%s(\" + sql.Describe(ctx, a.Child, options) + \")\"\n", strings.ToUpper(sqlName))
+	} else {
+		fmt.Fprintf(g.w, "  ret := \"%s(\" + sql.Describe(ctx, a.Child, options) + \")\"\n", strings.ToUpper(sqlName))
+		fmt.Fprintf(g.w, "  if a.window != nil {\n")
+		fmt.Fprintf(g.w, "    ret += \" \" + sql.Describe(ctx, a.window, options)\n")
+		fmt.Fprintf(g.w, "  }\n")
+		fmt.Fprintf(g.w, "  return ret\n")
+	}
 	fmt.Fprintf(g.w, "}\n\n")
 
-	fmt.Fprintf(g.w, "func (a *%s) DebugString() string {\n", define.Name)
-	fmt.Fprintf(g.w, "  if a.window != nil {\n")
-	fmt.Fprintf(g.w, "    pr := sql.NewTreePrinter()\n")
-	fmt.Fprintf(g.w, "    _ = pr.WriteNode(\"%s\")\n	", strings.ToUpper(sqlName))
-	fmt.Fprintf(g.w, "    children := []string{sql.DebugString(a.window), sql.DebugString(a.Child)}\n")
-	fmt.Fprintf(g.w, "    pr.WriteChildren(children...)\n")
-	fmt.Fprintf(g.w, "    return pr.String()\n")
-	fmt.Fprintf(g.w, "  }\n")
-	fmt.Fprintf(g.w, "  return fmt.Sprintf(\"%s(%%s)\", sql.DebugString(a.Child))\n", strings.ToUpper(sqlName))
+	fmt.Fprintf(g.w, "func (a *%s) DebugString(ctx *sql.Context) string {\n", define.Name)
+	fmt.Fprintf(g.w, "  return a.Describe(ctx, sql.DescribeOptions{Debug: true})\n")
 	fmt.Fprintf(g.w, "}\n\n")
 }
 
 func (g *AggGen) genAggWithChildren(define AggDef) {
-	fmt.Fprintf(g.w, "func (a *%s) WithChildren(children ...sql.Expression) (sql.Expression, error) {\n", define.Name)
-	fmt.Fprintf(g.w, "    res, err := a.unaryAggBase.WithChildren(children...)\n")
+	fmt.Fprintf(g.w, "func (a *%s) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {\n", define.Name)
+	fmt.Fprintf(g.w, "    res, err := a.unaryAggBase.WithChildren(ctx, children...)\n")
 	fmt.Fprintf(g.w, "    return &%s{unaryAggBase: *res.(*unaryAggBase)}, err\n", define.Name)
 	fmt.Fprintf(g.w, "}\n\n")
 }
@@ -150,25 +182,25 @@ func (g *AggGen) genAggWithId(define AggDef) {
 }
 
 func (g *AggGen) genAggWithWindow(define AggDef) {
-	fmt.Fprintf(g.w, "func (a *%s) WithWindow(window *sql.WindowDefinition) sql.WindowAdaptableExpression {\n", define.Name)
-	fmt.Fprintf(g.w, "    res := a.unaryAggBase.WithWindow(window)\n")
+	fmt.Fprintf(g.w, "func (a *%s) WithWindow(ctx *sql.Context, window *sql.WindowDefinition) sql.WindowAdaptableExpression {\n", define.Name)
+	fmt.Fprintf(g.w, "    res := a.unaryAggBase.WithWindow(ctx, window)\n")
 	fmt.Fprintf(g.w, "    return &%s{unaryAggBase: *res.(*unaryAggBase)}\n", define.Name)
 	fmt.Fprintf(g.w, "}\n\n")
 }
 
 func (g *AggGen) genAggWindowConstructor(define AggDef) {
-	fmt.Fprintf(g.w, "func (a *%s) NewWindowFunction() (sql.WindowFunction, error) {\n", define.Name)
-	fmt.Fprintf(g.w, "    child, err := transform.Clone(a.Child)\n")
+	fmt.Fprintf(g.w, "func (a *%s) NewWindowFunction(ctx *sql.Context) (sql.WindowFunction, error) {\n", define.Name)
+	fmt.Fprintf(g.w, "    child, err := transform.Clone(ctx, a.Child)\n")
 	fmt.Fprintf(g.w, "    if err != nil {\n")
 	fmt.Fprintf(g.w, "        return nil, err\n")
 	fmt.Fprintf(g.w, "    }\n")
-	fmt.Fprintf(g.w, "    return New%sAgg(child).WithWindow(a.Window())\n", define.Name)
+	fmt.Fprintf(g.w, "    return New%sAgg(child).WithWindow(ctx, a.Window())\n", define.Name)
 	fmt.Fprintf(g.w, "}\n\n")
 }
 
 func (g *AggGen) genAggNewBuffer(define AggDef) {
-	fmt.Fprintf(g.w, "func (a *%s) NewBuffer() (sql.AggregationBuffer, error) {\n", define.Name)
-	fmt.Fprintf(g.w, "    child, err := transform.Clone(a.Child)\n")
+	fmt.Fprintf(g.w, "func (a *%s) NewBuffer(ctx *sql.Context) (sql.AggregationBuffer, error) {\n", define.Name)
+	fmt.Fprintf(g.w, "    child, err := transform.Clone(ctx, a.Child)\n")
 	fmt.Fprintf(g.w, "    if err != nil {\n")
 	fmt.Fprintf(g.w, "        return nil, err\n")
 	fmt.Fprintf(g.w, "    }\n")

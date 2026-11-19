@@ -103,21 +103,50 @@ var InsertQueries = []WriteQueryTest{
 	},
 	{
 		WriteQuery: `INSERT INTO typestable VALUES (
-			999, 127, 32767, 2147483647, 9223372036854775807,
-			255, 65535, 4294967295, 18446744073709551615,
-			3.40282346638528859811704183484516925440e+38, 1.797693134862315708145274237317043567981e+308,
-			'2037-04-05 12:51:36', '2231-11-07',
-			'random text', true, '{"key":"value"}', 'blobdata', 'v1', 'v2'
-			);`,
+			999, 
+			127, 
+			32767, 
+			2147483647, 
+			9223372036854775807, 
+			255, 
+			65535, 
+			4294967295, 
+			18446744073709551615,
+			3.40282346638528859811704183484516925440e+38, 
+			1.797693134862315708145274237317043567981e+308,
+			'2037-04-05 12:51:36', 
+			'2231-11-07',
+			'random text', 
+			true, 
+			'{"key":"value"}', 
+			'blobdata', 
+			'v1', 
+			'v2'
+		);`,
 		ExpectedWriteResult: []sql.Row{{types.NewOkResult(1)}},
 		SelectQuery:         "SELECT * FROM typestable WHERE id = 999;",
-		ExpectedSelect: []sql.Row{{
-			int64(999), int8(math.MaxInt8), int16(math.MaxInt16), int32(math.MaxInt32), int64(math.MaxInt64),
-			uint8(math.MaxUint8), uint16(math.MaxUint16), uint32(math.MaxUint32), uint64(math.MaxUint64),
-			float32(math.MaxFloat32), float64(math.MaxFloat64),
-			sql.MustConvert(types.Timestamp.Convert(sqlCtx, "2037-04-05 12:51:36")), sql.MustConvert(types.Date.Convert(sqlCtx, "2231-11-07")),
-			"random text", sql.True, types.MustJSON(`{"key":"value"}`), []byte("blobdata"), "v1", "v2",
-		}},
+		ExpectedSelect: []sql.Row{
+			{
+				int64(999),
+				int8(math.MaxInt8),
+				int16(math.MaxInt16),
+				int32(math.MaxInt32),
+				int64(math.MaxInt64),
+				uint8(math.MaxUint8),
+				uint16(math.MaxUint16),
+				uint32(math.MaxUint32),
+				uint64(math.MaxUint64),
+				float32(math.MaxFloat32),
+				float64(math.MaxFloat64),
+				sql.MustConvert(types.Timestamp.Convert(sqlCtx, "2037-04-05 12:51:36")),
+				sql.MustConvert(types.Date.Convert(sqlCtx, "2231-11-07")),
+				"random text",
+				sql.True,
+				types.MustJSON(`{"key":"value"}`),
+				[]byte("blobdata"),
+				"v1",
+				"v2",
+			}},
 	},
 	{
 		WriteQuery: `INSERT INTO typestable SET
@@ -140,20 +169,48 @@ var InsertQueries = []WriteQueryTest{
 	{
 		SkipServerEngine: true, // the datetime returned is not non-zero
 		WriteQuery: `INSERT INTO typestable VALUES (
-			999, -128, -32768, -2147483648, -9223372036854775808,
-			0, 0, 0, 0,
-			1.401298464324817070923729583289916131280e-45, 4.940656458412465441765687928682213723651e-324,
-			'0000-00-00 00:00:00', '0000-00-00',
-			'', false, '""', '', '', ''
+			999, 
+			-128, 
+			-32768, 
+			-2147483648, 
+			-9223372036854775808,
+			0, 
+			0, 
+			0, 
+			0,
+			1.401298464324817070923729583289916131280e-45, 
+			4.940656458412465441765687928682213723651e-324,
+			'1970-01-01 00:00:01', 
+			'0000-01-01',
+			'', 
+			false, 
+			'""', 
+			'', 
+			'', 
+			''
 			);`,
 		ExpectedWriteResult: []sql.Row{{types.NewOkResult(1)}},
 		SelectQuery:         "SELECT * FROM typestable WHERE id = 999;",
 		ExpectedSelect: []sql.Row{{
-			int64(999), int8(-math.MaxInt8 - 1), int16(-math.MaxInt16 - 1), int32(-math.MaxInt32 - 1), int64(-math.MaxInt64 - 1),
-			uint8(0), uint16(0), uint32(0), uint64(0),
-			float32(math.SmallestNonzeroFloat32), float64(math.SmallestNonzeroFloat64),
-			types.Timestamp.Zero(), types.Date.Zero(),
-			"", sql.False, types.MustJSON(`""`), []byte(""), "", "",
+			int64(999),
+			int8(-math.MaxInt8 - 1),
+			int16(-math.MaxInt16 - 1),
+			int32(-math.MaxInt32 - 1),
+			int64(-math.MaxInt64 - 1),
+			uint8(0),
+			uint16(0),
+			uint32(0),
+			uint64(0),
+			float32(math.SmallestNonzeroFloat32),
+			float64(math.SmallestNonzeroFloat64),
+			time.Date(1970, 1, 1, 0, 0, 1, 0, time.UTC),
+			time.Date(0, 1, 1, 0, 0, 0, 0, time.UTC),
+			"",
+			sql.False,
+			types.MustJSON(`""`),
+			[]byte(""),
+			"",
+			"",
 		}},
 	},
 	{
@@ -162,16 +219,25 @@ var InsertQueries = []WriteQueryTest{
 			id = 999, i8 = -128, i16 = -32768, i32 = -2147483648, i64 = -9223372036854775808,
 			u8 = 0, u16 = 0, u32 = 0, u64 = 0,
 			f32 = 1.401298464324817070923729583289916131280e-45, f64 = 4.940656458412465441765687928682213723651e-324,
-			ti = '0000-00-00 00:00:00', da = '0000-00-00',
+			ti = '1970-01-01 00:00:01', da = '0000-01-01',
 			te = '', bo = false, js = '""', bl = '', e1 = 'v1', s1 = 'v2'
 			;`,
 		ExpectedWriteResult: []sql.Row{{types.NewOkResult(1)}},
 		SelectQuery:         "SELECT * FROM typestable WHERE id = 999;",
 		ExpectedSelect: []sql.Row{{
-			int64(999), int8(-math.MaxInt8 - 1), int16(-math.MaxInt16 - 1), int32(-math.MaxInt32 - 1), int64(-math.MaxInt64 - 1),
-			uint8(0), uint16(0), uint32(0), uint64(0),
-			float32(math.SmallestNonzeroFloat32), float64(math.SmallestNonzeroFloat64),
-			types.Timestamp.Zero(), types.Date.Zero(),
+			int64(999),
+			int8(-math.MaxInt8 - 1),
+			int16(-math.MaxInt16 - 1),
+			int32(-math.MaxInt32 - 1),
+			int64(-math.MaxInt64 - 1),
+			uint8(0),
+			uint16(0),
+			uint32(0),
+			uint64(0),
+			float32(math.SmallestNonzeroFloat32),
+			float64(math.SmallestNonzeroFloat64),
+			time.Date(1970, 1, 1, 0, 0, 1, 0, time.UTC),
+			time.Date(0, 1, 1, 0, 0, 0, 0, time.UTC),
 			"", sql.False, types.MustJSON(`""`), []byte(""), "v1", "v2",
 		}},
 	},
@@ -181,7 +247,7 @@ var InsertQueries = []WriteQueryTest{
 			id = 999, i8 = -128, i16 = -32768, i32 = -2147483648, i64 = -9223372036854775808,
 			u8 = 0, u16 = 0, u32 = 0, u64 = 0,
 			f32 = 1.401298464324817070923729583289916131280e-45, f64 = 4.940656458412465441765687928682213723651e-324,
-			ti = '2037-04-05 12:51:36 -0000 UTC', da = '0000-00-00',
+			ti = '2037-04-05 12:51:36 -0000 UTC', da = '0000-01-01',
 			te = '', bo = false, js = '""', bl = '', e1 = 'v1', s1 = 'v2'
 			;`,
 		ExpectedWriteResult: []sql.Row{{types.NewOkResult(1)}},
@@ -190,10 +256,12 @@ var InsertQueries = []WriteQueryTest{
 			int64(999), int8(-math.MaxInt8 - 1), int16(-math.MaxInt16 - 1), int32(-math.MaxInt32 - 1), int64(-math.MaxInt64 - 1),
 			uint8(0), uint16(0), uint32(0), uint64(0),
 			float32(math.SmallestNonzeroFloat32), float64(math.SmallestNonzeroFloat64),
-			sql.MustConvert(types.Timestamp.Convert(sqlCtx, "2037-04-05 12:51:36")), types.Date.Zero(),
+			time.Date(2037, 4, 5, 12, 51, 36, 0, time.UTC),
+			time.Date(0, 1, 1, 0, 0, 0, 0, time.UTC),
 			"", sql.False, types.MustJSON(`""`), []byte(""), "v1", "v2",
 		}},
 	},
+
 	{
 		WriteQuery:          `INSERT INTO mytable (i,s) VALUES (10, 'NULL')`,
 		ExpectedWriteResult: []sql.Row{{types.NewOkResult(1)}},
@@ -862,6 +930,127 @@ var SpatialInsertQueries = []WriteQueryTest{
 
 var InsertScripts = []ScriptTest{
 	{
+		// https://github.com/dolthub/dolt/issues/11918
+		Name:    "insert strings with dangling exponent into integer columns",
+		Dialect: "mysql",
+		SetUpScript: []string{
+			"CREATE TABLE t (pk INT PRIMARY KEY, i INT, u INT UNSIGNED);",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "INSERT INTO t VALUES (1, '1E', '1E'), (2, '1.5E', '1.5E');",
+				Expected: []sql.Row{{types.NewOkResult(2)}},
+			},
+			{
+				Query:       "INSERT INTO t VALUES (3, '1eE', '1eE');",
+				ExpectedErr: sql.ErrInvalidValue,
+			},
+			{
+				Query:    "SELECT * FROM t ORDER BY pk;",
+				Expected: []sql.Row{{1, 1, uint32(1)}, {2, 2, uint32(2)}},
+			},
+		},
+	},
+	{
+		// https://github.com/dolthub/dolt/issues/11388
+		Name:    "multi-row empty insert compatibility",
+		Dialect: "mysql",
+		SetUpScript: []string{
+			"create table empty_defaults (a int default 1, b int default 2)",
+			"create table empty_column_list (a int default 1, b int default 2)",
+			"create table mixed_defaults (a int default 1, b int default 2)",
+			"create table empty_named (a int default 1, b int default 2)",
+			"create table empty_auto (id int auto_increment primary key, v int default 5)",
+			"create table empty_nullable (a int, b int)",
+			"create table empty_required (a int not null, b int default 2)",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "insert into empty_defaults values (), ()",
+				Expected: []sql.Row{{types.NewOkResult(2)}},
+			},
+			{
+				Query:    "select * from empty_defaults",
+				Expected: []sql.Row{{1, 2}, {1, 2}},
+			},
+			{
+				Query:    "insert into empty_column_list () values (), ()",
+				Expected: []sql.Row{{types.NewOkResult(2)}},
+			},
+			{
+				Query:    "select * from empty_column_list",
+				Expected: []sql.Row{{1, 2}, {1, 2}},
+			},
+			{
+				Query:       "insert into mixed_defaults values (), (3, 4)",
+				ExpectedErr: sql.ErrInsertIntoMismatchValueCount,
+			},
+			{
+				Query:       "insert into mixed_defaults values (3, 4), ()",
+				ExpectedErr: sql.ErrInsertIntoMismatchValueCount,
+			},
+			{
+				Query:    "select * from mixed_defaults",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "insert into mixed_defaults values (default, default), (3, default)",
+				Expected: []sql.Row{{types.NewOkResult(2)}},
+			},
+			{
+				Query:    "select * from mixed_defaults",
+				Expected: []sql.Row{{1, 2}, {3, 2}},
+			},
+			{
+				Query:       "insert into empty_named (a) values (), ()",
+				ExpectedErr: sql.ErrInsertIntoMismatchValueCount,
+			},
+			{
+				Query:    "select * from empty_named",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "insert into empty_auto values (), ()",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 2, InsertID: 1}}},
+			},
+			{
+				Query:    "select * from empty_auto order by id",
+				Expected: []sql.Row{{1, 5}, {2, 5}},
+			},
+			{
+				Query:    "insert into empty_nullable values (), ()",
+				Expected: []sql.Row{{types.NewOkResult(2)}},
+			},
+			{
+				Query:    "select * from empty_nullable",
+				Expected: []sql.Row{{nil, nil}, {nil, nil}},
+			},
+			{
+				Query:       "insert into empty_required values (), ()",
+				ExpectedErr: sql.ErrFieldNoDefaultValue,
+			},
+			{
+				Query:    "select * from empty_required",
+				Expected: []sql.Row{},
+			},
+		},
+	},
+	{
+		Name: "values and rows",
+		SetUpScript: []string{
+			"CREATE TABLE xy (x INT PRIMARY KEY, y INT)",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				// Syntax error
+				Query: "INSERT INTO xy (VALUES ROW(1, 1))",
+				Expected: []sql.Row{
+					{types.NewOkResult(1)},
+				},
+			},
+		},
+	},
+	{
 		// https://github.com/dolthub/dolt/issues/7322
 		Name: "issue 7322: values expression is subquery",
 		SetUpScript: []string{
@@ -930,442 +1119,6 @@ var InsertScripts = []ScriptTest{
 			{
 				Query:    "INSERT INTO t1 (dt) VALUES ('0001-01-01 00:00:00');",
 				Expected: []sql.Row{{types.NewOkResult(1)}},
-			},
-		},
-	},
-	{
-		Name:    "insert into sparse auto_increment table",
-		Dialect: "mysql",
-		SetUpScript: []string{
-			"create table auto (pk int primary key auto_increment)",
-			"insert into auto values (10), (20), (30)",
-			"insert into auto values (NULL)",
-			"insert into auto values (40)",
-			"insert into auto values (0)",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: "select * from auto order by 1",
-				Expected: []sql.Row{
-					{10}, {20}, {30}, {31}, {40}, {41},
-				},
-			},
-		},
-	},
-	{
-		Name:    "insert negative values into auto_increment values",
-		Dialect: "mysql",
-		SetUpScript: []string{
-			"create table auto (pk int primary key auto_increment)",
-			"insert into auto values (10), (20), (30)",
-			"insert into auto values (-1), (-2), (-3)",
-			"insert into auto () values ()",
-			"insert into auto values (0), (0), (0)",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: "select * from auto order by 1",
-				Expected: []sql.Row{
-					{-3}, {-2}, {-1}, {10}, {20}, {30}, {31}, {32}, {33}, {34},
-				},
-			},
-		},
-	},
-	{
-		Name: "insert into auto_increment unique key column",
-		SetUpScript: []string{
-			"create table auto (pk int primary key, npk int unique auto_increment)",
-			"insert into auto (pk) values (10), (20), (30)",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: "select * from auto order by 1",
-				Expected: []sql.Row{
-					{10, 1}, {20, 2}, {30, 3},
-				},
-			},
-		},
-	},
-	{
-		Name: "insert into auto_increment with multiple unique key columns",
-		SetUpScript: []string{
-			"create table auto (pk int primary key, npk1 int auto_increment, npk2 int, unique(npk1, npk2))",
-			"insert into auto (pk) values (10), (20), (30)",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: "select * from auto order by 1",
-				Expected: []sql.Row{
-					{10, 1, nil}, {20, 2, nil}, {30, 3, nil},
-				},
-			},
-		},
-	},
-	{
-		Name:    "insert into auto_increment key/index column",
-		Dialect: "mysql",
-		SetUpScript: []string{
-			"create table auto_no_primary (i int auto_increment, index(i))",
-			"insert into auto_no_primary (i) values (0), (0), (0)",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: "select * from auto_no_primary order by 1",
-				Expected: []sql.Row{
-					{1}, {2}, {3},
-				},
-			},
-		},
-	},
-	{
-		Name:    "insert into auto_increment with multiple key/index columns",
-		Dialect: "mysql",
-		SetUpScript: []string{
-			"create table auto_no_primary (i int auto_increment, j int, index(i))",
-			"insert into auto_no_primary (i) values (0), (0), (0)",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: "select * from auto_no_primary order by 1",
-				Expected: []sql.Row{
-					{1, nil}, {2, nil}, {3, nil},
-				},
-			},
-		},
-	},
-	{
-		Name:    "auto increment table handles deletes",
-		Dialect: "mysql",
-		SetUpScript: []string{
-			"create table auto (pk int primary key auto_increment)",
-			"insert into auto values (10)",
-			"delete from auto where pk = 10",
-			"insert into auto values (NULL)",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: "select * from auto order by 1",
-				Expected: []sql.Row{
-					{11},
-				},
-			},
-		},
-	},
-	{
-		Name:    "create auto_increment table with out-of-line primary key def",
-		Dialect: "mysql",
-		SetUpScript: []string{
-			`create table auto (
-				pk int auto_increment,
-				c0 int,
-				primary key(pk)
-			);`,
-			"insert into auto values (NULL,10), (NULL,20), (NULL,30)",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: "select * from auto order by 1",
-				Expected: []sql.Row{
-					{1, 10}, {2, 20}, {3, 30},
-				},
-			},
-		},
-	},
-	{
-		Name:    "alter auto_increment value",
-		Dialect: "mysql",
-		SetUpScript: []string{
-			`create table auto (
-				pk int auto_increment,
-				c0 int,
-				primary key(pk)
-			);`,
-			"insert into auto values (NULL,10), (NULL,20), (NULL,30)",
-			"alter table auto auto_increment 9;",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query:    "SELECT AUTO_INCREMENT FROM information_schema.tables WHERE table_name = 'auto' AND table_schema = DATABASE()",
-				Expected: []sql.Row{{uint64(9)}},
-			},
-			{
-				Query: "insert into auto values (NULL,90)",
-				Expected: []sql.Row{{types.OkResult{
-					RowsAffected: 1,
-					InsertID:     9,
-				}}},
-			},
-			{
-				Query: "select * from auto order by 1",
-				Expected: []sql.Row{
-					{1, 10}, {2, 20}, {3, 30}, {9, 90},
-				},
-			},
-		},
-	},
-	{
-		Name:    "alter auto_increment value to float",
-		Dialect: "mysql",
-		SetUpScript: []string{
-			`create table auto (
-				pk int auto_increment,
-				c0 int,
-				primary key(pk)
-			);`,
-			"insert into auto values (NULL,10), (NULL,20), (NULL,30)",
-			"alter table auto auto_increment = 19.9;",
-			"insert into auto values (NULL,190)",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: "select * from auto order by 1",
-				Expected: []sql.Row{
-					{1, 10}, {2, 20}, {3, 30}, {19, 190},
-				},
-			},
-		},
-	},
-	{
-		Name:    "auto increment on tinyint",
-		Dialect: "mysql",
-		SetUpScript: []string{
-			"create table auto (pk tinyint primary key auto_increment)",
-			"insert into auto values (NULL),(10),(0)",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: "select * from auto order by 1",
-				Expected: []sql.Row{
-					{1}, {10}, {11},
-				},
-			},
-		},
-	},
-	{
-		Name:    "auto increment on smallint",
-		Dialect: "mysql",
-		SetUpScript: []string{
-			"create table auto (pk smallint primary key auto_increment)",
-			"insert into auto values (NULL),(10),(0)",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: "select * from auto order by 1",
-				Expected: []sql.Row{
-					{1}, {10}, {11},
-				},
-			},
-		},
-	},
-	{
-		Name:    "auto increment on mediumint",
-		Dialect: "mysql",
-		SetUpScript: []string{
-			"create table auto (pk mediumint primary key auto_increment)",
-			"insert into auto values (NULL),(10),(0)",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: "select * from auto order by 1",
-				Expected: []sql.Row{
-					{1}, {10}, {11},
-				},
-			},
-		},
-	},
-	{
-		Name:    "auto increment on int",
-		Dialect: "mysql",
-		SetUpScript: []string{
-			"create table auto (pk int primary key auto_increment)",
-			"insert into auto values (NULL),(10),(0)",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: "select * from auto order by 1",
-				Expected: []sql.Row{
-					{1}, {10}, {11},
-				},
-			},
-		},
-	},
-	{
-		Name:    "auto increment on bigint",
-		Dialect: "mysql",
-		SetUpScript: []string{
-			"create table auto (pk bigint primary key auto_increment)",
-			"insert into auto values (NULL),(10),(0)",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: "select * from auto order by 1",
-				Expected: []sql.Row{
-					{1}, {10}, {11},
-				},
-			},
-		},
-	},
-	{
-		Name:    "auto increment on tinyint unsigned",
-		Dialect: "mysql",
-		SetUpScript: []string{
-			"create table auto (pk tinyint unsigned primary key auto_increment)",
-			"insert into auto values (NULL),(10),(0)",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: "select * from auto order by 1",
-				Expected: []sql.Row{
-					{uint64(1)}, {uint64(10)}, {uint64(11)},
-				},
-			},
-		},
-	},
-	{
-		Name:    "auto increment on smallint unsigned",
-		Dialect: "mysql",
-		SetUpScript: []string{
-			"create table auto (pk smallint unsigned primary key auto_increment)",
-			"insert into auto values (NULL),(10),(0)",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: "select * from auto order by 1",
-				Expected: []sql.Row{
-					{uint64(1)}, {uint64(10)}, {uint64(11)},
-				},
-			},
-		},
-	},
-	{
-		Name:    "auto increment on mediumint unsigned",
-		Dialect: "mysql",
-		SetUpScript: []string{
-			"create table auto (pk mediumint unsigned primary key auto_increment)",
-			"insert into auto values (NULL),(10),(0)",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: "select * from auto order by 1",
-				Expected: []sql.Row{
-					{uint64(1)}, {uint64(10)}, {uint64(11)},
-				},
-			},
-		},
-	},
-	{
-		Name:    "auto increment on int unsigned",
-		Dialect: "mysql",
-		SetUpScript: []string{
-			"create table auto (pk int unsigned primary key auto_increment)",
-			"insert into auto values (NULL),(10),(0)",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: "select * from auto order by 1",
-				Expected: []sql.Row{
-					{uint64(1)}, {uint64(10)}, {uint64(11)},
-				},
-			},
-		},
-	},
-	{
-		Name:    "auto increment on bigint unsigned",
-		Dialect: "mysql",
-		SetUpScript: []string{
-			"create table auto (pk bigint unsigned primary key auto_increment)",
-			"insert into auto values (NULL),(10),(0)",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: "select * from auto order by 1",
-				Expected: []sql.Row{
-					{uint64(1)}, {uint64(10)}, {uint64(11)},
-				},
-			},
-		},
-	},
-	{
-		Name:    "sql_mode=NO_auto_value_ON_ZERO",
-		Dialect: "mysql",
-		SetUpScript: []string{
-			"set @old_sql_mode=@@sql_mode;",
-			"set @@sql_mode='NO_auto_value_ON_ZERO';",
-			"create table auto (i int auto_increment, index (i));",
-			"create table auto_pk (i int auto_increment primary key);",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: "select auto_increment from information_schema.tables where table_name='auto' and table_schema=database()",
-				Expected: []sql.Row{
-					{nil},
-				},
-			},
-			{
-				Query: "insert into auto values (0), (0), (1-1)",
-				Expected: []sql.Row{
-					{types.OkResult{RowsAffected: 3, InsertID: 0}},
-				},
-			},
-			{
-				Query: "select * from auto order by i",
-				Expected: []sql.Row{
-					{0},
-					{0},
-					{0},
-				},
-			},
-			{
-				Query: "select auto_increment from information_schema.tables where table_name='auto' and table_schema=database()",
-				Expected: []sql.Row{
-					{nil},
-				},
-			},
-			{
-				Query: "insert into auto values (1)",
-				Expected: []sql.Row{
-					{types.OkResult{RowsAffected: 1, InsertID: 1}},
-				},
-			},
-			{
-				Query: "select auto_increment from information_schema.tables where table_name='auto' and table_schema=database()",
-				Expected: []sql.Row{
-					{uint64(2)},
-				},
-			},
-
-			{
-				Query: "select auto_increment from information_schema.tables where table_name='auto_pk' and table_schema=database()",
-				Expected: []sql.Row{
-					{nil},
-				},
-			},
-			{
-				Query: "insert into auto_pk values (0), (1), (NULL), ()",
-				Expected: []sql.Row{
-					{types.OkResult{RowsAffected: 4}},
-				},
-			},
-			{
-				Query: "select * from auto_pk",
-				Expected: []sql.Row{
-					{0},
-					{1},
-					{2},
-					{3},
-				},
-			},
-			{
-				Query: "select auto_increment from information_schema.tables where table_name='auto_pk' and table_schema=database()",
-				Expected: []sql.Row{
-					{uint64(4)},
-				},
-			},
-
-			{
-				// restore old sql_mode just in case
-				SkipResultsCheck: true,
-				Query:            "set @@sql_mode=@old_sql_mode",
 			},
 		},
 	},
@@ -1658,6 +1411,19 @@ var InsertScripts = []ScriptTest{
 		},
 	},
 	{
+		Name: "table with defaults, insert with on duplicate key update",
+		SetUpScript: []string{
+			"create table t (a int primary key, b int default 100);",
+			"insert into t values (1, 1), (2, 2)",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "insert into t values (1, 10) on duplicate key update b = 10",
+				Expected: []sql.Row{{types.NewOkResult(2)}},
+			},
+		},
+	},
+	{
 		Name: "Insert on duplicate key references table in subquery",
 		SetUpScript: []string{
 			`create table a (i int primary key)`,
@@ -1848,6 +1614,19 @@ var InsertScripts = []ScriptTest{
 			},
 		},
 	},
+	// https://github.com/dolthub/dolt/issues/6500
+	{
+		Name:    "Test INSERT aliases in duplicate-key updates",
+		Dialect: "mysql",
+		SetUpScript: []string{
+			"CREATE TABLE alias_insert(a INT PRIMARY KEY,b INT,c INT)",
+			"INSERT INTO alias_insert VALUES(1,0,0)",
+			"INSERT INTO alias_insert(a,b,c) VALUES(1,2,3),(4,5,6) AS new(m,n,p) ON DUPLICATE KEY UPDATE c=m+n",
+		},
+		Assertions: []ScriptTestAssertion{
+			{Query: "SELECT * FROM alias_insert ORDER BY a", Expected: []sql.Row{{int32(1), int32(0), int32(3)}, {int32(4), int32(5), int32(6)}}},
+		},
+	},
 	{
 		Name: "Insert throws primary key violations",
 		SetUpScript: []string{
@@ -1885,7 +1664,7 @@ var InsertScripts = []ScriptTest{
 		Name: "Insert throws unique key violations",
 		SetUpScript: []string{
 			"CREATE TABLE t (pk int PRIMARY key, col1 int UNIQUE);",
-			"CREATE TABLE t2 (pk int PRIMARY key, col1 int, col2 int, UNIQUE KEY (col1, col2));",
+			"CREATE TABLE t2 (pk int PRIMARY key, col1 int, col2 int, CONSTRAINT col1_col2 UNIQUE KEY (col1, col2));",
 			"INSERT into t VALUES (1, 1);",
 			"INSERT into t2 VALUES (1, 1, 1);",
 		},
@@ -1936,7 +1715,7 @@ var InsertScripts = []ScriptTest{
 		Name: "Insert throws unique key violations for keyless tables",
 		SetUpScript: []string{
 			"CREATE TABLE t (not_pk int NOT NULL, col1 int UNIQUE);",
-			"CREATE TABLE t2 (not_pk int NOT NULL, col1 int, col2 int, UNIQUE KEY (col1, col2));",
+			"CREATE TABLE t2 (not_pk int NOT NULL, col1 int, col2 int, CONSTRAINT col1_col2 UNIQUE KEY (col1, col2));",
 			"INSERT into t VALUES (1, 1);",
 			"INSERT into t2 VALUES (1, 1, 1);",
 		},
@@ -2049,12 +1828,12 @@ var InsertScripts = []ScriptTest{
 				},
 			},
 			{
-				Query:          "insert into t2(d) select t from t1 where i = 3;",
-				ExpectedErrStr: "Incorrect datetime value: ''",
+				Query:       "insert into t2(d) select t from t1 where i = 3;",
+				ExpectedErr: sql.ErrIncorrectValue,
 			},
 			{
-				Query:          "insert into t2(d) select t from t1 where i = 2;",
-				ExpectedErrStr: "Incorrect datetime value: 'badtime'",
+				Query:       "insert into t2(d) select t from t1 where i = 2;",
+				ExpectedErr: sql.ErrIncorrectValue,
 			},
 			{
 				Query: "insert into t2(d) select t from t1 where i = 1;",
@@ -2369,6 +2148,48 @@ var InsertScripts = []ScriptTest{
 			},
 		},
 	},
+	{
+		Name:    "inserting DATETIMEs with warnings",
+		Dialect: "mysql",
+		SetUpScript: []string{
+			"create table t (dt datetime(6))",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:       "insert into t values ('baddatetime');",
+				ExpectedErr: sql.ErrIncorrectValue,
+			},
+			{
+				Query:       "insert into t values ('2001-02-03abc');",
+				ExpectedErr: sql.ErrInvalidValue,
+			},
+			{
+				Query: "insert into t values ('2001-02-03 ');",
+				Expected: []sql.Row{
+					{types.OkResult{
+						RowsAffected: 1,
+					}}},
+				ExpectedWarningsCount: 1,
+				ExpectedWarning:       4096,
+			},
+			{
+				Query: "insert ignore into t values ('   2002-03-04     ')",
+				Expected: []sql.Row{
+					{types.OkResult{
+						RowsAffected: 1,
+					}}},
+				ExpectedWarningsCount: 1,
+				ExpectedWarning:       4096,
+			},
+			{
+				Query: "select cast(dt as char) from t order by dt",
+				Expected: []sql.Row{
+					{"2001-02-03 00:00:00.000000"},
+					{"2002-03-04 00:00:00.000000"},
+				},
+			},
+		},
+	},
 }
 
 var InsertDuplicateKeyKeyless = []ScriptTest{
@@ -2610,6 +2431,159 @@ var InsertDuplicateKeyKeyless = []ScriptTest{
 			},
 		},
 	},
+	{
+		// https://github.com/dolthub/dolt/issues/11389
+		Name: "INSERT...ON DUPLICATE KEY UPDATE works with DEFAULT update value",
+		// TODO: This test should work in Doltgres. Even though standard Postgres doesn't support
+		//  ON DUPLICATE KEY UPDATE, it works in Doltgres. The problem is that Doltgres panics when DEFAULT is used
+		//  inside an ON UPDATE KEY UPDATE clause
+		//  https://github.com/dolthub/doltgresql/issues/3045
+		Dialect: "mysql",
+		SetUpScript: []string{
+			"CREATE TABLE t(id INT PRIMARY KEY, a INT DEFAULT 1);",
+			"INSERT INTO t VALUES (1, 5);",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "INSERT INTO t(id) VALUES (1) ON DUPLICATE KEY UPDATE a = DEFAULT;",
+				Expected: []sql.Row{{types.NewOkResult(2)}},
+			},
+			{
+				Query:    "SELECT * from t;",
+				Expected: []sql.Row{{1, 1}},
+			},
+		},
+	},
+	{
+		// REPLACE is MySQL-only.
+		Dialect: "mysql",
+		Name:    "replace conflicting secondary unique key",
+		SetUpScript: []string{
+			"CREATE TABLE r6 (a INT, b INT, c INT, UNIQUE(a), UNIQUE(b))",
+			"INSERT INTO r6 VALUES (1,1,1)",
+		},
+		Assertions: []ScriptTestAssertion{
+			{Query: "REPLACE INTO r6 VALUES (2,1,1)", Expected: []sql.Row{{types.NewOkResult(2)}}},
+			{Query: "SELECT * FROM r6", Expected: []sql.Row{{2, 1, 1}}},
+			{Query: "SELECT * FROM r6 FORCE INDEX(a) WHERE a = 2", Expected: []sql.Row{{2, 1, 1}}},
+			{Query: "SELECT * FROM r6 FORCE INDEX(a) WHERE a = 1", Expected: []sql.Row{}},
+			{Query: "SELECT * FROM r6 FORCE INDEX(b) WHERE b = 1", Expected: []sql.Row{{2, 1, 1}}},
+			{Query: "REPLACE INTO r6 VALUES (2,1,1)", Expected: []sql.Row{{types.NewOkResult(2)}}},
+			{Query: "SELECT * FROM r6", Expected: []sql.Row{{2, 1, 1}}},
+		},
+	},
+	{
+		// MySQL REPLACE can delete multiple conflicting rows.
+		Dialect: "mysql",
+		Name:    "replace conflicts with different rows",
+		SetUpScript: []string{
+			"CREATE TABLE t (a INT, b INT, c INT, UNIQUE(a), UNIQUE(b))",
+			"INSERT INTO t VALUES (1,1,1),(2,2,2)",
+		},
+		Assertions: []ScriptTestAssertion{
+			// TODO: The affected-row count for multiple conflicts is a separate MySQL compatibility issue
+			{Query: "REPLACE INTO t VALUES (1,2,3)", SkipResultsCheck: true},
+			{Query: "SELECT * FROM t", Expected: []sql.Row{{1, 2, 3}}},
+			{Query: "SELECT * FROM t FORCE INDEX(a) WHERE a IN (1,2)", Expected: []sql.Row{{1, 2, 3}}},
+			{Query: "SELECT * FROM t FORCE INDEX(b) WHERE b IN (1,2)", Expected: []sql.Row{{1, 2, 3}}},
+		},
+	},
+	{
+		// REPLACE and DELETE LIMIT are MySQL-only.
+		Dialect: "mysql",
+		Name:    "nullable unique keys and nonunique cardinality",
+		SetUpScript: []string{
+			"CREATE TABLE t (a INT, b INT, c INT, UNIQUE(a), UNIQUE(b), KEY c_idx(c))",
+			"INSERT INTO t VALUES (NULL,1,1),(NULL,NULL,1)",
+		},
+		Assertions: []ScriptTestAssertion{
+			{Query: "REPLACE INTO t VALUES (2,1,1),(NULL,NULL,1),(NULL,NULL,1)", Expected: []sql.Row{{types.NewOkResult(4)}}},
+			{Query: "SELECT * FROM t ORDER BY a,b,c", Expected: []sql.Row{{nil, nil, 1}, {nil, nil, 1}, {nil, nil, 1}, {2, 1, 1}}},
+			{Query: "SELECT * FROM t FORCE INDEX(c_idx) WHERE c = 1 ORDER BY a,b,c", Expected: []sql.Row{{nil, nil, 1}, {nil, nil, 1}, {nil, nil, 1}, {2, 1, 1}}},
+			{Query: "DELETE FROM t WHERE a IS NULL LIMIT 1", Expected: []sql.Row{{types.NewOkResult(1)}}},
+			{Query: "SELECT * FROM t FORCE INDEX(c_idx) WHERE c = 1 ORDER BY a,b,c", Expected: []sql.Row{{nil, nil, 1}, {nil, nil, 1}, {2, 1, 1}}},
+		},
+	},
+	{
+		// ON DUPLICATE KEY UPDATE is MySQL-only.
+		Dialect: "mysql",
+		Name:    "on duplicate key update does not publish rejected index entries",
+		SetUpScript: []string{
+			"CREATE TABLE t (a INT, b INT, c INT, UNIQUE(a), UNIQUE(b))",
+			"INSERT INTO t VALUES (1,1,1)",
+		},
+		Assertions: []ScriptTestAssertion{
+			{Query: "INSERT INTO t VALUES (2,1,2) ON DUPLICATE KEY UPDATE c = c + 1", SkipResultsCheck: true},
+			{Query: "INSERT INTO t VALUES (2,2,3)", Expected: []sql.Row{{types.NewOkResult(1)}}},
+			{Query: "SELECT * FROM t ORDER BY a", Expected: []sql.Row{{1, 1, 2}, {2, 2, 3}}},
+			{Query: "SELECT * FROM t FORCE INDEX(a) WHERE a = 2", Expected: []sql.Row{{2, 2, 3}}},
+			{Query: "SELECT * FROM t FORCE INDEX(b) WHERE b = 1", Expected: []sql.Row{{1, 1, 2}}},
+		},
+	},
+	{
+		Name: "update retains unique key checks",
+		SetUpScript: []string{
+			"CREATE TABLE t (a INT, b INT, c INT, UNIQUE(a), UNIQUE(b))",
+			"INSERT INTO t VALUES (1,1,1),(2,2,2)",
+		},
+		Assertions: []ScriptTestAssertion{
+			{Query: "UPDATE t SET a = 3, b = 1 WHERE a = 2", ExpectedErr: sql.ErrUniqueKeyViolation},
+			{Query: "SELECT * FROM t ORDER BY a", Expected: []sql.Row{{1, 1, 1}, {2, 2, 2}}},
+			{Query: "UPDATE t SET a = 3, b = 3 WHERE a = 2", SkipResultsCheck: true},
+			{Query: "SELECT * FROM t ORDER BY a", Expected: []sql.Row{{1, 1, 1}, {3, 3, 2}}},
+			{Dialect: "mysql", Query: "SELECT * FROM t FORCE INDEX(a) WHERE a = 3", Expected: []sql.Row{{3, 3, 2}}},
+			{Dialect: "mysql", Query: "SELECT * FROM t FORCE INDEX(b) WHERE b = 3", Expected: []sql.Row{{3, 3, 2}}},
+		},
+	},
+	{
+		Name: "multirow duplicate rolls back every index",
+		SetUpScript: []string{
+			"CREATE TABLE t (a INT, b INT, c INT, UNIQUE(a), UNIQUE(b))",
+			"INSERT INTO t VALUES (1,1,1)",
+		},
+		Assertions: []ScriptTestAssertion{
+			{Query: "INSERT INTO t VALUES (2,2,2),(3,1,3)", ExpectedErr: sql.ErrUniqueKeyViolation},
+			{Query: "SELECT * FROM t", Expected: []sql.Row{{1, 1, 1}}},
+			{Query: "INSERT INTO t VALUES (2,2,2)", Expected: []sql.Row{{types.NewOkResult(1)}}},
+			{Query: "SELECT * FROM t ORDER BY a", Expected: []sql.Row{{1, 1, 1}, {2, 2, 2}}},
+			{Dialect: "mysql", Query: "SELECT * FROM t FORCE INDEX(a) WHERE a >= 1 ORDER BY a", Expected: []sql.Row{{1, 1, 1}, {2, 2, 2}}},
+			{Dialect: "mysql", Query: "SELECT * FROM t FORCE INDEX(b) WHERE b >= 1 ORDER BY b", Expected: []sql.Row{{1, 1, 1}, {2, 2, 2}}},
+		},
+	},
+	{
+		// REPLACE and prefix-index syntax are MySQL-only.
+		Dialect: "mysql",
+		Name:    "replace composite and prefix unique keys",
+		SetUpScript: []string{
+			"CREATE TABLE t (a INT, b INT, c VARCHAR(10), UNIQUE ab(a,b), UNIQUE c_prefix(c(2)))",
+			"INSERT INTO t VALUES (1,1,'aaaa')",
+		},
+		Assertions: []ScriptTestAssertion{
+			{Query: "REPLACE INTO t VALUES (2,2,'aabb')", Expected: []sql.Row{{types.NewOkResult(2)}}},
+			{Query: "SELECT * FROM t", Expected: []sql.Row{{2, 2, "aabb"}}},
+			{Query: "SELECT * FROM t FORCE INDEX(ab) WHERE a = 2 AND b = 2", Expected: []sql.Row{{2, 2, "aabb"}}},
+			{Query: "SELECT * FROM t FORCE INDEX(c_prefix) WHERE c LIKE 'aa%'", Expected: []sql.Row{{2, 2, "aabb"}}},
+		},
+	},
+	{
+		// PostgreSQL does not support REPLACE or indexes on virtual generated columns.
+		Dialect: "mysql",
+		Name:    "replace and ignore reuse virtual unique keys",
+		SetUpScript: []string{
+			"CREATE TABLE t (a INT, b INT, v INT AS (b + 100) VIRTUAL, UNIQUE(a), UNIQUE(v))",
+			"INSERT INTO t (a,b) VALUES (1,1)",
+		},
+		Assertions: []ScriptTestAssertion{
+			{Query: "REPLACE INTO t (a,b) VALUES (2,1)", Expected: []sql.Row{{types.NewOkResult(2)}}},
+			{Query: "SELECT * FROM t", Expected: []sql.Row{{2, 1, 101}}},
+			{Query: "SELECT * FROM t FORCE INDEX(a) WHERE a = 2", Expected: []sql.Row{{2, 1, 101}}},
+			{Query: "SELECT * FROM t FORCE INDEX(v) WHERE v = 101", Expected: []sql.Row{{2, 1, 101}}},
+			{Query: "INSERT IGNORE INTO t (a,b) VALUES (3,1),(3,3)", SkipResultsCheck: true},
+			{Query: "SELECT * FROM t ORDER BY a", Expected: []sql.Row{{2, 1, 101}, {3, 3, 103}}},
+			{Query: "UPDATE t SET b = 2 WHERE a = 3", SkipResultsCheck: true},
+			{Query: "SELECT * FROM t FORCE INDEX(v) WHERE v >= 100 ORDER BY a", Expected: []sql.Row{{2, 1, 101}, {3, 2, 102}}},
+		},
+	},
 }
 
 var InsertErrorTests = []GenericErrorQueryTest{
@@ -2697,21 +2671,6 @@ var InsertErrorTests = []GenericErrorQueryTest{
 
 var InsertErrorScripts = []ScriptTest{
 	{
-		Name:        "create table with non-pk auto_increment column",
-		Query:       "create table bad (pk int primary key, c0 int auto_increment);",
-		ExpectedErr: sql.ErrInvalidAutoIncCols,
-	},
-	{
-		Name:        "create multiple auto_increment columns",
-		Query:       "create table bad (pk1 int auto_increment, pk2 int auto_increment, primary key (pk1,pk2));",
-		ExpectedErr: sql.ErrInvalidAutoIncCols,
-	},
-	{
-		Name:        "create auto_increment column with default",
-		Query:       "create table bad (pk1 int auto_increment default 10, c0 int);",
-		ExpectedErr: sql.ErrInvalidAutoIncCols,
-	},
-	{
 		Name: "try inserting string that is too long",
 		SetUpScript: []string{
 			"create table bad (s varchar(9))",
@@ -2742,309 +2701,6 @@ var InsertErrorScripts = []ScriptTest{
 		},
 		Query:       "insert into t values ('2020-01-01 a')",
 		ExpectedErr: sql.ErrInvalidValue,
-	},
-}
-
-var InsertIgnoreScripts = []ScriptTest{
-	{
-		Name: "Test that INSERT IGNORE with Non nullable columns works",
-		SetUpScript: []string{
-			"CREATE TABLE x (pk int primary key, c1 varchar(20) NOT NULL);",
-			"INSERT IGNORE INTO x VALUES (1, NULL)",
-			"CREATE TABLE y (pk int primary key, c1 int NOT NULL);",
-			"INSERT IGNORE INTO y VALUES (1, NULL);",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: "SELECT * FROM x",
-				Expected: []sql.Row{
-					{1, ""},
-				},
-			},
-			{
-				Query: "SELECT * FROM y",
-				Expected: []sql.Row{
-					{1, 0},
-				},
-			},
-			{
-				Query: "INSERT IGNORE INTO y VALUES (2, NULL)",
-				Expected: []sql.Row{
-					{types.OkResult{RowsAffected: 1}},
-				},
-				ExpectedWarningsCount: 1,
-				ExpectedWarning:       mysql.ERBadNullError,
-			},
-		},
-	},
-	{
-		Name: "Test that INSERT IGNORE properly addresses data conversion",
-		SetUpScript: []string{
-			"CREATE TABLE t1 (pk int primary key, v1 int)",
-			"CREATE TABLE t2 (pk int primary key, v2 varchar(1))",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: "INSERT IGNORE INTO t1 VALUES (1, 'dasd')",
-				Expected: []sql.Row{
-					{types.OkResult{RowsAffected: 1}},
-				},
-				ExpectedWarningsCount: 1,
-				ExpectedWarning:       mysql.ERTruncatedWrongValueForField,
-			},
-			{
-				Query: "SELECT * FROM t1",
-				Expected: []sql.Row{
-					{1, 0},
-				},
-			},
-			{
-				Query: "INSERT IGNORE INTO t2 values (1, 'adsda')",
-				Expected: []sql.Row{
-					{types.OkResult{RowsAffected: 1}},
-				},
-				ExpectedWarningsCount: 1,
-				ExpectedWarning:       mysql.ERUnknownError,
-			},
-			{
-				Query: "SELECT * FROM t2",
-				Expected: []sql.Row{
-					{1, "a"},
-				},
-			},
-		},
-	},
-	{
-		Name: "Insert Ignore works correctly with ON DUPLICATE UPDATE",
-		SetUpScript: []string{
-			"CREATE TABLE t1 (id INT PRIMARY KEY, v int);",
-			"INSERT INTO t1 VALUES (1,1)",
-			"CREATE TABLE t2 (pk int primary key, v2 varchar(1))",
-			"ALTER TABLE t2 ADD CONSTRAINT cx CHECK (pk < 100)",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: "INSERT IGNORE INTO t1 VALUES (1,2) ON DUPLICATE KEY UPDATE v='dsd';",
-				Expected: []sql.Row{
-					{types.OkResult{RowsAffected: 2}},
-				},
-				ExpectedWarningsCount: 1,
-				ExpectedWarning:       mysql.ERTruncatedWrongValueForField,
-			},
-			{
-				Query: "SELECT * FROM t1",
-				Expected: []sql.Row{
-					{1, 0},
-				},
-			},
-			{
-				Query: "INSERT IGNORE INTO t2 values (1, 'adsda')",
-				Expected: []sql.Row{
-					{types.OkResult{RowsAffected: 1}},
-				},
-				ExpectedWarningsCount: 1,
-				ExpectedWarning:       mysql.ERUnknownError,
-			},
-			{
-				Query: "SELECT * FROM t2",
-				Expected: []sql.Row{
-					{1, "a"},
-				},
-			},
-			{
-				Query:    "INSERT IGNORE INTO t2 VALUES (1, 's') ON DUPLICATE KEY UPDATE pk = 1000", // violates constraint
-				Expected: []sql.Row{{types.OkResult{RowsAffected: 0}}},
-			},
-			{
-				Query: "SELECT * FROM t2",
-				Expected: []sql.Row{
-					{1, "a"},
-				},
-			},
-		},
-	},
-	{
-		Name: "Test that INSERT IGNORE INTO works with unique keys",
-		SetUpScript: []string{
-			"CREATE TABLE one_uniq(pk int PRIMARY KEY, col1 int UNIQUE)",
-			"CREATE TABLE two_uniq(pk int PRIMARY KEY, col1 int, col2 int, UNIQUE KEY col1_col2_uniq (col1, col2))",
-			"INSERT INTO one_uniq values (1, 1)",
-			"INSERT INTO two_uniq values (1, 1, 1)",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: "INSERT IGNORE INTO one_uniq VALUES (3, 2), (2, 1), (4, null), (5, null)",
-				Expected: []sql.Row{
-					{types.OkResult{RowsAffected: 3}},
-				},
-				ExpectedWarningsCount: 1,
-				ExpectedWarning:       mysql.ERDupEntry,
-			},
-			{
-				Query: "SELECT * from one_uniq;",
-				Expected: []sql.Row{
-					{1, 1}, {3, 2}, {4, nil}, {5, nil},
-				},
-			},
-			{
-				Query: "INSERT IGNORE INTO two_uniq VALUES (4, 1, 2), (5, 2, 1), (6, null, 1), (7, null, 1), (12, 1, 1), (8, 1, null), (9, 1, null), (10, null, null), (11, null, null)",
-				Expected: []sql.Row{
-					{types.OkResult{RowsAffected: 8}},
-				},
-				ExpectedWarningsCount: 1,
-				ExpectedWarning:       mysql.ERDupEntry,
-			},
-			{
-				Query: "SELECT * from two_uniq;",
-				Expected: []sql.Row{
-					{1, 1, 1}, {4, 1, 2}, {5, 2, 1}, {6, nil, 1}, {7, nil, 1}, {8, 1, nil}, {9, 1, nil}, {10, nil, nil}, {11, nil, nil},
-				},
-			},
-		},
-	},
-	{
-		// https://github.com/dolthub/dolt/issues/8611
-		Name: "issue 8611: insert ignore on enum type column",
-		SetUpScript: []string{
-			"create table test_table (x int auto_increment primary key, y enum('hello','bye'))",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query:       "insert into test_table values (1, 'invalid'), (2, 'comparative politics'), (3, null)",
-				ExpectedErr: types.ErrDataTruncatedForColumnAtRow,
-			},
-			{
-				Query:    "insert ignore into test_table values (1, 'invalid'), (2, 'bye'), (3, null)",
-				Expected: []sql.Row{{types.OkResult{RowsAffected: 3, InsertID: 1}}},
-				//ExpectedWarning: mysql.ERWarnDataTruncated, // TODO: incorrect code
-			},
-			{
-				Query:    "select * from test_table",
-				Expected: []sql.Row{{1, ""}, {2, "bye"}, {3, nil}},
-			},
-		},
-	},
-}
-
-var IgnoreWithDuplicateUniqueKeyKeylessScripts = []ScriptTest{
-	{
-		Name: "Test that INSERT IGNORE INTO works with unique keys on a keyless table",
-		SetUpScript: []string{
-			"CREATE TABLE one_uniq(not_pk int, value int UNIQUE)",
-			"CREATE TABLE two_uniq(not_pk int, col1 int, col2 int, UNIQUE KEY col1_col2_uniq (col1, col2));",
-			"INSERT INTO one_uniq values (1, 1)",
-			"INSERT INTO two_uniq values (1, 1, 1)",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: "INSERT IGNORE INTO one_uniq VALUES (3, 2), (2, 1), (4, null), (5, null)",
-				Expected: []sql.Row{
-					{types.OkResult{RowsAffected: 3}},
-				},
-				ExpectedWarningsCount: 1,
-				ExpectedWarning:       mysql.ERDupEntry,
-			},
-			{
-				Query: "SELECT * from one_uniq;",
-				Expected: []sql.Row{
-					{1, 1}, {3, 2}, {4, nil}, {5, nil},
-				},
-			},
-			{
-				Query: "INSERT IGNORE INTO two_uniq VALUES (4, 1, 2), (5, 2, 1), (6, null, 1), (7, null, 1), (12, 1, 1), (8, 1, null), (9, 1, null), (10, null, null), (11, null, null)",
-				Expected: []sql.Row{
-					{types.OkResult{RowsAffected: 8}},
-				},
-				ExpectedWarningsCount: 1,
-				ExpectedWarning:       mysql.ERDupEntry,
-			},
-			{
-				Query: "SELECT * from two_uniq;",
-				Expected: []sql.Row{
-					{1, 1, 1}, {4, 1, 2}, {5, 2, 1}, {6, nil, 1}, {7, nil, 1}, {8, 1, nil}, {9, 1, nil}, {10, nil, nil}, {11, nil, nil},
-				},
-			},
-		},
-	},
-	{
-		Name: "INSERT IGNORE INTO multiple violations of a unique secondary index",
-		SetUpScript: []string{
-			"CREATE TABLE keyless(pk int, val int)",
-			"INSERT INTO keyless values (1, 1), (2, 2), (3, 3)",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query:    "INSERT IGNORE INTO keyless VALUES (1, 2);",
-				Expected: []sql.Row{{types.NewOkResult(1)}},
-			},
-			{
-				Query:       "ALTER TABLE keyless ADD CONSTRAINT c UNIQUE(val)",
-				ExpectedErr: sql.ErrUniqueKeyViolation,
-			},
-			{
-				Query:    "DELETE FROM keyless where pk = 1 and val = 2",
-				Expected: []sql.Row{{types.NewOkResult(1)}},
-			},
-			{
-				Query:    "ALTER TABLE keyless ADD CONSTRAINT c UNIQUE(val)",
-				Expected: []sql.Row{{types.NewOkResult(0)}},
-			},
-			{
-				Query:                 "INSERT IGNORE INTO keyless VALUES (1, 3)",
-				Expected:              []sql.Row{{types.NewOkResult(0)}},
-				ExpectedWarningsCount: 1,
-				ExpectedWarning:       mysql.ERDupEntry,
-			},
-		},
-	},
-	{
-		Name: "UPDATE IGNORE keyless tables and secondary indexes",
-		SetUpScript: []string{
-			"CREATE TABLE keyless(pk int, val int)",
-			"INSERT INTO keyless VALUES (1, 1), (2, 2), (3, 3)",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query:    "UPDATE IGNORE keyless SET val = 2 where pk = 1",
-				Expected: []sql.Row{{NewUpdateResult(1, 1)}},
-			},
-			{
-				Query:    "SELECT * FROM keyless ORDER BY pk",
-				Expected: []sql.Row{{1, 2}, {2, 2}, {3, 3}},
-			},
-			{
-				Query:       "ALTER TABLE keyless ADD CONSTRAINT c UNIQUE(val)",
-				ExpectedErr: sql.ErrUniqueKeyViolation,
-			},
-			{
-				Query:    "UPDATE IGNORE keyless SET val = 1 where pk = 1",
-				Expected: []sql.Row{{NewUpdateResult(1, 1)}},
-			},
-			{
-				Query:    "ALTER TABLE keyless ADD CONSTRAINT c UNIQUE(val)",
-				Expected: []sql.Row{{types.NewOkResult(0)}},
-			},
-			{
-				Query:                 "UPDATE IGNORE keyless SET val = 3 where pk = 1",
-				Expected:              []sql.Row{{NewUpdateResult(1, 0)}},
-				ExpectedWarningsCount: 1,
-				ExpectedWarning:       mysql.ERDupEntry,
-			},
-			{
-				Query:    "SELECT * FROM keyless ORDER BY pk",
-				Expected: []sql.Row{{1, 1}, {2, 2}, {3, 3}},
-			},
-			{
-				Query:                 "UPDATE IGNORE keyless SET val = val + 1 ORDER BY pk",
-				Expected:              []sql.Row{{NewUpdateResult(3, 1)}},
-				ExpectedWarningsCount: 2,
-				ExpectedWarning:       mysql.ERDupEntry,
-			},
-			{
-				Query:    "SELECT * FROM keyless ORDER BY pk",
-				Expected: []sql.Row{{1, 1}, {2, 2}, {3, 4}},
-			},
-		},
 	},
 }
 
@@ -3079,110 +2735,6 @@ var InsertBrokenScripts = []ScriptTest{
 				},
 				ExpectedWarningsCount: 1,
 				ExpectedWarning:       mysql.ERTruncatedWrongValueForField,
-			},
-		},
-	},
-	{
-		// https://github.com/dolthub/dolt/issues/3157
-		Name: "auto increment does not increment on error",
-		SetUpScript: []string{
-			"create table auto1 (pk int primary key auto_increment);",
-			"insert into auto1 values (null);",
-			"create table auto2 (pk int primary key auto_increment, c int not null);",
-			"insert into auto2 values (null, 1);",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: "show create table auto1;",
-				Expected: []sql.Row{
-					{"auto1", "CREATE TABLE `auto1` (\n" +
-						"  `pk` int NOT NULL AUTO_INCREMENT,\n" +
-						"  PRIMARY KEY (`pk`)\n" +
-						") ENGINE=InnoDB AUTO_INCREMENT=2 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"},
-				},
-			},
-			{
-				Query:       "insert into auto1 values (1);",
-				ExpectedErr: sql.ErrPrimaryKeyViolation,
-			},
-			{
-				Query: "show create table auto1;",
-				Expected: []sql.Row{
-					{"auto1", "CREATE TABLE `auto1` (\n" +
-						"  `pk` int NOT NULL AUTO_INCREMENT,\n" +
-						"  PRIMARY KEY (`pk`)\n" +
-						") ENGINE=InnoDB AUTO_INCREMENT=2 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"},
-				},
-			},
-			{
-				Query: "insert into auto1 values (null);",
-				Expected: []sql.Row{
-					{types.OkResult{RowsAffected: 1, InsertID: 2}},
-				},
-			},
-			{
-				Query: "show create table auto1;",
-				Expected: []sql.Row{
-					{"auto1", "CREATE TABLE `auto1` (\n" +
-						"  `pk` int NOT NULL AUTO_INCREMENT,\n" +
-						"  PRIMARY KEY (`pk`)\n" +
-						") ENGINE=InnoDB AUTO_INCREMENT=3 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"},
-				},
-			},
-			{
-				Query: "select * from auto1;",
-				Expected: []sql.Row{
-					{1},
-					{2},
-				},
-			},
-
-			{
-				Query: "show create table auto2;",
-				Expected: []sql.Row{
-					{"auto2", "CREATE TABLE `auto2` (\n" +
-						"  `pk` int NOT NULL AUTO_INCREMENT,\n" +
-						"  `c` int NOT NULL,\n" +
-						"  PRIMARY KEY (`pk`)\n" +
-						") ENGINE=InnoDB AUTO_INCREMENT=2 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"},
-				},
-			},
-			{
-				Query:       "insert into auto2 values (null, null);",
-				ExpectedErr: sql.ErrInsertIntoNonNullableProvidedNull,
-			},
-			{
-				Query: "show create table auto2;",
-				Expected: []sql.Row{
-					{"auto2", "CREATE TABLE `auto2` (\n" +
-						"  `pk` int NOT NULL AUTO_INCREMENT,\n" +
-						"  `c` int NOT NULL,\n" +
-						"  PRIMARY KEY (`pk`)\n" +
-						") ENGINE=InnoDB AUTO_INCREMENT=2 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"},
-				},
-			},
-			{
-				Query: "insert into auto2 values (null, 2);",
-				Expected: []sql.Row{
-					{types.OkResult{RowsAffected: 1, InsertID: 2}},
-				},
-			},
-			{
-				Query: "show create table auto2;",
-				Expected: []sql.Row{
-					{"auto2", "CREATE TABLE `auto2` (\n" +
-						"  `pk` int NOT NULL AUTO_INCREMENT,\n" +
-						"  `c` int NOT NULL,\n" +
-						"  PRIMARY KEY (`pk`)\n" +
-						") ENGINE=InnoDB AUTO_INCREMENT=3 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"},
-				},
-			},
-			{
-				Query: "select * from auto2;",
-				Expected: []sql.Row{
-					{1, 1},
-					{2, 2},
-				},
 			},
 		},
 	},

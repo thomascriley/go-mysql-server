@@ -15,17 +15,17 @@
 package function
 
 import (
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"math"
 	"math/rand"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/apd/v3"
 	"github.com/dolthub/vitess/go/mysql"
-	"github.com/shopspring/decimal"
 
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/expression"
@@ -44,7 +44,7 @@ var _ sql.FunctionExpression = (*Rand)(nil)
 var _ sql.CollationCoercible = (*Rand)(nil)
 
 // NewRand creates a new Rand expression.
-func NewRand(exprs ...sql.Expression) (sql.Expression, error) {
+func NewRand(ctx *sql.Context, exprs ...sql.Expression) (sql.Expression, error) {
 	if len(exprs) > 1 {
 		return nil, sql.ErrInvalidArgumentNumber.New("rand", "0 or 1", len(exprs))
 	}
@@ -65,7 +65,7 @@ func (r *Rand) Description() string {
 }
 
 // Type implements sql.Expression.
-func (r *Rand) Type() sql.Type {
+func (r *Rand) Type(ctx *sql.Context) sql.Type {
 	return types.Float64
 }
 
@@ -80,7 +80,7 @@ func (r *Rand) IsNonDeterministic() bool {
 }
 
 // IsNullable implements sql.Expression
-func (r *Rand) IsNullable() bool {
+func (r *Rand) IsNullable(ctx *sql.Context) bool {
 	return false
 }
 
@@ -97,7 +97,7 @@ func (r *Rand) String() string {
 }
 
 // WithChildren implements sql.Expression.
-func (r *Rand) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (r *Rand) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) > 1 {
 		return nil, sql.ErrInvalidChildrenNumber.New(r, len(children), 1)
 	}
@@ -105,7 +105,7 @@ func (r *Rand) WithChildren(children ...sql.Expression) (sql.Expression, error) 
 		return r, nil
 	}
 
-	return NewRand(children[0])
+	return NewRand(ctx, children[0])
 }
 
 // Children implements sql.Expression
@@ -125,20 +125,11 @@ func (r *Rand) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 	// For child expressions, the mysql semantics are to seed the PRNG with an int64 value of the expression given. For
 	// non-numeric types, the seed will always be 0, which means that rand() will always return the same result for all
 	// non-numeric seed arguments.
-	e, err := r.Child.Eval(ctx, row)
+	seed, _, err := evalInt64(ctx, r.Child, row)
 	if err != nil {
 		return nil, err
 	}
-
-	e, _, err = types.Int64.Convert(ctx, e)
-	if err != nil {
-		if !sql.ErrTruncatedIncorrect.Is(err) {
-			return nil, err
-		}
-		ctx.Warn(mysql.ERTruncatedWrongValue, "%s", err.Error())
-	}
-
-	return rand.New(rand.NewSource(e.(int64))).Float64(), nil
+	return rand.New(rand.NewSource(seed)).Float64(), nil
 }
 
 // Sin is the SIN function
@@ -150,7 +141,7 @@ var _ sql.FunctionExpression = (*Sin)(nil)
 var _ sql.CollationCoercible = (*Sin)(nil)
 
 // NewSin returns a new SIN function expression
-func NewSin(arg sql.Expression) sql.Expression {
+func NewSin(ctx *sql.Context, arg sql.Expression) sql.Expression {
 	return &Sin{NewUnaryFunc(arg, "SIN", types.Float64)}
 }
 
@@ -187,11 +178,11 @@ func (s *Sin) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 }
 
 // WithChildren implements sql.Expression
-func (s *Sin) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (s *Sin) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 1 {
 		return nil, sql.ErrInvalidChildrenNumber.New(s, len(children), 1)
 	}
-	return NewSin(children[0]), nil
+	return NewSin(ctx, children[0]), nil
 }
 
 type Cos struct {
@@ -202,7 +193,7 @@ var _ sql.FunctionExpression = (*Cos)(nil)
 var _ sql.CollationCoercible = (*Cos)(nil)
 
 // NewCos returns a new COS function expression
-func NewCos(arg sql.Expression) sql.Expression {
+func NewCos(ctx *sql.Context, arg sql.Expression) sql.Expression {
 	return &Cos{NewUnaryFunc(arg, "COS", types.Float64)}
 }
 
@@ -239,11 +230,11 @@ func (s *Cos) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 }
 
 // WithChildren implements sql.Expression
-func (c *Cos) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (c *Cos) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 1 {
 		return nil, sql.ErrInvalidChildrenNumber.New(c, len(children), 1)
 	}
-	return NewCos(children[0]), nil
+	return NewCos(ctx, children[0]), nil
 }
 
 type Tan struct {
@@ -254,7 +245,7 @@ var _ sql.FunctionExpression = (*Tan)(nil)
 var _ sql.CollationCoercible = (*Tan)(nil)
 
 // NewTan returns a new TAN function expression
-func NewTan(arg sql.Expression) sql.Expression {
+func NewTan(ctx *sql.Context, arg sql.Expression) sql.Expression {
 	return &Tan{NewUnaryFunc(arg, "TAN", types.Float64)}
 }
 
@@ -269,7 +260,7 @@ func (*Tan) CollationCoercibility(ctx *sql.Context) (collation sql.CollationID, 
 }
 
 // IsNullable implements sql.Expression
-func (t *Tan) IsNullable() bool {
+func (t *Tan) IsNullable(ctx *sql.Context) bool {
 	return true
 }
 
@@ -301,11 +292,11 @@ func (t *Tan) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 }
 
 // WithChildren implements sql.Expression
-func (t *Tan) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (t *Tan) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 1 {
 		return nil, sql.ErrInvalidChildrenNumber.New(t, len(children), 1)
 	}
-	return NewTan(children[0]), nil
+	return NewTan(ctx, children[0]), nil
 }
 
 type Asin struct {
@@ -316,7 +307,7 @@ var _ sql.FunctionExpression = (*Asin)(nil)
 var _ sql.CollationCoercible = (*Asin)(nil)
 
 // NewAsin returns a new ASIN function expression
-func NewAsin(arg sql.Expression) sql.Expression {
+func NewAsin(ctx *sql.Context, arg sql.Expression) sql.Expression {
 	return &Asin{NewUnaryFunc(arg, "ASIN", types.Float64)}
 }
 
@@ -331,7 +322,7 @@ func (*Asin) CollationCoercibility(ctx *sql.Context) (collation sql.CollationID,
 }
 
 // IsNullable implements sql.Expression
-func (a *Asin) IsNullable() bool {
+func (a *Asin) IsNullable(ctx *sql.Context) bool {
 	return true
 }
 
@@ -363,11 +354,11 @@ func (a *Asin) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 }
 
 // WithChildren implements sql.Expression
-func (a *Asin) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (a *Asin) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 1 {
 		return nil, sql.ErrInvalidChildrenNumber.New(a, len(children), 1)
 	}
-	return NewAsin(children[0]), nil
+	return NewAsin(ctx, children[0]), nil
 }
 
 type Acos struct {
@@ -378,7 +369,7 @@ var _ sql.FunctionExpression = (*Acos)(nil)
 var _ sql.CollationCoercible = (*Acos)(nil)
 
 // NewAcos returns a new ACOS function expression
-func NewAcos(arg sql.Expression) sql.Expression {
+func NewAcos(ctx *sql.Context, arg sql.Expression) sql.Expression {
 	return &Acos{NewUnaryFunc(arg, "ACOS", types.Float64)}
 }
 
@@ -393,7 +384,7 @@ func (*Acos) CollationCoercibility(ctx *sql.Context) (collation sql.CollationID,
 }
 
 // IsNullable implements sql.Expression
-func (a *Acos) IsNullable() bool {
+func (a *Acos) IsNullable(ctx *sql.Context) bool {
 	return true
 }
 
@@ -425,11 +416,11 @@ func (a *Acos) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 }
 
 // WithChildren implements sql.Expression
-func (a *Acos) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (a *Acos) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 1 {
 		return nil, sql.ErrInvalidChildrenNumber.New(a, len(children), 1)
 	}
-	return NewAcos(children[0]), nil
+	return NewAcos(ctx, children[0]), nil
 }
 
 type Atan struct {
@@ -440,7 +431,7 @@ var _ sql.FunctionExpression = (*Atan)(nil)
 var _ sql.CollationCoercible = (*Atan)(nil)
 
 // NewAtan returns a new ATAN function expression
-func NewAtan(args ...sql.Expression) (sql.Expression, error) {
+func NewAtan(ctx *sql.Context, args ...sql.Expression) (sql.Expression, error) {
 	if len(args) == 1 {
 		return &Atan{x: expression.NewLiteral(1, types.Int32), y: args[0]}, nil
 	}
@@ -469,19 +460,19 @@ func (a *Atan) Resolved() bool {
 // String implements sql.Expression
 func (a *Atan) String() string {
 	if a.x != nil {
-		return fmt.Sprintf("%s(%s, %s)", a.FunctionName(), a.x, a.y)
+		return fmt.Sprintf("%s(%s, %s)", a.FunctionName(), a.y, a.x)
 	}
 	return fmt.Sprintf("%s(%s)", a.FunctionName(), a.y)
 }
 
 // Type implements sql.Expression
-func (a *Atan) Type() sql.Type {
+func (a *Atan) Type(ctx *sql.Context) sql.Type {
 	return types.Float64
 }
 
 // IsNullable implements sql.Expression
-func (a *Atan) IsNullable() bool {
-	return a.x.IsNullable() || a.y.IsNullable()
+func (a *Atan) IsNullable(ctx *sql.Context) bool {
+	return a.x.IsNullable(ctx) || a.y.IsNullable(ctx)
 }
 
 // Description implements sql.FunctionExpression
@@ -548,8 +539,8 @@ func (a *Atan) Children() []sql.Expression {
 }
 
 // WithChildren implements sql.Expression
-func (a *Atan) WithChildren(children ...sql.Expression) (sql.Expression, error) {
-	return NewAtan(children...)
+func (a *Atan) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
+	return NewAtan(ctx, children...)
 }
 
 type Cot struct {
@@ -560,7 +551,7 @@ var _ sql.FunctionExpression = (*Cot)(nil)
 var _ sql.CollationCoercible = (*Cot)(nil)
 
 // NewCot returns a new COT function expression
-func NewCot(arg sql.Expression) sql.Expression {
+func NewCot(ctx *sql.Context, arg sql.Expression) sql.Expression {
 	return &Cot{NewUnaryFunc(arg, "COT", types.Float64)}
 }
 
@@ -575,7 +566,7 @@ func (*Cot) CollationCoercibility(ctx *sql.Context) (collation sql.CollationID, 
 }
 
 // IsNullable implements sql.Expression
-func (c *Cot) IsNullable() bool {
+func (c *Cot) IsNullable(ctx *sql.Context) bool {
 	return true
 }
 
@@ -612,11 +603,11 @@ func (c *Cot) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 }
 
 // WithChildren implements sql.Expression
-func (c *Cot) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (c *Cot) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 1 {
 		return nil, sql.ErrInvalidChildrenNumber.New(c, len(children), 1)
 	}
-	return NewCot(children[0]), nil
+	return NewCot(ctx, children[0]), nil
 }
 
 type Degrees struct {
@@ -627,7 +618,7 @@ var _ sql.FunctionExpression = (*Degrees)(nil)
 var _ sql.CollationCoercible = (*Degrees)(nil)
 
 // NewDegrees returns a new DEGREES function expression
-func NewDegrees(arg sql.Expression) sql.Expression {
+func NewDegrees(ctx *sql.Context, arg sql.Expression) sql.Expression {
 	return &Degrees{NewUnaryFunc(arg, "DEGREES", types.Float64)}
 }
 
@@ -669,11 +660,11 @@ func (d *Degrees) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 }
 
 // WithChildren implements sql.Expression
-func (d *Degrees) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (d *Degrees) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 1 {
 		return nil, sql.ErrInvalidChildrenNumber.New(d, len(children), 1)
 	}
-	return NewDegrees(children[0]), nil
+	return NewDegrees(ctx, children[0]), nil
 }
 
 type Radians struct {
@@ -684,7 +675,7 @@ var _ sql.FunctionExpression = (*Radians)(nil)
 var _ sql.CollationCoercible = (*Radians)(nil)
 
 // NewRadians returns a new RADIANS function expression
-func NewRadians(arg sql.Expression) sql.Expression {
+func NewRadians(ctx *sql.Context, arg sql.Expression) sql.Expression {
 	return &Radians{NewUnaryFunc(arg, "RADIANS", types.Float64)}
 }
 
@@ -721,11 +712,11 @@ func (r *Radians) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 }
 
 // WithChildren implements sql.Expression
-func (r *Radians) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (r *Radians) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 1 {
 		return nil, sql.ErrInvalidChildrenNumber.New(r, len(children), 1)
 	}
-	return NewRadians(children[0]), nil
+	return NewRadians(ctx, children[0]), nil
 }
 
 type Crc32 struct {
@@ -736,7 +727,7 @@ var _ sql.FunctionExpression = (*Crc32)(nil)
 var _ sql.CollationCoercible = (*Crc32)(nil)
 
 // NewCrc32 returns a new CRC32 function expression
-func NewCrc32(arg sql.Expression) sql.Expression {
+func NewCrc32(ctx *sql.Context, arg sql.Expression) sql.Expression {
 	return &Crc32{NewUnaryFunc(arg, "CRC32", types.Uint32)}
 }
 
@@ -765,6 +756,8 @@ func (c *Crc32) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 	switch val := arg.(type) {
 	case string:
 		bytes = []byte(val)
+	case []byte:
+		bytes = val
 	case int8, int16, int32, int64, int:
 		val, _, err := types.Int64.Convert(ctx, arg)
 
@@ -801,11 +794,11 @@ func (c *Crc32) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 }
 
 // WithChildren implements sql.Expression
-func (c *Crc32) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (c *Crc32) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 1 {
 		return nil, sql.ErrInvalidChildrenNumber.New(c, len(children), 1)
 	}
-	return NewCrc32(children[0]), nil
+	return NewCrc32(ctx, children[0]), nil
 }
 
 func floatToString(f float64) string {
@@ -827,12 +820,9 @@ var _ sql.FunctionExpression = (*Sign)(nil)
 var _ sql.CollationCoercible = (*Sign)(nil)
 
 // NewSign returns a new SIGN function expression
-func NewSign(arg sql.Expression) sql.Expression {
+func NewSign(ctx *sql.Context, arg sql.Expression) sql.Expression {
 	return &Sign{NewUnaryFunc(arg, "SIGN", types.Int8)}
 }
-
-var negativeSignRegex = regexp.MustCompile(`^-[0-9]*\.?[0-9]*[1-9]`)
-var positiveSignRegex = regexp.MustCompile(`^+?[0-9]*\.?[0-9]*[1-9]`)
 
 // Description implements sql.FunctionExpression
 func (s *Sign) Description() string {
@@ -856,69 +846,92 @@ func (s *Sign) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 	}
 
 	switch typedVal := arg.(type) {
-	case int8, int16, int32, int64, float64, float32, int, decimal.Decimal:
-		val, _, err := types.Int64.Convert(ctx, arg)
-
-		if err != nil {
-			return nil, err
+	case int:
+		return signOfVal(typedVal), nil
+	case int8:
+		return signOfVal(typedVal), nil
+	case int16:
+		return signOfVal(typedVal), nil
+	case int32:
+		return signOfVal(typedVal), nil
+	case int64:
+		return signOfVal(typedVal), nil
+	case uint:
+		return signOfVal(typedVal), nil
+	case uint8:
+		return signOfVal(typedVal), nil
+	case uint16:
+		return signOfVal(typedVal), nil
+	case uint32:
+		return signOfVal(typedVal), nil
+	case uint64:
+		return signOfVal(typedVal), nil
+	case float32:
+		return signOfVal(typedVal), nil
+	case float64:
+		return signOfVal(typedVal), nil
+	case types.Timespan:
+		return signOfVal(typedVal), nil
+	case *apd.Decimal:
+		if typedVal == nil {
+			return nil, nil
 		}
-
-		n := val.(int64)
-		if n == 0 {
-			return int8(0), nil
-		} else if n < 0 {
-			return int8(-1), nil
-		}
-
-		return int8(1), nil
-
-	case uint8, uint16, uint32, uint64, uint:
-		val, _, err := types.Uint64.Convert(ctx, arg)
-
-		if err != nil {
-			return nil, err
-		}
-
-		n := val.(uint64)
-		if n == 0 {
-			return int8(0), nil
-		}
-
-		return int8(1), nil
-
+		return int8(typedVal.Sign()), nil
 	case bool:
 		if typedVal {
 			return int8(1), nil
 		}
-
 		return int8(0), nil
-
 	case time.Time:
 		return int8(1), nil
-
-	case string:
-		if negativeSignRegex.MatchString(typedVal) {
-			return int8(-1), nil
-		} else if positiveSignRegex.MatchString(typedVal) {
-			return int8(1), nil
+	case string, []byte:
+		var s string
+		if str, ok := typedVal.(string); ok {
+			s = str
+		} else {
+			s = string(typedVal.([]byte))
 		}
-
-		return int8(0), nil
+		prefix, didTrunc := types.TruncateStringToDouble(s, true)
+		if didTrunc {
+			ctx.Warn(mysql.ERTruncatedWrongValue, "%s", sql.ErrTruncatedIncorrect.New(types.Float64, s).Error())
+		}
+		f, err := strconv.ParseFloat(prefix, 64)
+		if err != nil && !errors.Is(err, strconv.ErrRange) {
+			return int8(0), nil
+		}
+		return signOfVal(f), nil
 	}
 
 	return int8(0), nil
 }
 
 // WithChildren implements sql.Expression
-func (s *Sign) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (s *Sign) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 1 {
 		return nil, sql.ErrInvalidChildrenNumber.New(s, len(children), 1)
 	}
-	return NewSign(children[0]), nil
+	return NewSign(ctx, children[0]), nil
+}
+
+type realNumeric interface {
+	~int | ~int8 | ~int16 | ~int32 | ~int64 |
+		~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64 |
+		~float32 | ~float64
+}
+
+// signOfVal returns 1, -1, or 0 based on whether v is positive, negative,
+// or zero.
+func signOfVal[T realNumeric](v T) int8 {
+	if v > 0 {
+		return 1
+	} else if v < 0 {
+		return -1
+	}
+	return 0
 }
 
 // NewMod returns a new MOD function expression
-func NewMod(args ...sql.Expression) (sql.Expression, error) {
+func NewMod(ctx *sql.Context, args ...sql.Expression) (sql.Expression, error) {
 	if len(args) != 2 {
 		return nil, sql.ErrInvalidArgumentNumber.New("mod", "2", len(args))
 	}
@@ -928,7 +941,7 @@ func NewMod(args ...sql.Expression) (sql.Expression, error) {
 
 type Pi struct{}
 
-func NewPi() sql.Expression {
+func NewPi(ctx *sql.Context) sql.Expression {
 	return &Pi{}
 }
 
@@ -956,7 +969,7 @@ func (p *Pi) String() string {
 }
 
 // Type implements sql.Expression
-func (p *Pi) Type() sql.Type {
+func (p *Pi) Type(ctx *sql.Context) sql.Type {
 	return types.Float64
 }
 
@@ -966,7 +979,7 @@ func (p *Pi) CollationCoercibility(ctx *sql.Context) (collation sql.CollationID,
 }
 
 // IsNullable implements sql.Expression
-func (p *Pi) IsNullable() bool {
+func (p *Pi) IsNullable(ctx *sql.Context) bool {
 	return false
 }
 
@@ -981,15 +994,15 @@ func (p *Pi) Children() []sql.Expression {
 }
 
 // WithChildren implements sql.Expression
-func (p *Pi) WithChildren(children ...sql.Expression) (sql.Expression, error) {
-	return sql.NillaryWithChildren(p, children...)
+func (p *Pi) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
+	return sql.NillaryWithChildren(ctx, p, children...)
 }
 
 type Exp struct {
 	*UnaryFunc
 }
 
-func NewExp(arg sql.Expression) sql.Expression {
+func NewExp(ctx *sql.Context, arg sql.Expression) sql.Expression {
 	return &Exp{NewUnaryFunc(arg, "EXP", types.Float64)}
 }
 
@@ -1002,7 +1015,7 @@ func (e *Exp) Description() string {
 }
 
 // Type implements the Expression interface.
-func (e *Exp) Type() sql.Type {
+func (e *Exp) Type(ctx *sql.Context) sql.Type {
 	return types.Float64
 }
 
@@ -1012,7 +1025,7 @@ func (e *Exp) CollationCoercibility(ctx *sql.Context) (collation sql.CollationID
 }
 
 // IsNullable implements sql.Expression
-func (e *Exp) IsNullable() bool {
+func (e *Exp) IsNullable(ctx *sql.Context) bool {
 	return true
 }
 
@@ -1049,9 +1062,9 @@ func (e *Exp) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 }
 
 // WithChildren implements the Expression interface.
-func (e *Exp) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (e *Exp) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 1 {
 		return nil, sql.ErrInvalidChildrenNumber.New(e, len(children), 1)
 	}
-	return NewExp(children[0]), nil
+	return NewExp(ctx, children[0]), nil
 }

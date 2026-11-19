@@ -28,32 +28,63 @@ import (
 )
 
 type Builder struct {
+	overrides sql.BuilderOverrides
 	// EventScheduler is used to communicate with the event scheduler
 	// for any EVENT related statements. It can be nil if EventScheduler is not defined.
 	scheduler       sql.EventScheduler
-	cat             sql.Catalog
 	authQueryState  sql.AuthorizationQueryState
 	parser          sql.Parser
 	currentDatabase sql.Database
+	cat             sql.Catalog
 
+	qFlags     *sql.QueryFlags
 	f          *factory
 	viewCtx    *ViewContext
 	procCtx    *ProcContext
 	triggerCtx *TriggerContext
 	bindCtx    *BindvarContext
 	ctx        *sql.Context
-	qFlags     *sql.QueryFlags
+
+	// aggregateArgumentRoot points to the source scope where the current
+	// aggregate's arguments are being bound. Its query block and enclosing
+	// query blocks identify the source scopes where column lookup skips
+	// projection and HAVING aliases. It is nil outside argument binding.
+	aggregateArgumentRoot *scope
+
+	// virtualTables tracks the tables whose generated columns are currently being resolved by buildVirtualTableScan,
+	// so that a generated column expression that references its own table errors instead of recursing forever.
+	virtualTables map[string]struct{}
+
+	// windowClause tracks whether we are currently building an expression
+	// inside a window clause (e.g. "window order by") or empty otherwise.
+	windowClause string
 
 	nesting int
 
-	tabId sql.TableId
-	colId columnId
+	tabId      sql.TableId
+	colId      columnId
+	parserOpts ast.ParserOptions
+
+	// windowClauseColRef is true if the window clause is a single column
+	// name (not a composite expression like a + 1).
+	windowClauseColRef bool
+
+	// inAgg tracks whether we are inside aggregate arguments.
+	inAgg bool
+
+	// inWindow tracks whether we are inside window function arguments.
+	inWindow bool
+
+	// inAggFilter tracks whether we are inside the condition of an aggregate's FILTER clause.
+	inAggFilter bool
+
+	// skipVirtualColumnScans disables wrapping resolved tables that have virtual columns in a VirtualColumnTable. See
+	// disableVirtualColumnScans.
+	skipVirtualColumnScans bool
 
 	authEnabled  bool
 	multiDDL     bool
 	insertActive bool
-	parserOpts   ast.ParserOptions
-	overrides    sql.BuilderOverrides
 }
 
 // BindvarContext holds bind variable replacement literals.
@@ -92,6 +123,15 @@ func (bv *BindvarContext) UnusedBindings() []string {
 type ViewContext struct {
 	AsOf   interface{}
 	DbName string
+	// resolving holds the views being resolved, from the outermost to the innermost.
+	resolving []viewID
+}
+
+// viewID identifies a view by its database, schema, and name.
+type viewID struct {
+	db     string
+	schema string
+	name   string
 }
 
 type TriggerContext struct {
@@ -192,9 +232,42 @@ func (b *Builder) newScope() *scope {
 	return &scope{b: b}
 }
 
+func (b *Builder) withWindowState(clause string, isColRef bool) func() {
+	outerClause, outerColRef := b.windowClause, b.windowClauseColRef
+	b.windowClause, b.windowClauseColRef = clause, isColRef
+	return func() { b.windowClause, b.windowClauseColRef = outerClause, outerColRef }
+}
+
+// beginAggregateArgumentResolution temporarily sets aggregateArgumentRoot to
+// |source| so that argument lookup will use query block sources and skip
+// projection/HAVING aliases. The lookup mode lives on Builder and enables
+// correct aggregate argument resolution, based on the query block structure
+// from the original query, not the more fine-grained scopes from the query plan.
+// The caller must defer the returned function to restore the previous lookup mode;
+// correlations and expressions created during argument binding remain.
+func (b *Builder) beginAggregateArgumentResolution(source *scope) (restore func()) {
+	previousRoot := b.aggregateArgumentRoot
+	b.aggregateArgumentRoot = source
+	return func() { b.aggregateArgumentRoot = previousRoot }
+}
+
+// isAggregateArgumentQuerySource reports whether target is on the active aggregate argument's query-block chain.
+func (b *Builder) isAggregateArgumentQuerySource(target *scope) bool {
+	if b.aggregateArgumentRoot == nil {
+		return false
+	}
+	for query := b.aggregateArgumentRoot.queryBlock; query != nil; query = query.parent {
+		if query.source == target {
+			return true
+		}
+	}
+	return false
+}
+
 func (b *Builder) Reset() {
 	b.colId = 0
 	b.tabId = 0
+	b.aggregateArgumentRoot = nil
 	b.bindCtx = nil
 	b.currentDatabase = nil
 	b.procCtx = nil
@@ -203,6 +276,8 @@ func (b *Builder) Reset() {
 	b.triggerCtx = nil
 	b.viewCtx = nil
 	b.nesting = 0
+	b.virtualTables = nil
+	b.skipVirtualColumnScans = false
 	b.qFlags = &sql.QueryFlags{}
 	b.authQueryState = b.cat.AuthorizationHandler().NewQueryState(b.ctx)
 }
@@ -417,10 +492,40 @@ func (b *Builder) buildSubquery(inScope *scope, stmt ast.Statement, subQuery str
 	return
 }
 
+// disableVirtualColumnScans stops resolved tables from being wrapped in a VirtualColumnTable until the returned
+// function is called, and is meant to be deferred: `defer b.disableVirtualColumnScans()()`. This is for statements
+// that never read a table's rows, such as DROP and SHOW statements, and so never evaluate its virtual columns.
+// Wrapping a table resolves its generated column expressions, which fails for expressions that can't be resolved,
+// including those that reference their own table (see buildVirtualTableScan). Skipping it lets these statements
+// inspect and repair such tables. The setting applies to every table resolved while it is in effect, including tables
+// referenced by generated expressions that are resolved for display.
+func (b *Builder) disableVirtualColumnScans() (restore func()) {
+	prev := b.skipVirtualColumnScans
+	b.skipVirtualColumnScans = true
+	return func() {
+		b.skipVirtualColumnScans = prev
+	}
+}
+
 // buildVirtualTableScan returns a VirtualColumnTable for a table with virtual columns.
 func (b *Builder) buildVirtualTableScan(db string, tab sql.Table) *plan.VirtualColumnTable {
+	// Generated column expressions may not contain subqueries, but schemas created before that was enforced, or
+	// arriving from elsewhere (e.g. a merge), still might. A subquery that reads this table would resolve this table's
+	// generated columns again, recursing until the goroutine stack overflows and the process dies. Detect the cycle
+	// and fail the query instead.
+	schemaName := sql.TableSchemaName(tab)
+	key := strings.ToLower(db) + "." + strings.ToLower(schemaName) + "." + strings.ToLower(tab.Name())
+	if _, ok := b.virtualTables[key]; ok {
+		b.handleErr(sql.ErrGeneratedColumnRecursion.New(db, tab.Name()))
+	}
+	if b.virtualTables == nil {
+		b.virtualTables = make(map[string]struct{})
+	}
+	b.virtualTables[key] = struct{}{}
+	defer delete(b.virtualTables, key)
+
 	tableScope := b.newScope()
-	schema := tab.Schema()
+	schema := tab.Schema(b.ctx)
 	for _, c := range schema {
 		tableScope.newColumn(scopeColumn{
 			table:       strings.ToLower(tab.Name()),
@@ -445,7 +550,7 @@ func (b *Builder) buildVirtualTableScan(db string, tab sql.Table) *plan.VirtualC
 	// Unlike other kinds of nodes, the projection on this table wrapper is invisible to the analyzer, so we need to
 	// get the column indexes correct here, they won't be fixed later like other kinds of expressions.
 	for i, p := range projections {
-		projections[i] = assignColumnIndexes(p, schema)
+		projections[i] = assignColumnIndexes(b.ctx, p, schema)
 	}
 
 	return plan.NewVirtualColumnTable(tab, projections)
@@ -460,10 +565,16 @@ func (b *Builder) buildInjectedStatement(inScope *scope, n ast.InjectedStatement
 	for i, child := range n.Children {
 		resolvedChildren[i] = b.buildScalar(inScope, child)
 	}
-	stmt, err := n.Statement.WithResolvedChildren(resolvedChildren)
+	stmt, err := n.Statement.WithResolvedChildren(b.ctx, resolvedChildren)
 	if err != nil {
 		b.handleErr(err)
 		return nil
+	}
+	if mdb, ok := stmt.(sql.MultiDatabaser); ok {
+		stmt, err = mdb.WithDatabaseProvider(b.cat)
+		if err != nil {
+			b.handleErr(err)
+		}
 	}
 	if sqlNode, ok := stmt.(sql.ExecSourceRel); ok {
 		outScope = inScope.push()
@@ -475,8 +586,8 @@ func (b *Builder) buildInjectedStatement(inScope *scope, n ast.InjectedStatement
 }
 
 // assignColumnIndexes fixes the column indexes in the expression to match the schema given
-func assignColumnIndexes(e sql.Expression, schema sql.Schema) sql.Expression {
-	e, _, _ = transform.Expr(e, func(e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
+func assignColumnIndexes(ctx *sql.Context, e sql.Expression, schema sql.Schema) sql.Expression {
+	e, _, _ = transform.Expr(ctx, e, func(ctx *sql.Context, e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
 		if gf, ok := e.(*expression.GetField); ok {
 			idx := schema.IndexOfColName(gf.Name())
 			return gf.WithIndex(idx), transform.NewTree, nil

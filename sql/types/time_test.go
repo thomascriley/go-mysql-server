@@ -66,8 +66,7 @@ func TestTimeCompare(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(fmt.Sprintf("%v %v", test.val1, test.val2), func(t *testing.T) {
-			cmp, err := Time.Compare(ctx, test.val1, test.val2)
-			require.NoError(t, err)
+			cmp, _ := TimeMaxPrecision.Compare(ctx, test.val1, test.val2)
 			assert.Equal(t, test.expectedCmp, cmp)
 		})
 	}
@@ -130,10 +129,10 @@ func TestTimeConvert(t *testing.T) {
 		{"58:59:59.99999951", "58:59:59.999999", false},
 		{"58:58:59.999999514", "58:58:59.999999", false},
 		{"11:12", "11:12:00", false},
-		{"-850:00:00", "-838:59:59", false},
-		{"850:00:00", "838:59:59", false},
-		{"-838:59:59.1", "-838:59:59", false},
-		{"838:59:59.1", "838:59:59", false},
+		{"-850:00:00", "-838:59:59", true},
+		{"850:00:00", "838:59:59", true},
+		{"-838:59:59.1", "-838:59:59", true},
+		{"838:59:59.1", "838:59:59", true},
 		{time.Date(2019, 12, 12, 12, 12, 12, 0, time.UTC), "12:12:12", false},
 
 		{1060, nil, true},
@@ -165,25 +164,24 @@ func TestTimeConvert(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(fmt.Sprintf("%v %v", test.val, test.expectedVal), func(t *testing.T) {
-			val, _, err := Time.Convert(ctx, test.val)
+			val, _, err := TimeMaxPrecision.Convert(ctx, test.val)
 			if test.expectedErr {
 				assert.Error(t, err)
 			} else {
-				require.NoError(t, err)
-				if test.val == nil {
-					assert.Equal(t, test.expectedVal, val)
-				} else {
-					assert.Equal(t, test.expectedVal, val.(Timespan).String())
-					timespan, err := Time.ConvertToTimespan(test.val)
-					require.NoError(t, err)
-					require.True(t, timespan.Equals(val.(Timespan)))
-					ms := timespan.AsMicroseconds()
-					ums := Time.MicrosecondsToTimespan(ms)
-					cmp, err := Time.Compare(ctx, test.val, ums)
-					require.NoError(t, err)
-					assert.Equal(t, 0, cmp)
-				}
+				assert.NoError(t, err)
 			}
+			if test.expectedVal == nil {
+				assert.Equal(t, test.expectedVal, val)
+				return
+			}
+			assert.Equal(t, test.expectedVal, val.(Timespan).String())
+
+			timespan, _ := TimeMaxPrecision.ConvertToTimespan(test.val)
+			require.True(t, timespan.Equals(val.(Timespan)))
+			ms := timespan.AsMicroseconds()
+			ums := TimeMaxPrecision.MicrosecondsToTimespan(ms)
+			cmp, _ := TimeMaxPrecision.Compare(ctx, test.val, ums)
+			assert.Equal(t, 0, cmp)
 		})
 	}
 }
@@ -211,7 +209,7 @@ func TestTimeConvertToTimeDuration(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(fmt.Sprintf("%v %v", test.val, test.expectedVal), func(t *testing.T) {
-			val, err := Time.ConvertToTimeDuration(test.val)
+			val, err := TimeMaxPrecision.ConvertToTimeDuration(test.val)
 			require.NoError(t, err)
 			assert.Equal(t, test.expectedVal, val)
 		})
@@ -219,7 +217,8 @@ func TestTimeConvertToTimeDuration(t *testing.T) {
 }
 
 func TestTimeString(t *testing.T) {
-	require.Equal(t, "time(6)", Time.String())
+	require.Equal(t, "time", Time.String())
+	require.Equal(t, "time(6)", TimeMaxPrecision.String())
 }
 
 func TestTimeZero(t *testing.T) {

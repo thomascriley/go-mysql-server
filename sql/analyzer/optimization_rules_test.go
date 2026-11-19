@@ -35,7 +35,7 @@ func TestEvalFilter(t *testing.T) {
 	pro := memory.NewDBProvider(db)
 	ctx := newContext(pro)
 
-	inner := memory.NewTable(db, "foo", sql.PrimaryKeySchema{}, nil)
+	inner := memory.NewTable(ctx, db, "foo", sql.PrimaryKeySchema{}, nil)
 	rule := getRule(simplifyFiltersId)
 
 	testCases := []struct {
@@ -50,6 +50,7 @@ func TestEvalFilter(t *testing.T) {
 					lit(5)),
 			),
 			plan.NewFilter(
+				ctx,
 				eq(
 					expression.NewGetFieldWithTable(0, 0, types.Int64, "", "foo", "bar", false),
 					lit(5)),
@@ -64,6 +65,7 @@ func TestEvalFilter(t *testing.T) {
 				eq(lit(5), lit(5)),
 			),
 			plan.NewFilter(
+				ctx,
 				eq(
 					expression.NewGetFieldWithTable(0, 0, types.Int64, "", "foo", "bar", false),
 					lit(5)),
@@ -77,7 +79,7 @@ func TestEvalFilter(t *testing.T) {
 					expression.NewGetFieldWithTable(0, 0, types.Int64, "", "foo", "bar", false),
 					lit(5)),
 			),
-			plan.NewEmptyTableWithSchema(inner.Schema()),
+			plan.NewEmptyTableWithSchema(inner.Schema(ctx)),
 		},
 		{
 			and(
@@ -86,7 +88,7 @@ func TestEvalFilter(t *testing.T) {
 					lit(5)),
 				eq(lit(5), lit(4)),
 			),
-			plan.NewEmptyTableWithSchema(inner.Schema()),
+			plan.NewEmptyTableWithSchema(inner.Schema(ctx)),
 		},
 		{
 			and(
@@ -103,6 +105,7 @@ func TestEvalFilter(t *testing.T) {
 					lit(5)),
 			),
 			plan.NewFilter(
+				ctx,
 				eq(
 					expression.NewGetFieldWithTable(0, 0, types.Int64, "", "foo", "bar", false),
 					lit(5)),
@@ -117,6 +120,7 @@ func TestEvalFilter(t *testing.T) {
 				eq(lit(5), lit(4)),
 			),
 			plan.NewFilter(
+				ctx,
 				eq(
 					expression.NewGetFieldWithTable(0, 0, types.Int64, "", "foo", "bar", false),
 					lit(5)),
@@ -146,17 +150,62 @@ func TestEvalFilter(t *testing.T) {
 				eq(lit(5), lit(4)),
 				eq(lit(5), lit(4)),
 			),
-			plan.NewEmptyTableWithSchema(inner.Schema()),
+			plan.NewEmptyTableWithSchema(inner.Schema(ctx)),
 		},
 	}
 
 	for _, tt := range testCases {
 		t.Run(tt.filter.String(), func(t *testing.T) {
 			require := require.New(t)
-			node := plan.NewFilter(tt.filter, plan.NewResolvedTable(inner, nil, nil))
+			node := plan.NewFilter(ctx, tt.filter, plan.NewResolvedTable(inner, nil, nil))
 			result, _, err := rule.Apply(ctx, NewDefault(nil), node, nil, DefaultRuleSelector, nil)
 			require.NoError(err)
 			require.Equal(tt.expected, result)
+		})
+	}
+}
+
+func TestSimplifyLikeWildcardOnlyFilter(t *testing.T) {
+	// See https://github.com/dolthub/go-mysql-server/issues/3943
+	db := memory.NewDatabase("db")
+	pro := memory.NewDBProvider(db)
+	ctx := newContext(pro)
+	table := memory.NewTable(ctx, db, "foo", sql.PrimaryKeySchema{}, nil)
+	child := plan.NewResolvedTable(table, nil, nil)
+	rule := getRule(simplifyFiltersId)
+
+	s := expression.NewGetFieldWithTable(0, 0, types.Text, "", "foo", "s", true)
+	latin1 := expression.NewGetFieldWithTable(0, 0, types.CreateText(sql.Collation_latin1_swedish_ci), "", "foo", "s", true)
+	i := expression.NewGetFieldWithTable(0, 0, types.Int64, "", "foo", "i", true)
+	pat := func(p string) sql.Expression { return expression.NewLiteral(p, types.LongText) }
+	concat, err := function.NewConcat(ctx, pat("%"), pat("%"))
+	require.NoError(t, err)
+
+	tests := []struct {
+		name    string
+		filter  sql.Expression
+		notNull sql.Expression
+	}{
+		{name: "single wildcard", filter: expression.NewLike(s, pat("%"), nil), notNull: s},
+		{name: "triple wildcard", filter: expression.NewLike(s, pat("%%%"), nil), notNull: s},
+		{name: "non-utf8 string", filter: expression.NewLike(latin1, pat("%"), nil), notNull: latin1},
+		{name: "constant-folded wildcard pattern", filter: expression.NewLike(s, concat, nil), notNull: s},
+		{name: "non-string operand", filter: expression.NewLike(i, pat("%"), nil)},
+		{name: "explicit escape", filter: expression.NewLike(s, pat("%%%"), pat("$"))},
+		{name: "negated wildcard", filter: expression.NewNot(expression.NewLike(s, pat("%"), nil))},
+		{name: "wildcard is null", filter: expression.NewIsNull(expression.NewLike(s, pat("%"), nil))},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			expected := tt.filter
+			if tt.notNull != nil {
+				expected = expression.DefaultExpressionFactory.NewIsNotNull(tt.notNull)
+			}
+			node := plan.NewFilter(ctx, tt.filter, child)
+			result, _, err := rule.Apply(ctx, NewDefault(pro), node, nil, DefaultRuleSelector, nil)
+			require.NoError(t, err)
+			require.Equal(t, plan.NewFilter(ctx, expected, child), result)
 		})
 	}
 }
@@ -242,13 +291,13 @@ func newTestCatalog(db *memory.Database) *sql.MapCatalog {
 		Databases: make(map[string]sql.Database),
 		Tables:    make(map[string]sql.Table),
 	}
-
-	cat.Tables["xy"] = memory.NewTable(db, "xy", sql.NewPrimaryKeySchema(sql.Schema{
+	ctx := sql.NewEmptyContext()
+	cat.Tables["xy"] = memory.NewTable(ctx, db, "xy", sql.NewPrimaryKeySchema(sql.Schema{
 		{Name: "x", Type: types.Int64, Source: "xy"},
 		{Name: "y", Type: types.Int64, Source: "xy"},
 		{Name: "z", Type: types.Int64, Source: "xy"},
 	}, 0), nil)
-	cat.Tables["uv"] = memory.NewTable(db, "uv", sql.NewPrimaryKeySchema(sql.Schema{
+	cat.Tables["uv"] = memory.NewTable(ctx, db, "uv", sql.NewPrimaryKeySchema(sql.Schema{
 		{Name: "u", Type: types.Int64, Source: "uv"},
 		{Name: "v", Type: types.Int64, Source: "uv"},
 		{Name: "w", Type: types.Int64, Source: "uv"},

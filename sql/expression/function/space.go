@@ -15,7 +15,7 @@
 package function
 
 import (
-	"github.com/dolthub/vitess/go/mysql"
+	"strings"
 
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/types"
@@ -29,7 +29,7 @@ type Space struct {
 var _ sql.FunctionExpression = (*Space)(nil)
 var _ sql.CollationCoercible = (*Space)(nil)
 
-func NewSpace(arg sql.Expression) sql.Expression {
+func NewSpace(ctx *sql.Context, arg sql.Expression) sql.Expression {
 	return &Space{NewUnaryFunc(arg, "SPACE", types.LongText)}
 }
 
@@ -45,40 +45,23 @@ func (s *Space) CollationCoercibility(ctx *sql.Context) (collation sql.Collation
 
 // Eval implements the sql.Expression interface
 func (s *Space) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
-	val, err := s.EvalChild(ctx, row)
-	if err != nil {
+	v, ok, err := evalInt64(ctx, s.Child, row)
+	if err != nil || !ok {
 		return nil, err
 	}
 
-	if val == nil {
-		return nil, nil
-	}
-
-	// TODO: better truncate integer handling
-	v, _, err := types.Int64.Convert(ctx, val)
-	if err != nil {
-		if !sql.ErrTruncatedIncorrect.Is(err) {
-			return nil, err
-		}
-		ctx.Warn(mysql.ERTruncatedWrongValue, "%s", err.Error())
-	}
-
-	num := int(v.(int64))
+	num := int(v)
 	if num < 0 {
 		num = 0
 	}
 
-	res := ""
-	for i := 0; i < num; i++ {
-		res += " "
-	}
-	return res, nil
+	return strings.Repeat(" ", num), nil
 }
 
 // WithChildren implements the sql.Expression interface
-func (s *Space) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (s *Space) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 1 {
 		return nil, sql.ErrInvalidChildrenNumber.New(s, len(children), 1)
 	}
-	return NewSpace(children[0]), nil
+	return NewSpace(ctx, children[0]), nil
 }

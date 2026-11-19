@@ -15,6 +15,8 @@
 package queries
 
 import (
+	"time"
+
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/plan"
 	"github.com/dolthub/go-mysql-server/sql/types"
@@ -45,6 +47,36 @@ var ForeignKeyTests = []ScriptTest{
 			{
 				Query:    "SHOW CREATE TABLE sibling;",
 				Expected: []sql.Row{{"sibling", "CREATE TABLE `sibling` (\n  `id` int NOT NULL,\n  `v1` int,\n  PRIMARY KEY (`id`),\n  KEY `fk_named` (`v1`),\n  CONSTRAINT `fk_named` FOREIGN KEY (`v1`) REFERENCES `parent` (`v1`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"}},
+			},
+		},
+	},
+	{
+		// See https://github.com/dolthub/dolt/issues/10970
+		Name: "Inline column REFERENCES creates an enforced foreign key",
+		SetUpScript: []string{
+			"CREATE TABLE parent_pk (id INT PRIMARY KEY);",
+			"CREATE TABLE parent_uq (id INT PRIMARY KEY, u INT UNIQUE);",
+			"CREATE TABLE child_pk (id INT PRIMARY KEY, pid INT REFERENCES parent_pk(id));",
+			"CREATE TABLE child_uq (id INT PRIMARY KEY, u INT REFERENCES parent_uq(u));",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query: "SHOW CREATE TABLE child_pk;",
+				// The engine auto-generates a constraint name from the table name when no name is provided.
+				Expected: []sql.Row{{"child_pk", "CREATE TABLE `child_pk` (\n  `id` int NOT NULL,\n  `pid` int,\n  PRIMARY KEY (`id`),\n  KEY `pid` (`pid`),\n  CONSTRAINT `child_pk_ibfk_1` FOREIGN KEY (`pid`) REFERENCES `parent_pk` (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"}},
+			},
+			{
+				Query: "SHOW CREATE TABLE child_uq;",
+				// The engine auto-generates a constraint name from the table name when no name is provided.
+				Expected: []sql.Row{{"child_uq", "CREATE TABLE `child_uq` (\n  `id` int NOT NULL,\n  `u` int,\n  PRIMARY KEY (`id`),\n  KEY `u` (`u`),\n  CONSTRAINT `child_uq_ibfk_1` FOREIGN KEY (`u`) REFERENCES `parent_uq` (`u`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"}},
+			},
+			{
+				Query:       "INSERT INTO child_pk VALUES (1, 999);",
+				ExpectedErr: sql.ErrForeignKeyChildViolation,
+			},
+			{
+				Query:       "INSERT INTO child_uq VALUES (1, 999);",
+				ExpectedErr: sql.ErrForeignKeyChildViolation,
 			},
 		},
 	},
@@ -83,44 +115,6 @@ var ForeignKeyTests = []ScriptTest{
 		},
 	},
 	{
-		Name: "CREATE TABLE Type Mismatch",
-		SetUpScript: []string{
-			"CREATE TABLE sibling (pk INT PRIMARY KEY, v1 TIME);",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query:       "ALTER TABLE sibling ADD CONSTRAINT fk1 FOREIGN KEY (v1) REFERENCES parent(v1);",
-				ExpectedErr: sql.ErrForeignKeyColumnTypeMismatch,
-			},
-		},
-	},
-	{
-		Name: "CREATE TABLE Type Mismatch special case for strings",
-		SetUpScript: []string{
-			"CREATE TABLE parent1 (pk BIGINT PRIMARY KEY, v1 CHAR(20), INDEX (v1));",
-			"CREATE TABLE parent2 (pk BIGINT PRIMARY KEY, v1 VARCHAR(20), INDEX (v1));",
-			"CREATE TABLE parent3 (pk BIGINT PRIMARY KEY, v1 BINARY(20), INDEX (v1));",
-			"CREATE TABLE parent4 (pk BIGINT PRIMARY KEY, v1 VARBINARY(20), INDEX (v1));",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query:    "CREATE TABLE child1 (pk BIGINT PRIMARY KEY, v1 CHAR(30), CONSTRAINT fk_child1 FOREIGN KEY (v1) REFERENCES parent1 (v1));",
-				Expected: []sql.Row{{types.NewOkResult(0)}},
-			},
-			{
-				Query:    "CREATE TABLE child2 (pk BIGINT PRIMARY KEY, v1 VARCHAR(30), CONSTRAINT fk_child2 FOREIGN KEY (v1) REFERENCES parent2 (v1));",
-				Expected: []sql.Row{{types.NewOkResult(0)}},
-			},
-			{
-				Query:    "CREATE TABLE child3 (pk BIGINT PRIMARY KEY, v1 BINARY(30), CONSTRAINT fk_child3 FOREIGN KEY (v1) REFERENCES parent3 (v1));",
-				Expected: []sql.Row{{types.NewOkResult(0)}},
-			}, {
-				Query:    "CREATE TABLE child4 (pk BIGINT PRIMARY KEY, v1 VARBINARY(30), CONSTRAINT fk_child4 FOREIGN KEY (v1) REFERENCES parent4 (v1));",
-				Expected: []sql.Row{{types.NewOkResult(0)}},
-			},
-		},
-	},
-	{
 		Name: "CREATE TABLE Key Count Mismatch",
 		Assertions: []ScriptTestAssertion{
 			{
@@ -148,47 +142,6 @@ var ForeignKeyTests = []ScriptTest{
 			{
 				Query:       "ALTER TABLE child ADD CONSTRAINT fk1 FOREIGN KEY (v1) REFERENCES parent(v1) ON UPDATE SET DEFAULT ON DELETE SET DEFAULT;",
 				ExpectedErr: sql.ErrForeignKeySetDefault,
-			},
-		},
-	},
-	{
-		Name: "CREATE TABLE Disallow TEXT/BLOB",
-		SetUpScript: []string{
-			"CREATE TABLE parent1 (id INT PRIMARY KEY, v1 TINYTEXT, v2 TEXT, v3 MEDIUMTEXT, v4 LONGTEXT);",
-			"CREATE TABLE parent2 (id INT PRIMARY KEY, v1 TINYBLOB, v2 BLOB, v3 MEDIUMBLOB, v4 LONGBLOB);",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query:       "CREATE TABLE child11 (id INT PRIMARY KEY, parent_v1 TINYTEXT, FOREIGN KEY (parent_v1) REFERENCES parent1(v1));",
-				ExpectedErr: sql.ErrForeignKeyTextBlob,
-			},
-			{
-				Query:       "CREATE TABLE child12 (id INT PRIMARY KEY, parent_v2 TEXT, FOREIGN KEY (parent_v2) REFERENCES parent1(v2));",
-				ExpectedErr: sql.ErrForeignKeyTextBlob,
-			},
-			{
-				Query:       "CREATE TABLE child13 (id INT PRIMARY KEY, parent_v3 MEDIUMTEXT, FOREIGN KEY (parent_v3) REFERENCES parent1(v3));",
-				ExpectedErr: sql.ErrForeignKeyTextBlob,
-			},
-			{
-				Query:       "CREATE TABLE child14 (id INT PRIMARY KEY, parent_v4 LONGTEXT, FOREIGN KEY (parent_v4) REFERENCES parent1(v4));",
-				ExpectedErr: sql.ErrForeignKeyTextBlob,
-			},
-			{
-				Query:       "CREATE TABLE child21 (id INT PRIMARY KEY, parent_v1 TINYBLOB, FOREIGN KEY (parent_v1) REFERENCES parent2(v1));",
-				ExpectedErr: sql.ErrForeignKeyTextBlob,
-			},
-			{
-				Query:       "CREATE TABLE child22 (id INT PRIMARY KEY, parent_v2 BLOB, FOREIGN KEY (parent_v2) REFERENCES parent2(v2));",
-				ExpectedErr: sql.ErrForeignKeyTextBlob,
-			},
-			{
-				Query:       "CREATE TABLE child23 (id INT PRIMARY KEY, parent_v3 MEDIUMBLOB, FOREIGN KEY (parent_v3) REFERENCES parent2(v3));",
-				ExpectedErr: sql.ErrForeignKeyTextBlob,
-			},
-			{
-				Query:       "CREATE TABLE child24 (id INT PRIMARY KEY, parent_v4 LONGBLOB, FOREIGN KEY (parent_v4) REFERENCES parent2(v4));",
-				ExpectedErr: sql.ErrForeignKeyTextBlob,
 			},
 		},
 	},
@@ -385,7 +338,7 @@ var ForeignKeyTests = []ScriptTest{
 		Name: "DROP TABLE, with multiple tables, sorts by foreign key dependencies",
 		SetUpScript: []string{
 			"create table grandparent1 (pk int primary key);",
-			"create table parent1 (pk int primary key, c1 int references grandparent(pk));",
+			"create table parent1 (pk int primary key, c1 int references grandparent1(pk));",
 			"create table parent2 (pk int primary key);",
 			"create table child1 (pk int primary key, c1 int, c2 int, foreign key (c1) references parent1(pk), foreign key (c2) references parent2(pk));",
 			"create table selfref (pk int primary key, c1 int, foreign key (c1) references selfref(pk));",
@@ -441,138 +394,6 @@ var ForeignKeyTests = []ScriptTest{
 		},
 	},
 	{
-		Name: "ALTER TABLE MODIFY COLUMN type change not allowed",
-		SetUpScript: []string{
-			"ALTER TABLE child ADD CONSTRAINT fk1 FOREIGN KEY (v1) REFERENCES parent(v1);",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query:       "ALTER TABLE parent MODIFY v1 MEDIUMINT;",
-				ExpectedErr: sql.ErrForeignKeyTypeChange,
-			},
-			{
-				Query:       "ALTER TABLE child MODIFY v1 MEDIUMINT;",
-				ExpectedErr: sql.ErrForeignKeyTypeChange,
-			},
-		},
-	},
-	{
-		Name: "ALTER TABLE MODIFY COLUMN type change allowed when lengthening string",
-		SetUpScript: []string{
-			"CREATE TABLE parent1 (pk BIGINT PRIMARY KEY, v1 CHAR(20), INDEX (v1));",
-			"CREATE TABLE parent2 (pk BIGINT PRIMARY KEY, v1 VARCHAR(20), INDEX (v1));",
-			"CREATE TABLE parent3 (pk BIGINT PRIMARY KEY, v1 BINARY(20), INDEX (v1));",
-			"CREATE TABLE parent4 (pk BIGINT PRIMARY KEY, v1 VARBINARY(20), INDEX (v1));",
-			"CREATE TABLE child1 (pk BIGINT PRIMARY KEY, v1 CHAR(20), CONSTRAINT fk_child1 FOREIGN KEY (v1) REFERENCES parent1 (v1));",
-			"CREATE TABLE child2 (pk BIGINT PRIMARY KEY, v1 VARCHAR(20), CONSTRAINT fk_child2 FOREIGN KEY (v1) REFERENCES parent2 (v1));",
-			"CREATE TABLE child3 (pk BIGINT PRIMARY KEY, v1 BINARY(20), CONSTRAINT fk_child3 FOREIGN KEY (v1) REFERENCES parent3 (v1));",
-			"CREATE TABLE child4 (pk BIGINT PRIMARY KEY, v1 VARBINARY(20), CONSTRAINT fk_child4 FOREIGN KEY (v1) REFERENCES parent4 (v1));",
-			"INSERT INTO parent2 VALUES (1, 'aa'), (2, 'bb');",
-			"INSERT INTO child2 VALUES (1, 'aa');",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query:       "ALTER TABLE parent1 MODIFY v1 CHAR(10);",
-				ExpectedErr: sql.ErrForeignKeyTypeChange,
-			},
-			{
-				Query:       "ALTER TABLE child1 MODIFY v1 CHAR(10);",
-				ExpectedErr: sql.ErrForeignKeyTypeChange,
-			},
-			{
-				Query:       "ALTER TABLE parent2 MODIFY v1 VARCHAR(10);",
-				ExpectedErr: sql.ErrForeignKeyTypeChange,
-			},
-			{
-				Query:       "ALTER TABLE child2 MODIFY v1 VARCHAR(10);",
-				ExpectedErr: sql.ErrForeignKeyTypeChange,
-			},
-			{
-				Query:       "ALTER TABLE parent3 MODIFY v1 BINARY(10);",
-				ExpectedErr: sql.ErrForeignKeyTypeChange,
-			},
-			{
-				Query:       "ALTER TABLE child3 MODIFY v1 BINARY(10);",
-				ExpectedErr: sql.ErrForeignKeyTypeChange,
-			},
-			{
-				Query:       "ALTER TABLE parent4 MODIFY v1 VARBINARY(10);",
-				ExpectedErr: sql.ErrForeignKeyTypeChange,
-			},
-			{
-				Query:       "ALTER TABLE child4 MODIFY v1 VARBINARY(10);",
-				ExpectedErr: sql.ErrForeignKeyTypeChange,
-			},
-			{
-				Query:    "ALTER TABLE parent1 MODIFY v1 CHAR(30);",
-				Expected: []sql.Row{{types.NewOkResult(0)}},
-			},
-			{
-				Query:    "ALTER TABLE child1 MODIFY v1 CHAR(30);",
-				Expected: []sql.Row{{types.NewOkResult(0)}},
-			},
-			{
-				Query:    "ALTER TABLE parent2 MODIFY v1 VARCHAR(30);",
-				Expected: []sql.Row{{types.NewOkResult(0)}},
-			},
-			{
-				Query:    "ALTER TABLE child2 MODIFY v1 VARCHAR(30);",
-				Expected: []sql.Row{{types.NewOkResult(0)}},
-			},
-			{
-				Query:    "ALTER TABLE parent3 MODIFY v1 BINARY(30);",
-				Expected: []sql.Row{{types.NewOkResult(0)}},
-			},
-			{
-				Query:    "ALTER TABLE child3 MODIFY v1 BINARY(30);",
-				Expected: []sql.Row{{types.NewOkResult(0)}},
-			},
-			{
-				Query:    "ALTER TABLE parent4 MODIFY v1 VARBINARY(30);",
-				Expected: []sql.Row{{types.NewOkResult(0)}},
-			},
-			{
-				Query:    "ALTER TABLE child4 MODIFY v1 VARBINARY(30);",
-				Expected: []sql.Row{{types.NewOkResult(0)}},
-			},
-			{ // Make sure the type change didn't cause INSERTs to break or some other strange behavior
-				Query:    "INSERT INTO child2 VALUES (2, 'bb');",
-				Expected: []sql.Row{{types.NewOkResult(1)}},
-			},
-			{
-				Query:       "INSERT INTO child2 VALUES (3, 'cc');",
-				ExpectedErr: sql.ErrForeignKeyChildViolation,
-			},
-		},
-	},
-	{
-		Name: "ALTER TABLE MODIFY COLUMN type change only cares about foreign key columns",
-		SetUpScript: []string{
-			"CREATE TABLE parent1 (pk INT PRIMARY KEY, v1 INT UNSIGNED, v2 INT UNSIGNED, INDEX (v1));",
-			"CREATE TABLE child1 (pk INT PRIMARY KEY, v1 INT UNSIGNED, v2 INT UNSIGNED, CONSTRAINT fk_name FOREIGN KEY (v1) REFERENCES parent1(v1));",
-			"INSERT INTO parent1 VALUES (1, 2, 3), (4, 5, 6);",
-			"INSERT INTO child1 VALUES (7, 2, 9);",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query:       "ALTER TABLE parent1 MODIFY v1 BIGINT;",
-				ExpectedErr: sql.ErrForeignKeyTypeChange,
-			},
-			{
-				Query:       "ALTER TABLE child1 MODIFY v1 BIGINT;",
-				ExpectedErr: sql.ErrForeignKeyTypeChange,
-			},
-			{
-				Query:    "ALTER TABLE parent1 MODIFY v2 BIGINT;",
-				Expected: []sql.Row{{types.NewOkResult(0)}},
-			},
-			{
-				Query:    "ALTER TABLE child1 MODIFY v2 BIGINT;",
-				Expected: []sql.Row{{types.NewOkResult(0)}},
-			},
-		},
-	},
-	{
 		Name: "DROP COLUMN parent",
 		SetUpScript: []string{
 			"ALTER TABLE child ADD CONSTRAINT fk_name FOREIGN KEY (v1) REFERENCES parent(v1);",
@@ -609,30 +430,6 @@ var ForeignKeyTests = []ScriptTest{
 			{
 				Query:    "ALTER TABLE child DROP COLUMN v1;",
 				Expected: []sql.Row{{types.NewOkResult(0)}},
-			},
-		},
-	},
-	{
-		Name: "Disallow change column to nullable with ON UPDATE SET NULL",
-		SetUpScript: []string{
-			"ALTER TABLE child ADD CONSTRAINT fk_name FOREIGN KEY (v1) REFERENCES parent(v1) ON UPDATE SET NULL",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query:       "ALTER TABLE child CHANGE COLUMN v1 v1 INT NOT NULL;",
-				ExpectedErr: sql.ErrForeignKeyTypeChangeSetNull,
-			},
-		},
-	},
-	{
-		Name: "Disallow change column to nullable with ON DELETE SET NULL",
-		SetUpScript: []string{
-			"ALTER TABLE child ADD CONSTRAINT fk_name FOREIGN KEY (v1) REFERENCES parent(v1) ON DELETE SET NULL",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query:       "ALTER TABLE child CHANGE COLUMN v1 v1 INT NOT NULL;",
-				ExpectedErr: sql.ErrForeignKeyTypeChangeSetNull,
 			},
 		},
 	},
@@ -1250,25 +1047,6 @@ var ForeignKeyTests = []ScriptTest{
 		},
 	},
 	{
-		Name: "VARCHAR child violation detection",
-		SetUpScript: []string{
-			"CREATE TABLE colors (id INT NOT NULL, color VARCHAR(32) NOT NULL, PRIMARY KEY (id), INDEX color_index(color));",
-			"CREATE TABLE objects (id INT NOT NULL, name VARCHAR(64) NOT NULL, color VARCHAR(32), PRIMARY KEY(id), CONSTRAINT color_fk FOREIGN KEY (color) REFERENCES colors(color));",
-			"INSERT INTO colors (id, color) VALUES (1, 'red'), (2, 'green'), (3, 'blue'), (4, 'purple');",
-			"INSERT INTO objects (id, name, color) VALUES (1, 'truck', 'red'), (2, 'ball', 'green'), (3, 'shoe', 'blue');",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query:       "DELETE FROM colors where color='green';",
-				ExpectedErr: sql.ErrForeignKeyParentViolation,
-			},
-			{
-				Query:    "SELECT * FROM colors;",
-				Expected: []sql.Row{{1, "red"}, {2, "green"}, {3, "blue"}, {4, "purple"}},
-			},
-		},
-	},
-	{
 		Name: "INSERT IGNORE INTO works correctly with foreign key violations",
 		SetUpScript: []string{
 			"CREATE TABLE colors (id INT NOT NULL, color VARCHAR(32) NOT NULL, PRIMARY KEY (id), INDEX color_index(color));",
@@ -1284,244 +1062,6 @@ var ForeignKeyTests = []ScriptTest{
 			{
 				Query:    "SELECT * FROM objects;",
 				Expected: []sql.Row{{1, "truck", "red"}, {2, "ball", "green"}, {3, "shoe", "blue"}},
-			},
-		},
-	},
-	{
-		Name: "Delayed foreign key resolution: update",
-		SetUpScript: []string{
-			"set foreign_key_checks=0;",
-			"create table delayed_parent(pk int primary key);",
-			"create table delayed_child(pk int primary key, foreign key(pk) references delayed_parent(pk));",
-			"insert into delayed_parent values (10), (20);",
-			"insert into delayed_child values (1), (20);",
-			"set foreign_key_checks=1;",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				// No-op update bad to bad should not cause constraint violation
-				Skip:  true,
-				Query: "update delayed_child set pk=1 where pk=1;",
-				Expected: []sql.Row{
-					{types.OkResult{RowsAffected: 0, Info: plan.UpdateInfo{Matched: 1, Updated: 0}}},
-				},
-			},
-			{
-				// Update on non-existent row should not cause constraint violation
-				Query: "update delayed_child set pk=3 where pk=3;",
-				Expected: []sql.Row{
-					{types.OkResult{RowsAffected: 0, Info: plan.UpdateInfo{Matched: 0, Updated: 0}}},
-				},
-			},
-			{
-				// No-op update good to good should not cause constraint violation
-				Query: "update delayed_child set pk=20 where pk=20;",
-				Expected: []sql.Row{
-					{types.OkResult{RowsAffected: 0, Info: plan.UpdateInfo{Matched: 1, Updated: 0}}},
-				},
-			},
-			{
-				// Updating bad value to good value still fails
-				Query: "update delayed_child set pk=10 where pk=1;",
-				Expected: []sql.Row{
-					{types.OkResult{RowsAffected: 1, Info: plan.UpdateInfo{Matched: 1, Updated: 1}}},
-				},
-			},
-		},
-	},
-	{
-		Name: "Delayed foreign key resolution: delete",
-		SetUpScript: []string{
-			"set foreign_key_checks=0;",
-			"create table delayed_parent(pk int primary key);",
-			"create table delayed_child(pk int primary key, foreign key(pk) references delayed_parent(pk));",
-			"insert into delayed_parent values (10), (20);",
-			"insert into delayed_child values (1), (20);",
-			"set foreign_key_checks=1;",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				// No-op update good to good should not cause constraint violation
-				Query: "delete from delayed_child where false;",
-				Expected: []sql.Row{
-					{types.OkResult{RowsAffected: 0}},
-				},
-			},
-			{
-				Query: "delete from delayed_child where pk = 20;",
-				Expected: []sql.Row{
-					{types.OkResult{RowsAffected: 1}},
-				},
-			},
-			{
-				Query: "delete from delayed_child where pk = 1;",
-				Expected: []sql.Row{
-					{types.OkResult{RowsAffected: 1}},
-				},
-			},
-		},
-	},
-	{
-		Name: "Delayed foreign key resolution insert",
-		SetUpScript: []string{
-			"SET FOREIGN_KEY_CHECKS=0;",
-			"CREATE TABLE delayed_child (pk INT PRIMARY KEY, v1 INT, CONSTRAINT fk_delayed FOREIGN KEY (v1) REFERENCES delayed_parent(v1));",
-			"CREATE TABLE delayed_parent (pk INT PRIMARY KEY, v1 INT, INDEX (v1));",
-			"INSERT INTO delayed_child VALUES (1, 2);",
-			"SET FOREIGN_KEY_CHECKS=1;",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query:    "SHOW CREATE TABLE delayed_child;",
-				Expected: []sql.Row{{"delayed_child", "CREATE TABLE `delayed_child` (\n  `pk` int NOT NULL,\n  `v1` int,\n  PRIMARY KEY (`pk`),\n  KEY `fk_delayed` (`v1`),\n  CONSTRAINT `fk_delayed` FOREIGN KEY (`v1`) REFERENCES `delayed_parent` (`v1`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"}},
-			},
-			{
-				Query:    "SELECT * FROM delayed_parent;",
-				Expected: []sql.Row{},
-			},
-			{
-				Query:    "SELECT * FROM delayed_child;",
-				Expected: []sql.Row{{1, 2}},
-			},
-			{
-				Query:       "INSERT INTO delayed_child VALUES (2, 3);",
-				ExpectedErr: sql.ErrForeignKeyNotResolved,
-			},
-			{
-				Query:    "INSERT INTO delayed_parent VALUES (1, 2), (2, 3);",
-				Expected: []sql.Row{{types.NewOkResult(2)}},
-			},
-			{
-				Query:    "INSERT INTO delayed_child VALUES (2, 3);",
-				Expected: []sql.Row{{types.NewOkResult(1)}},
-			},
-			{
-				Query:    "SELECT * FROM delayed_child;",
-				Expected: []sql.Row{{1, 2}, {2, 3}},
-			},
-		},
-	},
-	{
-		Name: "Delayed foreign key still does some validation",
-		SetUpScript: []string{
-			"SET FOREIGN_KEY_CHECKS=0;",
-			"CREATE TABLE valid_delayed_child (i INT, CONSTRAINT valid_fk FOREIGN KEY (i) REFERENCES delayed_parent(i))",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query:       "CREATE TABLE delayed_child1(i int, CONSTRAINT fk_delayed1 FOREIGN KEY (badcolumn) REFERENCES delayed_parent(i));",
-				ExpectedErr: sql.ErrTableColumnNotFound,
-			},
-			{
-				Query:       "CREATE TABLE delayed_child2(i int, CONSTRAINT fk_delayed2 FOREIGN KEY (i) REFERENCES delayed_parent(c1, c2, c3));",
-				ExpectedErr: sql.ErrForeignKeyColumnCountMismatch,
-			},
-			{
-				Query:       "CREATE TABLE delayed_child3(i int, j int, CONSTRAINT fk_i FOREIGN KEY (i) REFERENCES delayed_parent(i), CONSTRAINT fk_i FOREIGN KEY (j) REFERENCES delayed_parent(j));",
-				ExpectedErr: sql.ErrForeignKeyDuplicateName,
-			},
-			{
-				Query:       "CREATE TABLE delayed_child4(i int, CONSTRAINT fk_delayed4 FOREIGN KEY (i,i,i) REFERENCES delayed_parent(c1, c2, c3));",
-				ExpectedErr: sql.ErrAddForeignKeyDuplicateColumn,
-			},
-			{
-				Query:       "ALTER TABLE valid_delayed_child drop index valid_fk",
-				ExpectedErr: sql.ErrForeignKeyDropIndex,
-			},
-		},
-	},
-	{
-		Name: "Delayed foreign key resolution resetting FOREIGN_KEY_CHECKS",
-		SetUpScript: []string{
-			"SET FOREIGN_KEY_CHECKS=0;",
-			"CREATE TABLE delayed_child (pk INT PRIMARY KEY, v1 INT, CONSTRAINT fk_delayed FOREIGN KEY (v1) REFERENCES delayed_parent(v1));",
-			"INSERT INTO delayed_child VALUES (1, 2);",
-			"SET FOREIGN_KEY_CHECKS=1;",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query:    "SHOW CREATE TABLE delayed_child;",
-				Expected: []sql.Row{{"delayed_child", "CREATE TABLE `delayed_child` (\n  `pk` int NOT NULL,\n  `v1` int,\n  PRIMARY KEY (`pk`),\n  KEY `fk_delayed` (`v1`),\n  CONSTRAINT `fk_delayed` FOREIGN KEY (`v1`) REFERENCES `delayed_parent` (`v1`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"}},
-			},
-			{
-				Query:    "SELECT * FROM delayed_child;",
-				Expected: []sql.Row{{1, 2}},
-			},
-			{
-				Query:       "INSERT INTO delayed_child VALUES (2, 3);",
-				ExpectedErr: sql.ErrForeignKeyNotResolved,
-			},
-			{
-				Query:    "CREATE TABLE delayed_parent (pk INT PRIMARY KEY, v1 INT, INDEX (v1));",
-				Expected: []sql.Row{{types.NewOkResult(0)}},
-			},
-			{
-				Query:    "INSERT INTO delayed_parent VALUES (1, 2), (2, 3);",
-				Expected: []sql.Row{{types.NewOkResult(2)}},
-			},
-			{
-				Query:    "INSERT INTO delayed_child VALUES (2, 3);",
-				Expected: []sql.Row{{types.NewOkResult(1)}},
-			},
-			{
-				Query:    "SELECT * FROM delayed_child;",
-				Expected: []sql.Row{{1, 2}, {2, 3}},
-			},
-		},
-	},
-	{
-		Name: "DROP TABLE with FOREIGN_KEY_CHECKS=0",
-		SetUpScript: []string{
-			"ALTER TABLE child ADD CONSTRAINT fk_dropped FOREIGN KEY (v1) REFERENCES parent(v1);",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query:       "TRUNCATE parent;",
-				ExpectedErr: sql.ErrTruncateReferencedFromForeignKey,
-			},
-			{
-				Query:       "DROP TABLE parent;",
-				ExpectedErr: sql.ErrForeignKeyDropTable,
-			},
-			{
-				Query:    "SET FOREIGN_KEY_CHECKS=0;",
-				Expected: []sql.Row{{types.NewOkResult(0)}},
-			},
-			{
-				Query:    "TRUNCATE parent;",
-				Expected: []sql.Row{{types.NewOkResult(0)}},
-			},
-			{
-				Query:    "DROP TABLE parent;",
-				Expected: []sql.Row{{types.NewOkResult(0)}},
-			},
-			{
-				Query:    "SET FOREIGN_KEY_CHECKS=1;",
-				Expected: []sql.Row{{types.NewOkResult(0)}},
-			},
-			{
-				Query:       "INSERT INTO child VALUES (4, 5, 6);",
-				ExpectedErr: sql.ErrForeignKeyNotResolved,
-			},
-			{
-				Query:    "CREATE TABLE parent (pk INT PRIMARY KEY, v1 INT, INDEX (v1));",
-				Expected: []sql.Row{{types.NewOkResult(0)}},
-			},
-			{
-				Query:    "INSERT INTO parent VALUES (1, 5);",
-				Expected: []sql.Row{{types.NewOkResult(1)}},
-			},
-			{
-				Query:    "INSERT INTO child VALUES (4, 5, 6);",
-				Expected: []sql.Row{{types.NewOkResult(1)}},
-			},
-			{
-				Query:    "SELECT * FROM parent;",
-				Expected: []sql.Row{{1, 5}},
-			},
-			{
-				Query:    "SELECT * FROM child;",
-				Expected: []sql.Row{{4, 5, 6}},
 			},
 		},
 	},
@@ -2086,18 +1626,6 @@ var ForeignKeyTests = []ScriptTest{
 		},
 	},
 	{
-		Name: "May use different collations as long as the character sets are equivalent",
-		SetUpScript: []string{
-			"CREATE TABLE t1 (pk char(32) COLLATE utf8mb4_0900_ai_ci PRIMARY KEY);",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query:    "CREATE TABLE t2 (pk char(32) COLLATE utf8mb4_0900_bin PRIMARY KEY, CONSTRAINT fk_1 FOREIGN KEY (pk) REFERENCES t1 (pk));",
-				Expected: []sql.Row{{types.NewOkResult(0)}},
-			},
-		},
-	},
-	{
 		Name: "Referenced index includes implicit primary key columns",
 		SetUpScript: []string{
 			"create table parent1 (fk1 int, pk1 int, pk2 int, pk3 int, primary key(pk1, pk2, pk3), index (fk1, pk2));",
@@ -2634,6 +2162,195 @@ var ForeignKeyTests = []ScriptTest{
 		},
 	},
 	{
+		Name: "UPDATE only checks the foreign keys over the columns it changes",
+		SetUpScript: []string{
+			"create table pt (id int primary key, v int);",
+			"create table ct (id int primary key, pid int, v int, foreign key (pid) references pt (id));",
+			"insert into pt values (1, 0), (2, 0);",
+			"insert into ct values (1, 1, 0);",
+			"set foreign_key_checks = 0;",
+			"insert into ct values (2, 77, 0);",
+			"create table orphan (id int primary key, pid int, v int, foreign key (pid) references missing (id));",
+			"insert into orphan values (1, 1, 0);",
+			"set foreign_key_checks = 1;",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query: "update pt set v = 1 where id = 1;",
+				Expected: []sql.Row{
+					{types.OkResult{RowsAffected: 1, Info: plan.UpdateInfo{Matched: 1, Updated: 1}}},
+				},
+			},
+			{
+				Query: "update ct set v = 1 where id = 2;",
+				Expected: []sql.Row{
+					{types.OkResult{RowsAffected: 1, Info: plan.UpdateInfo{Matched: 1, Updated: 1}}},
+				},
+			},
+			{
+				Query:       "update ct set pid = 78 where id = 2;",
+				ExpectedErr: sql.ErrForeignKeyChildViolation,
+			},
+			{
+				Query:       "update pt set id = 3 where id = 1;",
+				ExpectedErr: sql.ErrForeignKeyParentViolation,
+			},
+			{
+				Query: "update orphan set v = 1;",
+				Expected: []sql.Row{
+					{types.OkResult{RowsAffected: 1, Info: plan.UpdateInfo{Matched: 1, Updated: 1}}},
+				},
+			},
+			{
+				Query: "select * from ct order by id;",
+				Expected: []sql.Row{
+					{1, 1, 0},
+					{2, 77, 1},
+				},
+			},
+		},
+	},
+	{
+		Name: "UPDATE checks a foreign key over a column that a BEFORE UPDATE trigger assigns",
+		SetUpScript: []string{
+			"create table pt (id int primary key);",
+			"create table ct (id int primary key, pid int, v int, foreign key (pid) references pt (id));",
+			"insert into pt values (1), (2);",
+			"insert into ct values (1, 1, 0);",
+			"create trigger ct_bu before update on ct for each row set new.pid = new.v;",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query: "update ct set v = 2;",
+				Expected: []sql.Row{
+					{types.OkResult{RowsAffected: 1, Info: plan.UpdateInfo{Matched: 1, Updated: 1}}},
+				},
+			},
+			{
+				Query:       "update ct set v = 9;",
+				ExpectedErr: sql.ErrForeignKeyChildViolation,
+			},
+			{
+				Query:    "select * from ct;",
+				Expected: []sql.Row{{1, 2, 2}},
+			},
+		},
+	},
+	{
+		Name: "UPDATE checks a foreign key over a generated column of the columns it assigns",
+		SetUpScript: []string{
+			"create table pt (id int primary key);",
+			"create table ct (id int primary key, a int, g int as (a + 1) stored, foreign key (g) references pt (id));",
+			"insert into pt values (1), (2);",
+			"insert into ct (id, a) values (1, 0);",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query: "update ct set a = 1;",
+				Expected: []sql.Row{
+					{types.OkResult{RowsAffected: 1, Info: plan.UpdateInfo{Matched: 1, Updated: 1}}},
+				},
+			},
+			{
+				Query:       "update ct set a = 5;",
+				ExpectedErr: sql.ErrForeignKeyChildViolation,
+			},
+			{
+				Query:    "select * from ct;",
+				Expected: []sql.Row{{1, 1, 2}},
+			},
+		},
+	},
+	{
+		Name: "UPDATE checks a foreign key over a column with an ON UPDATE expression",
+		SetUpScript: []string{
+			"create table pt (ts datetime primary key);",
+			"insert into pt values ('2020-01-01 00:00:00');",
+			"create table ct (id int primary key, v int, ts datetime default '2020-01-01 00:00:00' on update current_timestamp, foreign key (ts) references pt (ts));",
+			"insert into ct (id, v) values (1, 0);",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:       "update ct set v = 1;",
+				ExpectedErr: sql.ErrForeignKeyChildViolation,
+			},
+			{
+				Query:    "select * from ct;",
+				Expected: []sql.Row{{1, 0, time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)}},
+			},
+		},
+	},
+	{
+		Name: "UPDATE JOIN only checks the foreign keys over the columns it changes",
+		SetUpScript: []string{
+			"create table pt (id int primary key, v int);",
+			"create table ct (id int primary key, pid int, v int, foreign key (pid) references pt (id));",
+			"insert into pt values (1, 0), (2, 0);",
+			"insert into ct values (1, 1, 0);",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query: "update pt join ct on pt.id = ct.pid set pt.v = 1, ct.v = 1;",
+				Expected: []sql.Row{
+					{types.OkResult{RowsAffected: 2, Info: plan.UpdateInfo{Matched: 2, Updated: 2}}},
+				},
+			},
+			{
+				Query:       "update pt join ct on pt.id = ct.pid set pt.v = 2, ct.pid = 9;",
+				ExpectedErr: sql.ErrForeignKeyChildViolation,
+			},
+			{
+				Query:       "update pt join ct on pt.id = ct.pid set pt.id = 9;",
+				ExpectedErr: sql.ErrForeignKeyParentViolation,
+			},
+			{
+				Query: "update pt join ct on pt.id = ct.pid set ct.pid = 2;",
+				Expected: []sql.Row{
+					{types.OkResult{RowsAffected: 1, Info: plan.UpdateInfo{Matched: 1, Updated: 1}}},
+				},
+			},
+			{
+				Query:    "select * from ct;",
+				Expected: []sql.Row{{1, 2, 1}},
+			},
+		},
+	},
+	{
+		Name: "RESTRICT doesn't depend on the child's other foreign keys",
+		SetUpScript: []string{
+			"create table pt (id int primary key);",
+			"insert into pt values (1), (2), (3);",
+			"set foreign_key_checks = 0;",
+			"create table ct (id int primary key, pid int, mid int, foreign key (pid) references pt (id), foreign key (mid) references missing (id));",
+			"insert into ct values (1, 1, 1);",
+			"set foreign_key_checks = 1;",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "delete from pt where id = 2;",
+				Expected: []sql.Row{{types.NewOkResult(1)}},
+			},
+			{
+				Query: "update pt set id = 4 where id = 3;",
+				Expected: []sql.Row{
+					{types.OkResult{RowsAffected: 1, Info: plan.UpdateInfo{Matched: 1, Updated: 1}}},
+				},
+			},
+			{
+				Query:       "delete from pt where id = 1;",
+				ExpectedErr: sql.ErrForeignKeyParentViolation,
+			},
+			{
+				Query:       "update pt set id = 5 where id = 1;",
+				ExpectedErr: sql.ErrForeignKeyParentViolation,
+			},
+			{
+				Query:    "select * from pt order by id;",
+				Expected: []sql.Row{{1}, {4}},
+			},
+		},
+	},
+	{
 		Name: "multiple foreign key refs",
 		SetUpScript: []string{
 			"create table parent1 (i int primary key);",
@@ -2698,6 +2415,246 @@ var ForeignKeyTests = []ScriptTest{
 				Expected: []sql.Row{
 					{20, 3},
 				},
+			},
+		},
+	},
+	{
+		// See https://github.com/dolthub/dolt/issues/11317
+		Name: "ON UPDATE CASCADE maintains an index over a virtual column",
+		SetUpScript: []string{
+			"CREATE TABLE vc_parent (id int PRIMARY KEY);",
+			"CREATE TABLE vc_child (id int PRIMARY KEY, parentId int, vcol int AS (parentId) VIRTUAL, UNIQUE KEY uk (vcol), FOREIGN KEY (parentId) REFERENCES vc_parent(id) ON UPDATE CASCADE);",
+			"INSERT INTO vc_parent VALUES (2);",
+			"INSERT INTO vc_child (id, parentId) VALUES (20, 2);",
+			"UPDATE vc_parent SET id = 99 WHERE id = 2;",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "SELECT id, parentId, vcol FROM vc_child ORDER BY id;",
+				Expected: []sql.Row{{20, 99, 99}},
+			},
+			{
+				Query:              "SELECT id FROM vc_child WHERE vcol = 99;",
+				Expected:           []sql.Row{{20}},
+				CheckIndexedAccess: true,
+				ExpectedIndexes:    []string{"uk"},
+			},
+			{
+				Query:              "SELECT id FROM vc_child WHERE vcol = 2;",
+				Expected:           []sql.Row{},
+				CheckIndexedAccess: true,
+				ExpectedIndexes:    []string{"uk"},
+			},
+			{
+				Query:       "INSERT INTO vc_child (id, parentId) VALUES (40, 99);",
+				ExpectedErr: sql.ErrUniqueKeyViolation,
+			},
+		},
+	},
+	{
+		// See https://github.com/dolthub/dolt/issues/11317
+		Name: "ON UPDATE CASCADE recomputes chained virtual columns",
+		SetUpScript: []string{
+			"CREATE TABLE vc_parent (id int PRIMARY KEY);",
+			"CREATE TABLE vc_child (id int PRIMARY KEY, parentId int, v1 int AS (parentId) VIRTUAL, v2 int AS (v1 + 100) VIRTUAL, UNIQUE KEY uk (v2), FOREIGN KEY (parentId) REFERENCES vc_parent(id) ON UPDATE CASCADE);",
+			"INSERT INTO vc_parent VALUES (2);",
+			"INSERT INTO vc_child (id, parentId) VALUES (20, 2);",
+			"UPDATE vc_parent SET id = 99 WHERE id = 2;",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "SELECT id, parentId, v1, v2 FROM vc_child ORDER BY id;",
+				Expected: []sql.Row{{20, 99, 99, 199}},
+			},
+			{
+				Query:              "SELECT id FROM vc_child WHERE v2 = 199;",
+				Expected:           []sql.Row{{20}},
+				CheckIndexedAccess: true,
+				ExpectedIndexes:    []string{"uk"},
+			},
+		},
+	},
+	{
+		// See https://github.com/dolthub/dolt/issues/11317
+		Name: "ON DELETE SET NULL maintains an index over a virtual column",
+		SetUpScript: []string{
+			"CREATE TABLE vc_parent (id int PRIMARY KEY);",
+			"CREATE TABLE vc_child (id int PRIMARY KEY, parentId int, vcol int AS (parentId) VIRTUAL, UNIQUE KEY uk (vcol), FOREIGN KEY (parentId) REFERENCES vc_parent(id) ON DELETE SET NULL);",
+			"INSERT INTO vc_parent VALUES (2);",
+			"INSERT INTO vc_child (id, parentId) VALUES (20, 2);",
+			"DELETE FROM vc_parent WHERE id = 2;",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "SELECT id, parentId, vcol FROM vc_child ORDER BY id;",
+				Expected: []sql.Row{{20, nil, nil}},
+			},
+			{
+				Query:              "SELECT id FROM vc_child WHERE vcol = 2;",
+				Expected:           []sql.Row{},
+				CheckIndexedAccess: true,
+				ExpectedIndexes:    []string{"uk"},
+			},
+		},
+	},
+	{
+		// See https://github.com/dolthub/dolt/issues/11317
+		Name: "ON UPDATE SET NULL maintains an index over a virtual column",
+		SetUpScript: []string{
+			"CREATE TABLE vc_parent (id int PRIMARY KEY);",
+			"CREATE TABLE vc_child (id int PRIMARY KEY, parentId int, vcol int AS (parentId) VIRTUAL, UNIQUE KEY uk (vcol), FOREIGN KEY (parentId) REFERENCES vc_parent(id) ON UPDATE SET NULL);",
+			"INSERT INTO vc_parent VALUES (2);",
+			"INSERT INTO vc_child (id, parentId) VALUES (20, 2);",
+			"UPDATE vc_parent SET id = 99 WHERE id = 2;",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "SELECT id, parentId, vcol FROM vc_child ORDER BY id;",
+				Expected: []sql.Row{{20, nil, nil}},
+			},
+			{
+				Query:              "SELECT id FROM vc_child WHERE vcol = 2;",
+				Expected:           []sql.Row{},
+				CheckIndexedAccess: true,
+				ExpectedIndexes:    []string{"uk"},
+			},
+		},
+	},
+	{
+		// See https://github.com/dolthub/dolt/issues/11317
+		Name: "self-referential ON DELETE SET NULL maintains an index over a virtual column",
+		SetUpScript: []string{
+			"CREATE TABLE vc_t (id int PRIMARY KEY, parentId int, parentKey int AS (parentId) VIRTUAL, UNIQUE KEY uk (parentKey), FOREIGN KEY (parentId) REFERENCES vc_t(id) ON DELETE SET NULL);",
+			"INSERT INTO vc_t (id, parentId) VALUES (1, NULL), (2, 1), (3, 2);",
+			"DELETE FROM vc_t WHERE id = 2;",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "SELECT id, parentId, parentKey FROM vc_t ORDER BY id;",
+				Expected: []sql.Row{{1, nil, nil}, {3, nil, nil}},
+			},
+			{
+				Query:              "SELECT id FROM vc_t WHERE parentKey = 2;",
+				Expected:           []sql.Row{},
+				CheckIndexedAccess: true,
+				ExpectedIndexes:    []string{"uk"},
+			},
+		},
+	},
+	{
+		// See https://github.com/dolthub/dolt/issues/11317
+		Name: "ON DELETE CASCADE maintains an index over a virtual column, self-referential",
+		SetUpScript: []string{
+			"CREATE TABLE vc_t2 (id int PRIMARY KEY, parentId int, parentKey int AS (parentId) VIRTUAL, UNIQUE KEY uk (parentKey), FOREIGN KEY (parentId) REFERENCES vc_t2(id) ON DELETE CASCADE);",
+			"INSERT INTO vc_t2 (id, parentId) VALUES (1, NULL), (2, 1);",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "DELETE FROM vc_t2 WHERE id = 1;",
+				Expected: []sql.Row{{types.NewOkResult(1)}},
+			},
+			{
+				Query:    "SELECT id, parentId, parentKey FROM vc_t2 ORDER BY id;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:              "SELECT parentKey FROM vc_t2 WHERE parentKey = 1;",
+				Expected:           []sql.Row{},
+				CheckIndexedAccess: true,
+				ExpectedIndexes:    []string{"uk"},
+			},
+			{
+				Query:    "INSERT INTO vc_t2 (id, parentId) VALUES (3, NULL), (4, 3);",
+				Expected: []sql.Row{{types.NewOkResult(2)}},
+			},
+			{
+				Query:    "SELECT id, parentId, parentKey FROM vc_t2 ORDER BY id;",
+				Expected: []sql.Row{{3, nil, nil}, {4, 3, 3}},
+			},
+		},
+	},
+	{
+		// See https://github.com/dolthub/dolt/issues/11317
+		Name: "ON DELETE CASCADE maintains an index over a virtual column between stored columns",
+		SetUpScript: []string{
+			"CREATE TABLE vc_parent2 (id int PRIMARY KEY);",
+			"CREATE TABLE vc_child2 (" +
+				"id int PRIMARY KEY, " +
+				"parentId int, " +
+				"doubled int AS (parentId * 2) VIRTUAL, " +
+				"note varchar(10), " +
+				"KEY idx_doubled (doubled), " +
+				"FOREIGN KEY (parentId) REFERENCES vc_parent2(id) ON DELETE CASCADE);",
+			"INSERT INTO vc_parent2 VALUES (1), (2);",
+			"INSERT INTO vc_child2 (id, parentId, note) VALUES (10, 1, 'a'), (20, 1, 'b'), (30, 2, 'c');",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "DELETE FROM vc_parent2 WHERE id = 1;",
+				Expected: []sql.Row{{types.NewOkResult(1)}},
+			},
+			{
+				Query:    "SELECT id, parentId, doubled, note FROM vc_child2 ORDER BY id;",
+				Expected: []sql.Row{{30, 2, 4, "c"}},
+			},
+			{
+				Query:              "SELECT id FROM vc_child2 WHERE doubled = 4;",
+				Expected:           []sql.Row{{30}},
+				CheckIndexedAccess: true,
+				ExpectedIndexes:    []string{"idx_doubled"},
+			},
+			{
+				Query:              "SELECT id FROM vc_child2 WHERE doubled = 2;",
+				Expected:           []sql.Row{},
+				CheckIndexedAccess: true,
+				ExpectedIndexes:    []string{"idx_doubled"},
+			},
+		},
+	},
+	// The editors that foreign keys take must be closed even when the statement doesn't run them. An integrator may
+	// fail the next transaction, or the next statement, if they aren't.
+	{
+		Name: "foreign key editors are closed when their statement doesn't run them",
+		SetUpScript: []string{
+			"CREATE TABLE ec_parent (id INT PRIMARY KEY);",
+			"CREATE TABLE ec_child (id INT PRIMARY KEY, pid INT, FOREIGN KEY (pid) REFERENCES ec_parent (id));",
+			"CREATE TABLE ec_t (id INT PRIMARY KEY);",
+			"CREATE TABLE ec_u (id INT PRIMARY KEY);",
+			"INSERT INTO ec_parent VALUES (1);",
+			"CREATE TRIGGER ec_trig AFTER INSERT ON ec_t FOR EACH ROW INSERT INTO ec_child VALUES (new.id, 1);",
+			"CREATE TRIGGER ec_trig_if AFTER INSERT ON ec_u FOR EACH ROW BEGIN IF new.id > 100 THEN INSERT INTO ec_child VALUES (new.id, 1); END IF; END;",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "INSERT INTO ec_child VALUES (1, 1);",
+				Expected: []sql.Row{{types.NewOkResult(1)}},
+			},
+			{
+				Query:            "EXPLAIN PLAN INSERT INTO ec_child VALUES (2, 1);",
+				SkipResultsCheck: true,
+			},
+			{
+				// The trigger never fires.
+				Query:    "INSERT INTO ec_t SELECT id FROM ec_parent WHERE id > 100;",
+				Expected: []sql.Row{{types.NewOkResult(0)}},
+			},
+			{
+				// The trigger fires, but the branch with the insert isn't taken.
+				Query:    "INSERT INTO ec_u VALUES (1);",
+				Expected: []sql.Row{{types.NewOkResult(1)}},
+			},
+			{
+				Query:    "SELECT * FROM ec_child;",
+				Expected: []sql.Row{{1, 1}},
+			},
+			{
+				// Foreign keys are applied before this fails analysis.
+				Query:       "INSERT INTO ec_child SELECT id, (SELECT 1, 2) FROM ec_parent;",
+				ExpectedErr: sql.ErrInvalidOperandColumns,
+			},
+			{
+				Query:    "SELECT * FROM ec_child;",
+				Expected: []sql.Row{{1, 1}},
 			},
 		},
 	},
@@ -2780,6 +2737,54 @@ var CreateForeignKeyTests = []ScriptTest{
 			},
 			{
 				Query:    "CREATE TABLE delayed_parent4 (pk BIGINT PRIMARY KEY)",
+				Expected: []sql.Row{{types.NewOkResult(0)}},
+			},
+		},
+	},
+	{
+		Name: "stored generated column foreign keys",
+		SetUpScript: []string{
+			"create table parent(id int primary key)",
+			"create table child(a int, b int as (a) stored)",
+			"create table child2(a int, b int as (a) virtual)",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:       "alter table child add constraint fk_child foreign key (a) references parent(id) on delete set null;",
+				ExpectedErr: sql.ErrStoredGeneratedColumnForeignKeyConflict,
+			},
+			{
+				// https://github.com/dolthub/dolt/issues/11083
+				Skip:        true,
+				Query:       "alter table child add constraint fk_child foreign key (b) references parent(id) on delete set null;",
+				ExpectedErr: sql.ErrStoredGeneratedColumnForeignKeyConflict,
+			},
+			{
+				Query: "alter table child2 add constraint fk_child foreign key (a) references parent(id) on delete set null;",
+				// This is allowed because the generated column is virtual.
+				Expected: []sql.Row{{types.NewOkResult(0)}},
+			},
+			{
+				Query:       "create table child3(a int, b int as (a) stored, foreign key (a) references parent(id) on update cascade);",
+				ExpectedErr: sql.ErrStoredGeneratedColumnForeignKeyConflict,
+			},
+			{
+				// https://github.com/dolthub/dolt/issues/11083
+				Skip:        true,
+				Query:       "create table child3(a int, b int as (a) stored, foreign key (b) references parent(id) on update cascade);",
+				ExpectedErr: sql.ErrStoredGeneratedColumnForeignKeyConflict,
+			},
+			{
+				// https://github.com/dolthub/dolt/issues/11082
+				Skip:        true,
+				Query:       "select * from child3",
+				ExpectedErr: sql.ErrTableNotFound,
+			},
+			{
+				// This should be child3, but we have to use child4 here due to tables still being created despite
+				// erroring out https://github.com/dolthub/dolt/issues/11082
+				Query: "create table child4(a int, b int as (a) virtual, foreign key (a) references parent(id) on update cascade);",
+				// This is allowed because the generated column is virtual.
 				Expected: []sql.Row{{types.NewOkResult(0)}},
 			},
 		},

@@ -17,9 +17,11 @@ package function
 import (
 	"fmt"
 	"math"
+	"regexp"
 	"strings"
 	"time"
 
+	"github.com/dolthub/vitess/go/mysql"
 	"gopkg.in/src-d/go-errors.v1"
 
 	"github.com/dolthub/go-mysql-server/sql"
@@ -36,7 +38,7 @@ var _ sql.FunctionExpression = (*DateDiff)(nil)
 var _ sql.CollationCoercible = (*DateDiff)(nil)
 
 // NewDateDiff creates a new DATEDIFF() function.
-func NewDateDiff(expr1, expr2 sql.Expression) sql.Expression {
+func NewDateDiff(ctx *sql.Context, expr1, expr2 sql.Expression) sql.Expression {
 	return &DateDiff{
 		expression.BinaryExpressionStub{
 			LeftChild:  expr1,
@@ -61,10 +63,10 @@ func (d *DateDiff) String() string {
 }
 
 // Type implements the sql.Expression interface.
-func (d *DateDiff) Type() sql.Type { return types.Int64 }
+func (d *DateDiff) Type(ctx *sql.Context) sql.Type { return types.Int64 }
 
 // IsNullable implements the Expression interface
-func (d *DateDiff) IsNullable() bool {
+func (d *DateDiff) IsNullable(ctx *sql.Context) bool {
 	return true
 }
 
@@ -74,11 +76,11 @@ func (*DateDiff) CollationCoercibility(ctx *sql.Context) (collation sql.Collatio
 }
 
 // WithChildren implements the Expression interface.
-func (d *DateDiff) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (d *DateDiff) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 2 {
 		return nil, sql.ErrInvalidChildrenNumber.New(d, len(children), 2)
 	}
-	return NewDateDiff(children[0], children[1]), nil
+	return NewDateDiff(ctx, children[0], children[1]), nil
 }
 
 // Eval implements the sql.Expression interface.
@@ -91,20 +93,19 @@ func (d *DateDiff) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	if val1 == nil {
+	expr1, _, err := types.Date.Convert(ctx, val1)
+	if err != nil && !sql.HandleConvertWarning(ctx, err) {
 		return nil, nil
 	}
-
-	expr1, _, err := types.DatetimeMaxPrecision.Convert(ctx, val1)
-	if err != nil {
-		ctx.Warn(1292, "Incorrect datetime value: '%s'", val1)
-		return nil, nil
-	}
-
-	expr1str := expr1.(time.Time).String()[:10]
-	expr1, _, _ = types.DatetimeMaxPrecision.Convert(ctx, expr1str)
-	if expr1 == nil {
-		ctx.Warn(1292, "Incorrect datetime value: '%s'", val1)
+	var date1 time.Time
+	switch expr1.(type) {
+	case time.Time:
+		date1 = expr1.(time.Time)
+		if types.ZeroTime.Equal(date1) {
+			ctx.Warn(mysql.ERTruncatedWrongValue, "%s", sql.ErrTruncatedIncorrect.New("datetime", val1).Error())
+			return nil, nil
+		}
+	default:
 		return nil, nil
 	}
 
@@ -112,25 +113,21 @@ func (d *DateDiff) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	if val2 == nil {
+	expr2, _, err := types.Date.Convert(ctx, val2)
+	if err != nil && !sql.HandleConvertWarning(ctx, err) {
 		return nil, nil
 	}
-
-	expr2, _, err := types.DatetimeMaxPrecision.Convert(ctx, val2)
-	if err != nil {
-		ctx.Warn(1292, "Incorrect datetime value: '%s'", val2)
+	var date2 time.Time
+	switch expr2.(type) {
+	case time.Time:
+		date2 = expr2.(time.Time)
+		if types.ZeroTime.Equal(date2) {
+			ctx.Warn(mysql.ERTruncatedWrongValue, "%s", sql.ErrTruncatedIncorrect.New("datetime", val2).Error())
+			return nil, nil
+		}
+	default:
 		return nil, nil
 	}
-
-	expr2str := expr2.(time.Time).String()[:10]
-	expr2, _, _ = types.DatetimeMaxPrecision.Convert(ctx, expr2str)
-	if expr2 == nil {
-		ctx.Warn(1292, "Incorrect datetime value: '%s'", val2)
-		return nil, nil
-	}
-
-	date1 := expr1.(time.Time)
-	date2 := expr2.(time.Time)
 
 	diff := int64(math.Round(date1.Sub(date2).Hours() / 24))
 
@@ -147,7 +144,7 @@ var _ sql.FunctionExpression = (*DateAdd)(nil)
 var _ sql.CollationCoercible = (*DateAdd)(nil)
 
 // NewDateAdd creates a new date add function.
-func NewDateAdd(args ...sql.Expression) (sql.Expression, error) {
+func NewDateAdd(ctx *sql.Context, args ...sql.Expression) (sql.Expression, error) {
 	if len(args) != 2 {
 		return nil, sql.ErrInvalidArgumentNumber.New("DATE_ADD", 2, len(args))
 	}
@@ -164,7 +161,7 @@ func NewDateAdd(args ...sql.Expression) (sql.Expression, error) {
 // function is a synonym for DATE_ADD, with the one exception that if the second argument is NOT an
 // explicitly declared interval, then the value is used and the interval period is assumed to be DAY.
 // In either case, this function will actually return a *DateAdd struct.
-func NewAddDate(args ...sql.Expression) (sql.Expression, error) {
+func NewAddDate(ctx *sql.Context, args ...sql.Expression) (sql.Expression, error) {
 	if len(args) != 2 {
 		return nil, sql.ErrInvalidArgumentNumber.New("ADDDATE", 2, len(args))
 	}
@@ -206,13 +203,13 @@ func (d *DateAdd) Resolved() bool {
 }
 
 // IsNullable implements the sql.Expression interface.
-func (d *DateAdd) IsNullable() bool {
+func (d *DateAdd) IsNullable(ctx *sql.Context) bool {
 	return true
 }
 
 // Type implements the sql.Expression interface.
-func (d *DateAdd) Type() sql.Type {
-	sqlType := dateOffsetType(d.Date, d.Interval)
+func (d *DateAdd) Type(ctx *sql.Context) sql.Type {
+	sqlType := dateOffsetType(ctx, d.Date, d.Interval)
 	return sqlType
 }
 
@@ -222,8 +219,8 @@ func (*DateAdd) CollationCoercibility(ctx *sql.Context) (collation sql.Collation
 }
 
 // WithChildren implements the Expression interface.
-func (d *DateAdd) WithChildren(children ...sql.Expression) (sql.Expression, error) {
-	return NewDateAdd(children...)
+func (d *DateAdd) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
+	return NewDateAdd(ctx, children...)
 }
 
 // Eval implements the sql.Expression interface.
@@ -246,15 +243,15 @@ func (d *DateAdd) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 		return nil, nil
 	}
 
-	var dateVal interface{}
+	var dateVal any
 	dateVal, _, err = types.DatetimeMaxRange.Convert(ctx, date)
 	if err != nil {
-		ctx.Warn(1292, "%s", err.Error())
+		ctx.Warn(mysql.ERTruncatedWrongValue, "%s", err.Error())
 		return nil, nil
 	}
 	datetime, ok := dateVal.(time.Time)
 	if !ok || datetime.Equal(types.ZeroTime) {
-		ctx.Warn(1292, "Incorrect datetime value: '%s'", date)
+		ctx.Warn(mysql.ERTruncatedWrongValue, "%s", sql.ErrIncorrectValue.New(types.DatetimeMaxRange.String(), date).Error())
 		return nil, nil
 	}
 
@@ -264,8 +261,9 @@ func (d *DateAdd) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 		return nil, nil
 	}
 
-	resType := d.Type()
+	resType := d.Type(ctx)
 	if types.IsText(resType) {
+		// TODO: use the regex
 		// If the input is a properly formatted date/datetime string, the output should also be a string
 		if dateStr, isStr := date.(string); isStr {
 			if res.(time.Time).Nanosecond() > 0 {
@@ -300,7 +298,7 @@ var _ sql.FunctionExpression = (*DateSub)(nil)
 var _ sql.CollationCoercible = (*DateSub)(nil)
 
 // NewDateSub creates a new date add function.
-func NewDateSub(args ...sql.Expression) (sql.Expression, error) {
+func NewDateSub(ctx *sql.Context, args ...sql.Expression) (sql.Expression, error) {
 	if len(args) != 2 {
 		return nil, sql.ErrInvalidArgumentNumber.New("DATE_SUB", 2, len(args))
 	}
@@ -317,7 +315,7 @@ func NewDateSub(args ...sql.Expression) (sql.Expression, error) {
 // function is a synonym for DATE_SUB, with the one exception that if the second argument is NOT an
 // explicitly declared interval, then the value is used and the interval period is assumed to be DAY.
 // In either case, this function will actually return a *DateSub struct.
-func NewSubDate(args ...sql.Expression) (sql.Expression, error) {
+func NewSubDate(ctx *sql.Context, args ...sql.Expression) (sql.Expression, error) {
 	if len(args) != 2 {
 		return nil, sql.ErrInvalidArgumentNumber.New("SUBDATE", 2, len(args))
 	}
@@ -359,13 +357,13 @@ func (d *DateSub) Resolved() bool {
 }
 
 // IsNullable implements the sql.Expression interface.
-func (d *DateSub) IsNullable() bool {
+func (d *DateSub) IsNullable(ctx *sql.Context) bool {
 	return true
 }
 
 // Type implements the sql.Expression interface.
-func (d *DateSub) Type() sql.Type {
-	sqlType := dateOffsetType(d.Date, d.Interval)
+func (d *DateSub) Type(ctx *sql.Context) sql.Type {
+	sqlType := dateOffsetType(ctx, d.Date, d.Interval)
 	return sqlType
 }
 
@@ -375,8 +373,8 @@ func (*DateSub) CollationCoercibility(ctx *sql.Context) (collation sql.Collation
 }
 
 // WithChildren implements the Expression interface.
-func (d *DateSub) WithChildren(children ...sql.Expression) (sql.Expression, error) {
-	return NewDateSub(children...)
+func (d *DateSub) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
+	return NewDateSub(ctx, children...)
 }
 
 // Eval implements the sql.Expression interface.
@@ -402,12 +400,12 @@ func (d *DateSub) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 	var dateVal interface{}
 	dateVal, _, err = types.DatetimeMaxRange.Convert(ctx, date)
 	if err != nil {
-		ctx.Warn(1292, "%s", err.Error())
+		ctx.Warn(mysql.ERTruncatedWrongValue, "%s", err.Error())
 		return nil, nil
 	}
 	datetime, ok := dateVal.(time.Time)
 	if !ok || datetime.Equal(types.ZeroTime) {
-		ctx.Warn(1292, "Incorrect datetime value: '%s'", date)
+		ctx.Warn(mysql.ERTruncatedWrongValue, "%s", sql.ErrIncorrectValue.New(types.DatetimeMaxRange.String(), date).Error())
 		return nil, nil
 	}
 
@@ -417,7 +415,7 @@ func (d *DateSub) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 		return nil, nil
 	}
 
-	resType := d.Type()
+	resType := d.Type(ctx)
 	if types.IsText(resType) {
 		// If the input is a properly formatted date/datetime string, the output should also be a string
 		if dateStr, isStr := date.(string); isStr {
@@ -452,7 +450,7 @@ var _ sql.FunctionExpression = (*TimeDiff)(nil)
 var _ sql.CollationCoercible = (*TimeDiff)(nil)
 
 // NewTimeDiff creates a new NewTimeDiff expression.
-func NewTimeDiff(e1, e2 sql.Expression) sql.Expression {
+func NewTimeDiff(ctx *sql.Context, e1, e2 sql.Expression) sql.Expression {
 	return &TimeDiff{
 		expression.BinaryExpressionStub{
 			LeftChild:  e1,
@@ -472,7 +470,7 @@ func (td *TimeDiff) Description() string {
 }
 
 // Type implements the Expression interface.
-func (td *TimeDiff) Type() sql.Type { return types.Time }
+func (td *TimeDiff) Type(ctx *sql.Context) sql.Type { return types.TimeMaxPrecision }
 
 // CollationCoercibility implements the interface sql.CollationCoercible.
 func (*TimeDiff) CollationCoercibility(ctx *sql.Context) (collation sql.CollationID, coercibility byte) {
@@ -484,11 +482,11 @@ func (td *TimeDiff) String() string {
 }
 
 // WithChildren implements the Expression interface.
-func (td *TimeDiff) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (td *TimeDiff) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 2 {
 		return nil, sql.ErrInvalidChildrenNumber.New(td, len(children), 2)
 	}
-	return NewTimeDiff(children[0], children[1]), nil
+	return NewTimeDiff(ctx, children[0], children[1]), nil
 }
 
 func convToDateOrTime(ctx *sql.Context, val interface{}) (interface{}, error) {
@@ -496,7 +494,7 @@ func convToDateOrTime(ctx *sql.Context, val interface{}) (interface{}, error) {
 	if err == nil {
 		return date, nil
 	}
-	tim, _, err := types.Time.Convert(ctx, val)
+	tim, _, err := types.TimeMaxPrecision.Convert(ctx, val)
 	if err == nil {
 		return tim, err
 	}
@@ -527,14 +525,14 @@ func (td *TimeDiff) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 	if _, ok := left.(string); ok {
 		left, err = convToDateOrTime(ctx, left)
 		if err != nil {
-			ctx.Warn(1292, "%s", err.Error())
+			ctx.Warn(mysql.ERTruncatedWrongValue, "%s", err.Error())
 			return nil, nil
 		}
 	}
 	if _, ok := right.(string); ok {
 		right, err = convToDateOrTime(ctx, right)
 		if err != nil {
-			ctx.Warn(1292, "%s", err.Error())
+			ctx.Warn(mysql.ERTruncatedWrongValue, "%s", err.Error())
 			return nil, nil
 		}
 	}
@@ -548,7 +546,7 @@ func (td *TimeDiff) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 		if leftDatetime.Location() != rightDatetime.Location() {
 			rightDatetime = rightDatetime.In(leftDatetime.Location())
 		}
-		ret, _, err := types.Time.Convert(ctx, leftDatetime.Sub(rightDatetime))
+		ret, _, err := types.TimeMaxPrecision.Convert(ctx, leftDatetime.Sub(rightDatetime))
 		return ret, err
 	}
 
@@ -574,7 +572,7 @@ var _ sql.FunctionExpression = (*TimestampDiff)(nil)
 var _ sql.CollationCoercible = (*TimestampDiff)(nil)
 
 // NewTimestampDiff creates a new TIMESTAMPDIFF() function.
-func NewTimestampDiff(u, e1, e2 sql.Expression) sql.Expression {
+func NewTimestampDiff(ctx *sql.Context, u, e1, e2 sql.Expression) sql.Expression {
 	return &TimestampDiff{u, e1, e2}
 }
 
@@ -593,6 +591,17 @@ func (t *TimestampDiff) String() string {
 	return fmt.Sprintf("TIMESTAMPDIFF(%s, %s, %s)", t.unit, t.expr1, t.expr2)
 }
 
+// quotedTimestampDiffUnit matches a TIMESTAMPDIFF unit written as a string.
+var quotedTimestampDiffUnit = regexp.MustCompile(`(?i)(\bTIMESTAMPDIFF\(\s*)'([A-Za-z_]+)'`)
+
+// init registers the stored default rewrite for TIMESTAMPDIFF, which removes
+// the quotes from the unit so a stored default with a quoted unit parses again.
+func init() {
+	sql.RegisterStoredDefaultRewrite("timestampdiff", func(text string) string {
+		return quotedTimestampDiffUnit.ReplaceAllString(text, "${1}${2}")
+	})
+}
+
 // Children implements the sql.Expression interface.
 func (t *TimestampDiff) Children() []sql.Expression {
 	return []sql.Expression{t.unit, t.expr1, t.expr2}
@@ -604,12 +613,12 @@ func (t *TimestampDiff) Resolved() bool {
 }
 
 // IsNullable implements the sql.Expression interface.
-func (t *TimestampDiff) IsNullable() bool {
+func (t *TimestampDiff) IsNullable(ctx *sql.Context) bool {
 	return true
 }
 
 // Type implements the sql.Expression interface.
-func (t *TimestampDiff) Type() sql.Type { return types.Int64 }
+func (t *TimestampDiff) Type(ctx *sql.Context) sql.Type { return types.Int64 }
 
 // CollationCoercibility implements the interface sql.CollationCoercible.
 func (*TimestampDiff) CollationCoercibility(ctx *sql.Context) (collation sql.CollationID, coercibility byte) {
@@ -617,11 +626,11 @@ func (*TimestampDiff) CollationCoercibility(ctx *sql.Context) (collation sql.Col
 }
 
 // WithChildren implements the Expression interface.
-func (t *TimestampDiff) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (t *TimestampDiff) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 3 {
 		return nil, sql.ErrInvalidChildrenNumber.New(t, len(children), 3)
 	}
-	return NewTimestampDiff(children[0], children[1], children[2]), nil
+	return NewTimestampDiff(ctx, children[0], children[1], children[2]), nil
 }
 
 // Eval implements the sql.Expression interface.
@@ -650,13 +659,15 @@ func (t *TimestampDiff) Eval(ctx *sql.Context, row sql.Row) (interface{}, error)
 	}
 
 	expr1, _, err = types.DatetimeMaxPrecision.Convert(ctx, expr1)
-	if err != nil {
-		return nil, err
+	if err != nil && !sql.HandleConvertWarning(ctx, err) {
+		ctx.Warn(mysql.ERTruncatedWrongValue, "%s", err.Error())
+		return nil, nil
 	}
 
 	expr2, _, err = types.DatetimeMaxPrecision.Convert(ctx, expr2)
-	if err != nil {
-		return nil, err
+	if err != nil && !sql.HandleConvertWarning(ctx, err) {
+		ctx.Warn(mysql.ERTruncatedWrongValue, "%s", err.Error())
+		return nil, nil
 	}
 
 	unit, err := t.unit.Eval(ctx, row)

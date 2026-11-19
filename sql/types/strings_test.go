@@ -56,6 +56,12 @@ func TestStringCompare(t *testing.T) {
 		{MustCreateStringWithDefaults(sqltypes.VarChar, 10), "0xed54321", "0x12345de", 1},
 		{MustCreateStringWithDefaults(sqltypes.VarChar, 10), []byte("254"), 254, 0},
 		{MustCreateStringWithDefaults(sqltypes.VarChar, 10), []byte("254"), 254.5, -1},
+		{MustCreateStringWithDefaults(sqltypes.Char, 10), "a", "a ", 0},
+		{MustCreateStringWithDefaults(sqltypes.Char, 10), "a ", "a", 0},
+		{MustCreateStringWithDefaults(sqltypes.Char, 10), "a  ", "a", 0},
+		{MustCreateStringWithDefaults(sqltypes.Char, 10), "a", "b", -1},
+		{MustCreateStringWithDefaults(sqltypes.Char, 10), "a ", "b", -1},
+		{MustCreateStringWithDefaults(sqltypes.VarChar, 10), "a", "a ", -1},
 
 		// Sanity checks that behavior is consistent
 		{MustCreateBinary(sqltypes.Binary, 10), 0, 1, -1},
@@ -320,6 +326,11 @@ func TestStringConvert(t *testing.T) {
 		{MustCreateStringWithDefaults(sqltypes.Text, 7), "abcde", "abcde", false},
 		{MustCreateBinary(sqltypes.VarBinary, 7), "abcde", []byte("abcde"), false},
 		{MustCreateStringWithDefaults(sqltypes.VarChar, 7), "abcde", "abcde", false},
+		{MustCreateStringWithDefaults(sqltypes.Char, 7), "a ", "a", false},
+		{MustCreateStringWithDefaults(sqltypes.Char, 7), "a  ", "a", false},
+		{MustCreateStringWithDefaults(sqltypes.VarChar, 7), "a ", "a ", false},
+		{MustCreateStringWithDefaults(sqltypes.Char, 3), "a   ", "a", false},
+		{MustCreateStringWithDefaults(sqltypes.Char, 3), "abc ", "abc", false},
 
 		{MustCreateStringWithDefaults(sqltypes.Char, 4), int(1), "1", false},
 		{MustCreateStringWithDefaults(sqltypes.Text, 4), int8(2), "2", false},
@@ -424,6 +435,62 @@ func TestStringString(t *testing.T) {
 		t.Run(fmt.Sprintf("%v %v", test.typ, test.expectedStr), func(t *testing.T) {
 			str := test.typ.String()
 			assert.Equal(t, test.expectedStr, str)
+		})
+	}
+}
+
+func TestStringComparePadAttribute(t *testing.T) {
+	// https://github.com/dolthub/dolt/issues/12503
+	ctx := sql.NewEmptyContext()
+	tests := []struct {
+		name     string
+		typ      sql.Type
+		left     string
+		right    string
+		expected int
+	}{
+		{
+			name:     "utf8mb4_0900_ai_ci NO PAD distinguishes trailing space",
+			typ:      MustCreateString(sqltypes.Text, 100, sql.Collation_utf8mb4_0900_ai_ci),
+			left:     "a",
+			right:    "a ",
+			expected: -1,
+		},
+		{
+			name:     "utf8mb4_general_ci PAD SPACE ignores trailing space",
+			typ:      MustCreateString(sqltypes.Text, 100, sql.Collation_utf8mb4_general_ci),
+			left:     "a",
+			right:    "a ",
+			expected: 0,
+		},
+		{
+			name:     "utf8mb4_bin PAD SPACE ignores trailing space",
+			typ:      MustCreateString(sqltypes.VarChar, 100, sql.Collation_utf8mb4_bin),
+			left:     "a",
+			right:    "a ",
+			expected: 0,
+		},
+		{
+			name:     "CHAR NO PAD ignores trailing space",
+			typ:      MustCreateString(sqltypes.Char, 100, sql.Collation_utf8mb4_0900_ai_ci),
+			left:     "a",
+			right:    "a ",
+			expected: 0,
+		},
+		{
+			name:     "VARBINARY distinguishes trailing space",
+			typ:      MustCreateBinary(sqltypes.VarBinary, 100),
+			left:     "a",
+			right:    "a ",
+			expected: -1,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cmp, err := test.typ.Compare(ctx, test.left, test.right)
+			require.NoError(t, err)
+			assert.Equal(t, test.expected, cmp)
 		})
 	}
 }

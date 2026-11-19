@@ -28,6 +28,7 @@ import (
 func TestGenBuilder(t *testing.T) {
 	t.Skip()
 	nodes := map[string]string{
+		"OnDupUpdateSource":         "*plan.OnDuplicateKeyUpdateSource",
 		"Releaser":                  "*plan.Releaser",
 		"dummyNode":                 "plan.dummyNode",
 		"UnresolvedTableFunction":   "*plan.UnresolvedTableFunction",
@@ -169,6 +170,7 @@ func TestGenBuilder(t *testing.T) {
 		"CreateSavepoint":           "*plan.CreateSavepoint",
 		"RollbackSavepoint":         "*plan.RollbackSavepoint",
 		"ReleaseSavepoint":          "*plan.ReleaseSavepoint",
+		"DisallowedStatement":       "*plan.DisallowedStatement",
 		"TransactionCommittingNode": "*plan.TransactionCommittingNode",
 		"TransformedNamedNode":      "*plan.TransformedNamedNode",
 		"TriggerExecutor":           "*plan.TriggerExecutor",
@@ -214,7 +216,6 @@ func TestGenBuilder(t *testing.T) {
 		"GreaterThanOrEqual":       "*expression.GreaterThanOrEqual",
 		"LessThanOrEqual":          "*expression.LessThanOrEqual",
 		"Convert":                  "*expression.Convert",
-		"DefaultColumn":            "*expression.DefaultColumn",
 		"DistinctExpression":       "*expression.DistinctExpression",
 		"Rand":                     "*expression.Rand",
 		"Time":                     "*expression.Time",

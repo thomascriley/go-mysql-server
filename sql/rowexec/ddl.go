@@ -26,9 +26,11 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/dolthub/go-mysql-server/sql"
+	"github.com/dolthub/go-mysql-server/sql/expression"
 	"github.com/dolthub/go-mysql-server/sql/fulltext"
 	"github.com/dolthub/go-mysql-server/sql/mysql_db"
 	"github.com/dolthub/go-mysql-server/sql/plan"
+	"github.com/dolthub/go-mysql-server/sql/planbuilder"
 	"github.com/dolthub/go-mysql-server/sql/types"
 )
 
@@ -63,7 +65,7 @@ func (b *BaseBuilder) buildLoadData(ctx *sql.Context, n *plan.LoadData, row sql.
 	var reader io.ReadCloser
 	var err error
 	if n.Local {
-		_, localInfile, ok := sql.SystemVariables.GetGlobal("local_infile")
+		_, localInfile, ok := ctx.SystemVariables().GetGlobal("local_infile")
 		if !ok {
 			return nil, fmt.Errorf("error: local_infile variable was not found")
 		}
@@ -77,7 +79,7 @@ func (b *BaseBuilder) buildLoadData(ctx *sql.Context, n *plan.LoadData, row sql.
 			return nil, err
 		}
 	} else {
-		_, secureFileDir, ok := sql.SystemVariables.GetGlobal("secure_file_priv")
+		_, secureFileDir, ok := ctx.SystemVariables().GetGlobal("secure_file_priv")
 		if !ok {
 			return nil, fmt.Errorf("error: secure_file_priv variable was not found")
 		}
@@ -96,7 +98,7 @@ func (b *BaseBuilder) buildLoadData(ctx *sql.Context, n *plan.LoadData, row sql.
 	scanner.Buffer(nil, int(types.LongTextBlobMax))
 	scanner.Split(n.SplitLines)
 
-	sch := n.Schema()
+	sch := n.Schema(ctx)
 	source := sch[0].Source // Schema will always have at least one column
 	colNames := n.ColNames
 	if len(colNames) == 0 {
@@ -143,7 +145,7 @@ func (b *BaseBuilder) buildDropConstraint(ctx *sql.Context, n *plan.DropConstrai
 	return nil, fmt.Errorf("%T does not have an execution iterator, this is a bug", n)
 }
 
-func (b *BaseBuilder) buildCreateView(ctx *sql.Context, n *plan.CreateView, row sql.Row) (sql.RowIter, error) {
+func (b *BaseBuilder) buildCreateView(ctx *sql.Context, n *plan.CreateView, _ sql.Row) (sql.RowIter, error) {
 	registry := ctx.GetViewRegistry()
 	if n.IsReplace {
 		if dropper, ok := n.Database().(sql.ViewDatabase); ok {
@@ -158,6 +160,13 @@ func (b *BaseBuilder) buildCreateView(ctx *sql.Context, n *plan.CreateView, row 
 			}
 		}
 	}
+
+	if v, ok := n.Database().(sql.SchemaObjectNameValidator); ok {
+		if err := v.ValidateNewViewName(ctx, n.Name, n.IsReplace); err != nil {
+			return nil, err
+		}
+	}
+
 	names, err := n.Database().GetTableNames(ctx)
 	if err != nil {
 		return nil, err
@@ -216,7 +225,7 @@ func (b *BaseBuilder) buildAlterDefaultSet(ctx *sql.Context, n *plan.AlterDefaul
 	}
 	loweredColName := strings.ToLower(n.ColumnName)
 	var col *sql.Column
-	for _, schCol := range alterable.Schema() {
+	for _, schCol := range alterable.Schema(ctx) {
 		if strings.ToLower(schCol.Name) == loweredColName {
 			col = schCol
 			break
@@ -250,6 +259,19 @@ func (b *BaseBuilder) buildRenameTable(ctx *sql.Context, n *plan.RenameTable, ro
 	renamer, _ := n.Db.(sql.TableRenamer)
 	viewDb, _ := n.Db.(sql.ViewDatabase)
 	viewRegistry := ctx.GetViewRegistry()
+
+	db := n.Db
+	if pdb, ok := db.(mysql_db.PrivilegedDatabase); ok {
+		db = pdb.Unwrap()
+	}
+	if v, ok := db.(sql.SchemaObjectNameValidator); ok {
+		for _, newName := range n.NewNames {
+			_, err := v.ValidateNewTableName(ctx, newName, false)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
 
 	for i, oldName := range n.OldNames {
 		if tbl, exists := n.TableExists(ctx, oldName); exists {
@@ -294,7 +316,7 @@ func (b *BaseBuilder) buildModifyColumn(ctx *sql.Context, n *plan.ModifyColumn, 
 		return nil, sql.ErrAlterTableNotSupported.New(tbl.Name())
 	}
 
-	if err := n.ValidateDefaultPosition(n.TargetSchema()); err != nil {
+	if err := n.ValidateDefaultPosition(ctx, n.TargetSchema()); err != nil {
 		return nil, err
 	}
 	// MySQL assigns the column's type (which contains the collation) at column creation/modification. If a column has
@@ -350,14 +372,14 @@ func (b *BaseBuilder) buildCreateIndex(ctx *sql.Context, n *plan.CreateIndex, ro
 		return nil, plan.ErrInvalidIndexDriver.New(n.Driver)
 	}
 
-	columns, exprs, err := GetColumnsAndPrepareExpressions(n.Exprs)
+	columns, exprs, err := GetColumnsAndPrepareExpressions(ctx, n.Exprs)
 	if err != nil {
 		return nil, err
 	}
 
 	for _, e := range exprs {
-		if types.IsBlobType(e.Type()) || types.IsJSON(e.Type()) {
-			return nil, plan.ErrExprTypeNotIndexable.New(e, e.Type())
+		if types.IsBlobType(e.Type(ctx)) || types.IsJSON(e.Type(ctx)) {
+			return nil, plan.ErrExprTypeNotIndexable.New(e, e.Type(ctx))
 		}
 	}
 
@@ -535,7 +557,7 @@ func (b *BaseBuilder) buildAlterDefaultDrop(ctx *sql.Context, n *plan.AlterDefau
 	alterable, ok := table.(sql.AlterableTable)
 	loweredColName := strings.ToLower(n.ColumnName)
 	var col *sql.Column
-	for _, schCol := range alterable.Schema() {
+	for _, schCol := range alterable.Schema(ctx) {
 		if strings.ToLower(schCol.Name) == loweredColName {
 			col = schCol
 			break
@@ -608,6 +630,7 @@ func (b *BaseBuilder) buildAlterUser(ctx *sql.Context, a *plan.AlterUser, _ sql.
 	// have a plaintext password to process into an authorization string for the auth plugin.
 	plugin := previousUserEntry.Plugin
 	authString := previousUserEntry.AuthString
+	identity := previousUserEntry.Identity
 	if user.Auth1 != nil {
 		plugin = user.Auth1.Plugin()
 		var err error
@@ -615,6 +638,7 @@ func (b *BaseBuilder) buildAlterUser(ctx *sql.Context, a *plan.AlterUser, _ sql.
 		if err != nil {
 			return nil, err
 		}
+		identity = user.Identity
 	}
 	if plugin != string(mysql.MysqlNativePassword) && plugin != string(mysql.CachingSha2Password) {
 		if err := mysqlDb.VerifyPlugin(plugin); err != nil {
@@ -624,6 +648,7 @@ func (b *BaseBuilder) buildAlterUser(ctx *sql.Context, a *plan.AlterUser, _ sql.
 
 	previousUserEntry.Plugin = plugin
 	previousUserEntry.AuthString = authString
+	previousUserEntry.Identity = identity
 	previousUserEntry.PasswordLastChanged = time.Now().UTC()
 	editor.PutUser(previousUserEntry)
 
@@ -753,12 +778,12 @@ func (b *BaseBuilder) buildAlterPK(ctx *sql.Context, n *plan.AlterPK, row sql.Ro
 
 	switch n.Action {
 	case plan.PrimaryKeyAction_Create:
-		if plan.HasPrimaryKeys(pkAlterable) {
+		if plan.HasPrimaryKeys(ctx, pkAlterable) {
 			return sql.RowsToRowIter(), sql.ErrMultiplePrimaryKeysDefined.New()
 		}
 
 		for _, c := range n.Columns {
-			if !pkAlterable.Schema().Contains(c.Name, pkAlterable.Name()) {
+			if !pkAlterable.Schema(ctx).Contains(c.Name, pkAlterable.Name()) {
 				return sql.RowsToRowIter(), sql.ErrKeyColumnDoesNotExist.New(c.Name)
 			}
 		}
@@ -768,12 +793,14 @@ func (b *BaseBuilder) buildAlterPK(ctx *sql.Context, n *plan.AlterPK, row sql.Ro
 			columns:      n.Columns,
 			pkAlterable:  pkAlterable,
 			db:           n.Database(),
+			overrides:    b.EngineOverrides,
 		}, nil
 	case plan.PrimaryKeyAction_Drop:
 		return &dropPkIter{
 			targetSchema: n.TargetSchema(),
 			pkAlterable:  pkAlterable,
 			db:           n.Database(),
+			overrides:    b.EngineOverrides,
 		}, nil
 	default:
 		panic("unreachable")
@@ -954,6 +981,14 @@ func (b *BaseBuilder) buildRenameColumn(ctx *sql.Context, n *plan.RenameColumn, 
 		return nil, sql.ErrTableColumnNotFound.New(tbl.Name(), n.ColumnName)
 	}
 
+	// Check for functional index dependencies (matches MySQL ERROR 3837)
+	colLower := strings.ToLower(n.ColumnName)
+	for _, col := range n.TargetSchema() {
+		if col.HiddenSystem && col.Generated != nil && plan.ColumnReferencedInDefaultValueExpression(ctx, col.Generated, colLower) {
+			return nil, sql.ErrColumnFunctionalIndexDependency.New(n.ColumnName)
+		}
+	}
+
 	nc := *n.TargetSchema()[idx]
 	nc.Name = n.NewColumnName
 	col := &nc
@@ -1011,14 +1046,14 @@ func (b *BaseBuilder) buildAddColumn(ctx *sql.Context, n *plan.AddColumn, row sq
 
 	tbl := alterable.(sql.Table)
 	tblSch := n.TargetSchema()
-	if n.Order() != nil && !n.Order().First {
-		idx := tblSch.IndexOf(n.Order().AfterColumn, tbl.Name())
+	if n.Order(ctx) != nil && !n.Order(ctx).First {
+		idx := tblSch.IndexOf(n.Order(ctx).AfterColumn, tbl.Name())
 		if idx < 0 {
-			return nil, sql.ErrTableColumnNotFound.New(tbl.Name(), n.Order().AfterColumn)
+			return nil, sql.ErrTableColumnNotFound.New(tbl.Name(), n.Order(ctx).AfterColumn)
 		}
 	}
 
-	if err := n.ValidateDefaultPosition(tblSch); err != nil {
+	if err := n.ValidateDefaultPosition(ctx, tblSch); err != nil {
 		return nil, err
 	}
 	// MySQL assigns the column's type (which contains the collation) at column creation/modification. If a column has
@@ -1098,7 +1133,7 @@ func (b *BaseBuilder) buildCreateTable(ctx *sql.Context, n *plan.CreateTable, ro
 		}
 	}
 
-	err = n.ValidateDefaultPosition()
+	err = n.ValidateDefaultPosition(ctx)
 	if err != nil {
 		return sql.RowsToRowIter(), err
 	}
@@ -1108,6 +1143,16 @@ func (b *BaseBuilder) buildCreateTable(ctx *sql.Context, n *plan.CreateTable, ro
 		maybePrivDb = privDb.Unwrap()
 	}
 
+	if v, ok := maybePrivDb.(sql.SchemaObjectNameValidator); ok {
+		nameAlreadyUsed, err := v.ValidateNewTableName(ctx, n.Name(), n.IfNotExists())
+		if err != nil {
+			return nil, err
+		} else if nameAlreadyUsed && n.IfNotExists() {
+			return rowIterWithOkResultWithZeroRowsAffected(), nil
+		}
+	}
+
+	comment, _ := n.TableOpts["comment"].(string)
 	if n.Temporary() {
 		creatable, ok := maybePrivDb.(sql.TemporaryTableCreator)
 		if !ok {
@@ -1131,7 +1176,7 @@ func (b *BaseBuilder) buildCreateTable(ctx *sql.Context, n *plan.CreateTable, ro
 				}
 			}
 			if pkIdxDef != nil {
-				err = creatable.CreateIndexedTable(ctx, n.Name(), n.PkSchema(), *pkIdxDef, n.Collation)
+				err = creatable.CreateIndexedTable(ctx, n.Name(), n.PkSchema(), *pkIdxDef, n.Collation, comment)
 				if sql.ErrUnsupportedIndexPrefix.Is(err) {
 					return sql.RowsToRowIter(), err
 				}
@@ -1140,17 +1185,9 @@ func (b *BaseBuilder) buildCreateTable(ctx *sql.Context, n *plan.CreateTable, ro
 				if !ok {
 					return sql.RowsToRowIter(), sql.ErrCreateTableNotSupported.New(n.Db.Name())
 				}
-				comment := ""
-				if n.TableOpts != nil && n.TableOpts["comment"] != nil {
-					comment = n.TableOpts["comment"].(string)
-				}
 				err = creatable.CreateTable(ctx, n.Name(), n.PkSchema(), n.Collation, comment)
 			}
 		case sql.TableCreator:
-			comment := ""
-			if n.TableOpts != nil && n.TableOpts["comment"] != nil {
-				comment = n.TableOpts["comment"].(string)
-			}
 			err = creatable.CreateTable(ctx, n.Name(), n.PkSchema(), n.Collation, comment)
 		default:
 			return sql.RowsToRowIter(), sql.ErrCreateTableNotSupported.New(n.Db.Name())
@@ -1176,8 +1213,9 @@ func (b *BaseBuilder) buildCreateTable(ctx *sql.Context, n *plan.CreateTable, ro
 		}
 	}
 
-	// TODO: in the event that foreign keys or indexes aren't supported, you'll be left with a created table and no foreign keys/indexes
-	// this also means that if a foreign key or index fails, you'll only have what was declared up to the failure
+	// TODO: in the event that foreign keys or indexes aren't supported, you'll be left with a created table and no
+	//  foreign keys/indexes This also means that if a foreign key or index fails, the table will still have been
+	//  created anyways, just without the foreign key or index https://github.com/dolthub/dolt/issues/11082
 	tableNode, ok, err := n.Db.GetTableInsensitive(ctx, n.Name())
 	if err != nil {
 		return sql.RowsToRowIter(), err
@@ -1200,16 +1238,28 @@ func (b *BaseBuilder) buildCreateTable(ctx *sql.Context, n *plan.CreateTable, ro
 			}
 
 			// No-op if the table doesn't already have an auto increment column.
-			if autoTbl.Schema().HasAutoIncrement() {
+			if autoTbl.Schema(ctx).HasAutoIncrement() {
 				setter := autoTbl.AutoIncrementSetter(ctx)
 				err = setter.SetAutoIncrementValue(ctx, aiVal)
 				if err != nil {
+					_ = setter.Close(ctx)
 					return sql.RowsToRowIter(), err
 				}
 				err = setter.Close(ctx)
 				if err != nil {
 					return sql.RowsToRowIter(), err
 				}
+			}
+		}
+	}
+
+	if targetRowSize, hasTargetRowSize := n.TableOpts["target_row_size"]; hasTargetRowSize {
+		val := targetRowSize.(uint64)
+		alterable, ok := tableNode.(sql.TargetRowSizeAlterableTable)
+		if ok {
+			err = alterable.ModifyTargetRowSize(ctx, val)
+			if err != nil {
+				return sql.RowsToRowIter(), err
 			}
 		}
 	}
@@ -1229,7 +1279,7 @@ func (b *BaseBuilder) buildCreateTable(ctx *sql.Context, n *plan.CreateTable, ro
 	}
 
 	if len(n.ForeignKeys()) > 0 {
-		err = n.CreateForeignKeys(ctx, tableNode)
+		err = b.buildCreateTableForeignKeys(ctx, n, tableNode)
 		if err != nil {
 			return sql.RowsToRowIter(), err
 		}
@@ -1251,6 +1301,107 @@ func (b *BaseBuilder) buildCreateTable(ctx *sql.Context, n *plan.CreateTable, ro
 	return rowIterWithOkResultWithZeroRowsAffected(), nil
 }
 
+// buildCreateTableForeignKeys creates, validates, and resolves the foreign keys that are part of a CreateTable
+func (b *BaseBuilder) buildCreateTableForeignKeys(ctx *sql.Context, n *plan.CreateTable, tableNode sql.Table) error {
+	fkTbl, ok := tableNode.(sql.ForeignKeyTable)
+	if !ok {
+		return sql.ErrNoForeignKeySupport.New(n.Name())
+	}
+
+	fkChecks, err := ctx.GetSessionVariable(ctx, "foreign_key_checks")
+	if err != nil {
+		return err
+	}
+
+	storedGeneratedColumnRefs, err := b.storedGeneratedColumnReferences(ctx, fkTbl)
+	if err != nil {
+		return err
+	}
+	parentForeignKeyTables := n.ParentForeignKeyTables()
+	for i, fkDef := range n.ForeignKeys() {
+		err = validateForeignKeyStoredGeneratedColumnRefs(fkDef, storedGeneratedColumnRefs)
+		if err != nil {
+			return err
+		}
+		if fkChecks.(int8) == 1 {
+			fkParentTbl := parentForeignKeyTables[i]
+			// If a foreign key is self-referential then the analyzer uses a nil since the table does not yet exist
+			if fkParentTbl == nil {
+				fkParentTbl = fkTbl
+			}
+			// If foreign_key_checks are true, then the referenced tables will be populated
+			err = plan.ResolveForeignKey(ctx, fkTbl, fkParentTbl, *fkDef, true, true, true)
+			if err != nil {
+				return err
+			}
+		} else {
+			// If foreign_key_checks are true, then the referenced tables will be populated
+			err = plan.ResolveForeignKey(ctx, fkTbl, nil, *fkDef, true, false, false)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// validateForeignKeyStoredGeneratedColumnRefs checks if there are any conflicts between foreign key referential actions
+// and stored generated columns
+func validateForeignKeyStoredGeneratedColumnRefs(fkDef *sql.ForeignKeyConstraint, storedGeneratedColumnRefs map[string]bool) error {
+	if storedGeneratedColumnRefs == nil || fkDef.AllowStoredGeneratedColumnReference() {
+		return nil
+	}
+	for _, col := range fkDef.Columns {
+		if contains, ok := storedGeneratedColumnRefs[col]; contains && ok {
+			return sql.ErrStoredGeneratedColumnForeignKeyConflict.New()
+		}
+	}
+	return nil
+}
+
+// storedGeneratedColumnReferences resolves any stored generated columns, inspects them for references to other columns,
+// and returns a set of base columns referenced by any stored generated columns
+func (b *BaseBuilder) storedGeneratedColumnReferences(ctx *sql.Context, table sql.ForeignKeyTable) (map[string]bool, error) {
+	hasStoredGeneratedColumn := false
+	schema := table.Schema(ctx)
+	for _, col := range schema {
+		if !col.Virtual && col.Generated != nil {
+			hasStoredGeneratedColumn = true
+			if !col.Generated.Resolved() {
+				// TODO: calling ResolveSchemaDefaults here is doing too much since we only need the stored generated
+				//  columns to be resolved. We are currently not able to do so because planbuilder.scope and
+				//  planbuilder.resolveColumnDefaultExpression are both unexported.
+				var err error
+				schema, err = planbuilder.NewBuilderForColumnDefaultResolution(ctx, b.EngineOverrides).
+					ResolveSchemaDefaults(ctx.GetCurrentDatabase(), table.Name(), schema)
+				if err != nil {
+					return nil, err
+				}
+				break
+			}
+		}
+	}
+	if hasStoredGeneratedColumn {
+		refs := make(map[string]bool)
+		// TODO: second pass through the schema would not be necessary if we're able to resolve individual column
+		//  expressions.
+		for _, col := range schema {
+			if !col.Virtual && col.Generated != nil {
+				sql.Inspect(ctx, col.Generated.Expr, func(ctx *sql.Context, e sql.Expression) bool {
+					if colRef, ok := e.(*expression.GetField); ok {
+						refs[colRef.Name()] = true
+						return false
+					}
+					return true
+				})
+			}
+		}
+		return refs, nil
+	}
+	return nil, nil
+}
+
 func createIndexesForCreateTable(ctx *sql.Context, db sql.Database, tableNode sql.Table, idxes sql.IndexDefs) (err error) {
 	idxAltTbl, ok := tableNode.(sql.IndexAlterableTable)
 	if !ok {
@@ -1261,7 +1412,7 @@ func createIndexesForCreateTable(ctx *sql.Context, db sql.Database, tableNode sq
 	fulltextIndexes := make(sql.IndexDefs, 0)
 	for _, idxDef := range idxes {
 		if len(idxDef.Name) == 0 {
-			idxDef.Name, err = generateIndexName(ctx, idxAltTbl, idxDef.ColumnNames())
+			idxDef.Name, err = getIndexNameGenerator(db).GenerateIndexName(ctx, tableNode.Name(), *idxDef, idxAltTbl)
 			if err != nil {
 				return err
 			}
@@ -1455,12 +1606,19 @@ func (b *BaseBuilder) buildCreateForeignKey(ctx *sql.Context, n *plan.CreateFore
 		return nil, sql.ErrNoForeignKeySupport.New(n.FkDef.ParentTable)
 	}
 
+	storedGeneratedColumnRefs, err := b.storedGeneratedColumnReferences(ctx, fkTbl)
+	if err != nil {
+		return nil, err
+	}
+	err = validateForeignKeyStoredGeneratedColumnRefs(n.FkDef, storedGeneratedColumnRefs)
+	if err != nil {
+		return nil, err
+	}
 	fkChecks, err := ctx.GetSessionVariable(ctx, "foreign_key_checks")
 	if err != nil {
 		return nil, err
 	}
-
-	err = plan.ResolveForeignKey(ctx, fkTbl, refFkTbl, *n.FkDef, true, fkChecks.(int8) == 1, true)
+	err = plan.ResolveForeignKey(ctx, fkTbl, refFkTbl, *n.FkDef, true, fkChecks.(int8) == 1, !n.FkDef.IsNotValid)
 	if err != nil {
 		return nil, err
 	}

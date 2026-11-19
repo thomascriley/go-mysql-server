@@ -72,6 +72,8 @@ func (b *BaseBuilder) buildNodeExecNoAnalyze(ctx *sql.Context, n sql.Node, row s
 		return b.buildShowBinlogStatus(ctx, n, row)
 	case *plan.ShowReplicaStatus:
 		return b.buildShowReplicaStatus(ctx, n, row)
+	case *plan.OnDuplicateKeyUpdateSource:
+		return b.buildOnDupUpdateSource(ctx, n, row)
 	case *plan.UpdateSource:
 		return b.buildUpdateSource(ctx, n, row)
 	case plan.ElseCaseError:
@@ -246,8 +248,6 @@ func (b *BaseBuilder) buildNodeExecNoAnalyze(ctx *sql.Context, n sql.Node, row s
 		return b.buildCreateIndex(ctx, n, row)
 	case *plan.Procedure:
 		return b.buildProcedure(ctx, n, row)
-	case *plan.With:
-		return b.buildWith(ctx, n, row)
 	case *plan.Project:
 		return b.buildProject(ctx, n, row)
 	case *plan.ModifyColumn:
@@ -308,6 +308,8 @@ func (b *BaseBuilder) buildNodeExecNoAnalyze(ctx *sql.Context, n sql.Node, row s
 		return b.buildRollbackSavepoint(ctx, n, row)
 	case *plan.ReleaseSavepoint:
 		return b.buildReleaseSavepoint(ctx, n, row)
+	case *plan.DisallowedStatement:
+		return b.buildDisallowedStatement(ctx, n, row)
 	case *plan.Update:
 		return b.buildUpdate(ctx, n, row)
 	case plan.ShowWarnings:

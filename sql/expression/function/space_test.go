@@ -15,9 +15,9 @@
 package function
 
 import (
+	"strings"
 	"testing"
 
-	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/require"
 
 	"github.com/dolthub/go-mysql-server/sql"
@@ -77,7 +77,7 @@ func TestSpace(t *testing.T) {
 		},
 		{
 			name: "decimal rounds down",
-			arg:  expression.NewLiteral(decimal.NewFromFloat(1.1), types.DecimalType_{}),
+			arg:  expression.NewLiteral(types.DecimalFromFloat64(1.1), types.DecimalType_{}),
 			exp:  " ",
 			err:  false,
 		},
@@ -95,7 +95,7 @@ func TestSpace(t *testing.T) {
 		},
 		{
 			name: "decimal rounds up",
-			arg:  expression.NewLiteral(decimal.NewFromFloat(1.99), types.DecimalType_{}),
+			arg:  expression.NewLiteral(types.DecimalFromFloat64(1.99), types.DecimalType_{}),
 			exp:  "  ",
 			err:  false,
 		},
@@ -113,7 +113,7 @@ func TestSpace(t *testing.T) {
 		},
 		{
 			name: "negative decimal is 0",
-			arg:  expression.NewLiteral(decimal.NewFromFloat(-12.34), types.DecimalType_{}),
+			arg:  expression.NewLiteral(types.DecimalFromFloat64(-12.34), types.DecimalType_{}),
 			exp:  "",
 			err:  false,
 		},
@@ -147,7 +147,7 @@ func TestSpace(t *testing.T) {
 			}
 
 			ctx := sql.NewEmptyContext()
-			f := NewSpace(tt.arg)
+			f := NewSpace(sql.NewEmptyContext(), tt.arg)
 
 			res, err := f.Eval(ctx, nil)
 			if tt.err {
@@ -159,4 +159,23 @@ func TestSpace(t *testing.T) {
 			require.Equal(t, tt.exp, res)
 		})
 	}
+}
+
+func TestSpaceBoundedAllocations(t *testing.T) {
+	const count = 100_000
+	ctx := sql.NewEmptyContext()
+	f := NewSpace(ctx, expression.NewLiteral(int64(count), types.Int64))
+
+	res, err := f.Eval(ctx, nil)
+	require.NoError(t, err)
+	spaces, ok := res.(string)
+	require.True(t, ok)
+	require.Equal(t, strings.Repeat(" ", count), spaces)
+
+	allocations := testing.AllocsPerRun(1, func() {
+		_, err := f.Eval(ctx, nil)
+		require.NoError(t, err)
+	})
+	// A linear construction should not allocate once per output byte.
+	require.Less(t, allocations, float64(count)/100)
 }

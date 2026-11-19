@@ -29,6 +29,7 @@ type MultiTableEditor struct {
 var _ sql.TableEditor = MultiTableEditor{}
 var _ sql.ForeignKeyEditor = MultiTableEditor{}
 var _ sql.AutoIncrementSetter = MultiTableEditor{}
+var _ sql.UniqueKeyConflictCheckingRowInserter = MultiTableEditor{}
 
 // CreateMultiTableEditor creates a TableEditor that writes to both the primary and secondary editors. The primary
 // editor must implement ForeignKeyEditor and AutoIncrementSetter in addition to TableEditor.
@@ -94,11 +95,24 @@ func (editor MultiTableEditor) StatementComplete(ctx *sql.Context) error {
 // Insert implements the interface sql.TableEditor.
 func (editor MultiTableEditor) Insert(ctx *sql.Context, row sql.Row) error {
 	for _, secondary := range editor.secondaries {
+		// TODO: In some places, for example `REPLACE INTO` and `INSERT...ON DUPLICATE UPDATE`, we use the information
+		//  inside UniqueKeyError to perform the replace/update. However, the information in the UniqueKeyError
+		//  generated from an Insert on a secondary table does always not match the primary table's schema.
+		//  https://github.com/dolthub/dolt/issues/10882#issuecomment-4255176383
 		if err := secondary.Insert(ctx, row); err != nil {
 			return err
 		}
 	}
 	return editor.primary.Insert(ctx, row)
+}
+
+// HasUniqueKeyConflict implements sql.UniqueKeyConflictCheckingRowInserter.
+func (editor MultiTableEditor) HasUniqueKeyConflict(ctx *sql.Context, row sql.Row, columns []string) (bool, error) {
+	checker, ok := editor.primary.(sql.UniqueKeyConflictCheckingRowInserter)
+	if !ok {
+		return false, nil
+	}
+	return checker.HasUniqueKeyConflict(ctx, row, columns)
 }
 
 // Update implements the interface sql.TableEditor.

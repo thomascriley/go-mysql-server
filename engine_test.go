@@ -82,7 +82,7 @@ func TestBindingsToExprs(t *testing.T) {
 		{
 			"BadDate",
 			map[string]*query.BindVariable{
-				"v1": &query.BindVariable{Type: query.Type_DATE, Value: []byte("00000000")},
+				"v1": &query.BindVariable{Type: query.Type_DATE, Value: []byte("baddate")},
 			},
 			nil,
 			true,
@@ -98,7 +98,7 @@ func TestBindingsToExprs(t *testing.T) {
 		{
 			"BadDatetime",
 			map[string]*query.BindVariable{
-				"v1": &query.BindVariable{Type: query.Type_DATETIME, Value: []byte("0000")},
+				"v1": &query.BindVariable{Type: query.Type_DATETIME, Value: []byte("baddatetime")},
 			},
 			nil,
 			true,
@@ -106,7 +106,7 @@ func TestBindingsToExprs(t *testing.T) {
 		{
 			"BadTimestamp",
 			map[string]*query.BindVariable{
-				"v1": &query.BindVariable{Type: query.Type_TIMESTAMP, Value: []byte("0000")},
+				"v1": &query.BindVariable{Type: query.Type_TIMESTAMP, Value: []byte("badtimestamp")},
 			},
 			nil,
 			true,
@@ -177,21 +177,23 @@ func getRuleFrom(rules []analyzer.Rule, id analyzer.RuleId) *analyzer.Rule {
 // TODO: this was an analyzer test, but we don't have a mock process list for it to use, so it has to be here
 func TestTrackProcess(t *testing.T) {
 	require := require.New(t)
-	variables.InitStatusVariables()
+
 	db := memory.NewDatabase("db")
 	provider := memory.NewDBProvider(db)
 	a := analyzer.NewDefault(provider)
-	sess := memory.NewSession(sql.NewBaseSession(), provider)
+	vars := variables.NewEngineVariables()
+	sess := memory.NewSession(sql.NewBaseSessionWithVariables(vars), provider)
+
+	pl := NewProcessListWithVariables(vars)
+	ctx := sql.NewContextWithVariables(context.Background(), vars, sql.WithPid(1), sql.WithProcessList(pl), sql.WithSession(sess))
 
 	node := plan.NewInnerJoin(
-		plan.NewResolvedTable(&nonIndexableTable{memory.NewPartitionedTable(db.BaseDatabase, "foo", sql.PrimaryKeySchema{}, nil, 2)}, nil, nil),
-		plan.NewResolvedTable(memory.NewPartitionedTable(db.BaseDatabase, "bar", sql.PrimaryKeySchema{}, nil, 4), nil, nil),
+		ctx,
+		plan.NewResolvedTable(&nonIndexableTable{memory.NewPartitionedTable(ctx, db.BaseDatabase, "foo", sql.PrimaryKeySchema{}, nil, 2)}, nil, nil),
+		plan.NewResolvedTable(memory.NewPartitionedTable(ctx, db.BaseDatabase, "bar", sql.PrimaryKeySchema{}, nil, 4), nil, nil),
 		expression.NewLiteral(int64(1), types.Int64),
 	)
 
-	pl := NewProcessList()
-
-	ctx := sql.NewContext(context.Background(), sql.WithPid(1), sql.WithProcessList(pl), sql.WithSession(sess))
 	pl.AddConnection(ctx.Session.ID(), "localhost")
 	pl.ConnectionReady(ctx.Session)
 	ctx, err := ctx.ProcessList.BeginQuery(ctx, "SELECT foo")
@@ -233,13 +235,87 @@ func TestTrackProcess(t *testing.T) {
 
 	iter, err := rowexec.NewBuilder(nil, sql.EngineOverrides{}).Build(ctx, result, nil)
 	require.NoError(err)
-	iter, _, err = rowexec.FinalizeIters(ctx, result, nil, iter)
+	iter, _, err = rowexec.FinalizeIters(ctx, result, nil, iter, false)
 	require.NoError(err)
 	_, err = sql.RowIterToRows(ctx, iter)
 	require.NoError(err)
 
+	// Closing the iterator does not end the query; that is the responsibility of whoever called BeginQuery.
+	processes = ctx.ProcessList.Processes()
+	require.Len(processes, 1)
+	require.Equal(sql.ProcessCommandQuery, processes[0].Command)
+	require.NoError(ctx.Err())
+
+	ctx.ProcessList.EndQuery(ctx)
 	processes = ctx.ProcessList.Processes()
 	require.Len(processes, 1)
 	require.Equal(sql.ProcessCommandSleep, processes[0].Command)
 	require.Error(ctx.Err())
+}
+
+// TestEventCallsProcedureThatCommits checks that an event body isn't a statement run as part of another statement, so
+// it can call a procedure that commits, while a trigger the event body fires still can't.
+func TestEventCallsProcedureThatCommits(t *testing.T) {
+	db := memory.NewDatabase("mydb")
+	pro := memory.NewDBProvider(db)
+	e := NewDefault(pro)
+	defer e.Close()
+	newCtx := func() *sql.Context {
+		ctx := e.NewContext(context.Background(), sql.WithSession(memory.NewSession(sql.NewBaseSessionWithVariables(e.Variables()), pro)))
+		ctx.SetCurrentDatabase("mydb")
+		return ctx
+	}
+	query := func(q string) ([]sql.Row, error) {
+		ctx := newCtx()
+		_, iter, _, err := e.Query(ctx, q)
+		if err != nil {
+			return nil, err
+		}
+		return sql.RowIterToRows(ctx, iter)
+	}
+	for _, q := range []string{
+		"create table lg (id int primary key)",
+		"create table other (id int primary key)",
+		"create table t (id int primary key)",
+		"create procedure p_commit(v int) begin insert into lg values (v); commit; end",
+		"create trigger trg after insert on t for each row call p_commit(new.id)",
+	} {
+		_, err := query(q)
+		require.NoError(t, err, q)
+	}
+
+	err := e.executeEvent(newCtx(), "mydb", "create event ev on schedule at current_timestamp do begin insert into other values (40); call p_commit(41); insert into other values (42); end", "root", "localhost")
+	require.NoError(t, err)
+	rows, err := query("select (select group_concat(id order by id) from other), (select group_concat(id order by id) from lg)")
+	require.NoError(t, err)
+	require.Equal(t, []sql.Row{{"40,42", "41"}}, rows)
+
+	err = e.executeEvent(newCtx(), "mydb", "create event ev on schedule at current_timestamp do insert into t values (50)", "root", "localhost")
+	require.True(t, sql.ErrCommitNotAllowedInSubStatement.Is(err), "unexpected error: %v", err)
+}
+
+// TestInterpretedQueryErrorKeepsTransaction checks that a failing query run from an interpreted function doesn't end
+// the autocommit transaction, which belongs to the statement running the function, while a failing top-level query
+// still ends its own.
+func TestInterpretedQueryErrorKeepsTransaction(t *testing.T) {
+	db := memory.NewDatabase("mydb")
+	pro := memory.NewDBProvider(db)
+	e := NewDefault(pro)
+	defer e.Close()
+	ctx := e.NewContext(context.Background(), sql.WithSession(memory.NewSession(sql.NewBaseSessionWithVariables(e.Variables()), pro)))
+	ctx.SetCurrentDatabase("mydb")
+
+	_, _, _, err := e.Query(ctx, "select * from missing")
+	require.Error(t, err)
+	require.Nil(t, ctx.GetTransaction())
+
+	require.NoError(t, e.beginTransaction(ctx))
+	tx := ctx.GetTransaction()
+	require.NotNil(t, tx)
+	_, err = sql.RunInterpreted(ctx, func(ctx *sql.Context) (sql.RowIter, error) {
+		_, iter, _, err := e.Query(ctx, "select * from missing")
+		return iter, err
+	})
+	require.Error(t, err)
+	require.Equal(t, tx, ctx.GetTransaction())
 }

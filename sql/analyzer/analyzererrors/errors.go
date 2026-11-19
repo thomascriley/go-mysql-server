@@ -40,6 +40,14 @@ var (
 			"this is incompatible with sql_mode=only_full_group_by",
 	)
 
+	// ErrValidationGroupByHaving is returned when a HAVING expression contains a nonaggregated column that is neither
+	// grouped nor functionally dependent on the GROUP BY columns.
+	ErrValidationGroupByHaving = errors.NewKind(
+		"Expression #%d of HAVING clause is not in GROUP BY clause and contains nonaggregated column '%s' which " +
+			"is not functionally dependent on columns in GROUP BY clause; " +
+			"this is incompatible with sql_mode=only_full_group_by",
+	)
+
 	// ErrValidationSchemaSource is returned when there is any column source
 	// that does not match the table name.
 	ErrValidationSchemaSource = errors.NewKind("one or more schema sources are empty")
@@ -53,13 +61,6 @@ var (
 	ErrCaseResultType = errors.NewKind(
 		"expecting all case branches to return values of type %s, " +
 			"but found value %q of type %s on %s",
-	)
-
-	// ErrIntervalInvalidUse is returned when an interval expression is not
-	// correctly used.
-	ErrIntervalInvalidUse = errors.NewKind(
-		"invalid use of an interval, which can only be used with DATE_ADD, " +
-			"DATE_SUB and +/- operators to subtract from or add to a date",
 	)
 
 	// ErrExplodeInvalidUse is returned when an EXPLODE function is used

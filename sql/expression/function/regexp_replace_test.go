@@ -23,24 +23,29 @@ import (
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/expression"
 	"github.com/dolthub/go-mysql-server/sql/types"
+	"github.com/dolthub/go-mysql-server/testutils"
 )
 
 func TestRegexpReplaceInvalidArgNumber(t *testing.T) {
-	_, err := NewRegexpReplace()
+	ctx := newRegexpTestContext()
+	_, err := NewRegexpReplace(ctx)
 	require.Error(t, err)
 
 	_, err = NewRegexpReplace(
+		ctx,
 		expression.NewGetField(0, types.LongText, "str", true),
 	)
 	require.Error(t, err)
 
 	_, err = NewRegexpReplace(
+		ctx,
 		expression.NewGetField(0, types.LongText, "str", true),
 		expression.NewGetField(1, types.LongText, "pattern", true),
 	)
 	require.Error(t, err)
 
 	_, err = NewRegexpReplace(
+		ctx,
 		expression.NewGetField(0, types.LongText, "str", true),
 		expression.NewGetField(1, types.LongText, "pattern", true),
 		expression.NewGetField(2, types.LongText, "replaceStr", true),
@@ -53,7 +58,9 @@ func TestRegexpReplaceInvalidArgNumber(t *testing.T) {
 }
 
 func TestRegexpReplace(t *testing.T) {
+	ctx := newRegexpTestContext()
 	f, err := NewRegexpReplace(
+		ctx,
 		expression.NewGetField(0, types.LongText, "str", true),
 		expression.NewGetField(1, types.LongText, "pattern", true),
 		expression.NewGetField(2, types.LongText, "replaceStr", true),
@@ -108,12 +115,21 @@ func TestRegexpReplace(t *testing.T) {
 			"XXX XXX XXX",
 			false,
 		},
+		{
+			"string wrapper input",
+			sql.NewRow(
+				testutils.NewMockStringWrapper("abc def ghi"),
+				testutils.NewMockStringWrapper(`[a-z]`),
+				testutils.NewMockStringWrapper("X")),
+			"XXX XXX XXX",
+			false,
+		},
 	}
 
 	for _, tt := range testCases {
 		t.Run(tt.name, func(t *testing.T) {
 			require := require.New(t)
-			ctx := sql.NewEmptyContext()
+			ctx := newRegexpTestContext()
 
 			val, err := f.Eval(ctx, tt.row)
 			if tt.err {
@@ -127,7 +143,9 @@ func TestRegexpReplace(t *testing.T) {
 }
 
 func TestRegexpReplaceWithPosition(t *testing.T) {
+	ctx := newRegexpTestContext()
 	f, err := NewRegexpReplace(
+		ctx,
 		expression.NewGetField(0, types.LongText, "str", true),
 		expression.NewGetField(1, types.LongText, "pattern", true),
 		expression.NewGetField(2, types.LongText, "replaceStr", true),
@@ -162,8 +180,20 @@ func TestRegexpReplaceWithPosition(t *testing.T) {
 		{
 			"too large position",
 			sql.NewRow("abc def ghi", `[a-z]`, "X", 1000),
-			nil,
-			true,
+			"abc def ghi",
+			false,
+		},
+		{
+			"position immediately after string",
+			sql.NewRow("abc", "a", "X", 4),
+			"abc",
+			false,
+		},
+		{
+			"position after empty string",
+			sql.NewRow("", "a", "X", 1000),
+			"",
+			false,
 		},
 		{
 			"string type position",
@@ -194,7 +224,7 @@ func TestRegexpReplaceWithPosition(t *testing.T) {
 	for _, tt := range testCases {
 		t.Run(tt.name, func(t *testing.T) {
 			require := require.New(t)
-			ctx := sql.NewEmptyContext()
+			ctx := newRegexpTestContext()
 
 			val, err := f.Eval(ctx, tt.row)
 			if tt.err {
@@ -208,7 +238,9 @@ func TestRegexpReplaceWithPosition(t *testing.T) {
 }
 
 func TestRegexpReplaceWithOccurrence(t *testing.T) {
+	ctx := newRegexpTestContext()
 	f, err := NewRegexpReplace(
+		ctx,
 		expression.NewGetField(0, types.LongText, "str", true),
 		expression.NewGetField(1, types.LongText, "pattern", true),
 		expression.NewGetField(2, types.LongText, "replaceStr", true),
@@ -276,7 +308,7 @@ func TestRegexpReplaceWithOccurrence(t *testing.T) {
 	for _, tt := range testCases {
 		t.Run(tt.name, func(t *testing.T) {
 			require := require.New(t)
-			ctx := sql.NewEmptyContext()
+			ctx := newRegexpTestContext()
 
 			val, err := f.Eval(ctx, tt.row)
 			if tt.err {
@@ -290,7 +322,9 @@ func TestRegexpReplaceWithOccurrence(t *testing.T) {
 }
 
 func TestRegexpReplaceWithFlags(t *testing.T) {
+	ctx := newRegexpTestContext()
 	f, err := NewRegexpReplace(
+		ctx,
 		expression.NewGetField(0, types.LongText, "str", true),
 		expression.NewGetField(1, types.LongText, "pattern", true),
 		expression.NewGetField(2, types.LongText, "replaceStr", true),
@@ -365,7 +399,7 @@ func TestRegexpReplaceWithFlags(t *testing.T) {
 	for _, tt := range testCases {
 		t.Run(tt.name, func(t *testing.T) {
 			require := require.New(t)
-			ctx := sql.NewEmptyContext()
+			ctx := newRegexpTestContext()
 
 			val, err := f.Eval(ctx, tt.row)
 			if tt.err {
@@ -383,7 +417,7 @@ func TestRegexpReplaceWithFlags(t *testing.T) {
 // BenchmarkRegexpReplace-14    	     100	  97385769 ns/op
 // BenchmarkRegexpReplace-14    	   10000	   1012373 ns/op
 func BenchmarkRegexpReplace(b *testing.B) {
-	ctx := sql.NewEmptyContext()
+	ctx := newRegexpTestContext()
 	// TODO: for some reason large datasets cause this to hang
 	data := make([]sql.Row, 11)
 	for i := range data {
@@ -392,6 +426,7 @@ func BenchmarkRegexpReplace(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		f, err := NewRegexpReplace(
+			ctx,
 			expression.NewGetField(0, types.LongText, "text", false),
 			expression.NewLiteral("^test[0-9]$", types.LongText),
 			expression.NewLiteral("abc", types.LongText),
@@ -409,6 +444,6 @@ func BenchmarkRegexpReplace(b *testing.B) {
 			}
 		}
 		require.Equal(b, 10, total)
-		f.(*RegexpReplace).Dispose()
+		f.(*RegexpReplace).Dispose(ctx)
 	}
 }

@@ -25,16 +25,16 @@ import (
 	"time"
 
 	"github.com/dolthub/vitess/go/sqltypes"
+	"github.com/dolthub/vitess/go/vt/sqlparser"
 	"github.com/pmezard/go-difflib/difflib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/otel/trace"
 	"gopkg.in/src-d/go-errors.v1"
 
 	sqle "github.com/dolthub/go-mysql-server"
 	"github.com/dolthub/go-mysql-server/enginetest"
 	"github.com/dolthub/go-mysql-server/enginetest/queries"
-	"github.com/dolthub/go-mysql-server/enginetest/scriptgen/setup"
+	"github.com/dolthub/go-mysql-server/enginetest/setup"
 	"github.com/dolthub/go-mysql-server/memory"
 	"github.com/dolthub/go-mysql-server/server"
 	"github.com/dolthub/go-mysql-server/sql"
@@ -45,6 +45,7 @@ import (
 	"github.com/dolthub/go-mysql-server/sql/planbuilder"
 	"github.com/dolthub/go-mysql-server/sql/rowexec"
 	"github.com/dolthub/go-mysql-server/sql/types"
+	"github.com/dolthub/go-mysql-server/sql/variables"
 )
 
 // This file is for tests of the engine that we are very sure do not rely on a particular database implementation. They
@@ -120,18 +121,18 @@ func TestLocks(t *testing.T) {
 	require := require.New(t)
 
 	harness := enginetest.NewDefaultMemoryHarness()
+	ctx := enginetest.NewContext(harness)
 	db := harness.NewDatabases("db")[0].(*memory.HistoryDatabase)
-	t1 := newLockableTable(memory.NewTable(db.BaseDatabase, "t1", sql.PrimaryKeySchema{}, db.GetForeignKeyCollection()))
-	t2 := newLockableTable(memory.NewTable(db.BaseDatabase, "t2", sql.PrimaryKeySchema{}, db.GetForeignKeyCollection()))
-	t3 := memory.NewTable(db.BaseDatabase, "t3", sql.PrimaryKeySchema{}, db.GetForeignKeyCollection())
+	t1 := newLockableTable(memory.NewTable(ctx, db.BaseDatabase, "t1", sql.PrimaryKeySchema{}, db.GetForeignKeyCollection()))
+	t2 := newLockableTable(memory.NewTable(ctx, db.BaseDatabase, "t2", sql.PrimaryKeySchema{}, db.GetForeignKeyCollection()))
+	t3 := memory.NewTable(ctx, db.BaseDatabase, "t3", sql.PrimaryKeySchema{}, db.GetForeignKeyCollection())
 	db.AddTable("t1", t1)
 	db.AddTable("t2", t2)
 	db.AddTable("t3", t3)
 
 	analyzer := analyzer.NewDefault(harness.Provider())
-	engine := sqle.New(analyzer, new(sqle.Config))
+	engine := sqle.New(analyzer, &sqle.Config{EngineVariables: harness.EngineVariables()})
 
-	ctx := enginetest.NewContext(harness)
 	ctx.SetCurrentDatabase("db")
 	_, iter, _, err := engine.Query(ctx, "LOCK TABLES t1 READ, t2 WRITE, t3 READ")
 	require.NoError(err)
@@ -153,44 +154,6 @@ func TestLocks(t *testing.T) {
 	require.Equal(0, t2.readLocks)
 	require.Equal(1, t2.writeLocks)
 	require.Equal(1, t2.unlocks)
-}
-
-type mockSpan struct {
-	trace.Span
-	finished bool
-}
-
-func (m *mockSpan) End(options ...trace.SpanEndOption) {
-	m.finished = true
-	m.Span.End(options...)
-}
-
-func newMockSpan(ctx context.Context) (context.Context, *mockSpan) {
-	ctx, span := trace.NewNoopTracerProvider().Tracer("").Start(ctx, "")
-	return ctx, &mockSpan{span, false}
-}
-
-func TestRootSpanFinish(t *testing.T) {
-	harness := enginetest.NewDefaultMemoryHarness()
-	if harness.IsUsingServer() {
-		t.Skip("this test depends on Context, which ServerEngine does not depend on or update the current context")
-	}
-	e, err := harness.NewEngine(t)
-	if err != nil {
-		panic(err)
-	}
-	sqlCtx := harness.NewContext()
-	ctx, fakeSpan := newMockSpan(sqlCtx)
-	sql.WithRootSpan(fakeSpan)(sqlCtx)
-	sqlCtx = sqlCtx.WithContext(ctx)
-
-	_, iter, _, err := e.Query(sqlCtx, "SELECT 1")
-	require.NoError(t, err)
-
-	_, err = sql.RowIterToRows(sqlCtx, iter)
-	require.NoError(t, err)
-
-	require.True(t, fakeSpan.finished)
 }
 
 type lockableTable struct {
@@ -242,7 +205,7 @@ func TestShowProcessList(t *testing.T) {
 	addr2 := "127.0.0.1:34568"
 	username := "foo"
 
-	p := sqle.NewProcessList()
+	p := sqle.NewProcessListWithVariables(variables.NewEngineVariables())
 	p.AddConnection(1, addr1)
 	p.AddConnection(2, addr2)
 	sess := sql.NewBaseSessionWithClientServer("0.0.0.0:3306", sql.Client{Address: addr1, User: username}, 1)
@@ -320,9 +283,10 @@ func (t *nonIndexableTable) IgnoreSessionData() bool {
 func TestLockTables(t *testing.T) {
 	require := require.New(t)
 	db := memory.NewDatabase("db")
+	ctx := sql.NewEmptyContext()
 
-	t1 := newLockableTable(memory.NewTable(db.BaseDatabase, "foo", sql.PrimaryKeySchema{}, nil))
-	t2 := newLockableTable(memory.NewTable(db.BaseDatabase, "bar", sql.PrimaryKeySchema{}, nil))
+	t1 := newLockableTable(memory.NewTable(ctx, db.BaseDatabase, "foo", sql.PrimaryKeySchema{}, nil))
+	t2 := newLockableTable(memory.NewTable(ctx, db.BaseDatabase, "bar", sql.PrimaryKeySchema{}, nil))
 	node := plan.NewLockTables([]*plan.TableLock{
 		{plan.NewResolvedTable(t1, nil, nil), true},
 		{plan.NewResolvedTable(t2, nil, nil), false},
@@ -342,17 +306,17 @@ func TestLockTables(t *testing.T) {
 func TestUnlockTables(t *testing.T) {
 	require := require.New(t)
 	db := memory.NewDatabase("db")
+	ctx := sql.NewEmptyContext()
 
-	t1 := newLockableTable(memory.NewTable(db.BaseDatabase, "foo", sql.PrimaryKeySchema{}, db.GetForeignKeyCollection()))
-	t2 := newLockableTable(memory.NewTable(db.BaseDatabase, "bar", sql.PrimaryKeySchema{}, db.GetForeignKeyCollection()))
-	t3 := newLockableTable(memory.NewTable(db.BaseDatabase, "baz", sql.PrimaryKeySchema{}, db.GetForeignKeyCollection()))
+	t1 := newLockableTable(memory.NewTable(ctx, db.BaseDatabase, "foo", sql.PrimaryKeySchema{}, db.GetForeignKeyCollection()))
+	t2 := newLockableTable(memory.NewTable(ctx, db.BaseDatabase, "bar", sql.PrimaryKeySchema{}, db.GetForeignKeyCollection()))
+	t3 := newLockableTable(memory.NewTable(ctx, db.BaseDatabase, "baz", sql.PrimaryKeySchema{}, db.GetForeignKeyCollection()))
 	db.AddTable("foo", t1)
 	db.AddTable("bar", t2)
 	db.AddTable("baz", t3)
 
 	catalog := analyzer.NewCatalog(sql.NewDatabaseProvider(db), sql.EngineOverrides{})
 
-	ctx := sql.NewEmptyContext()
 	ctx.SetCurrentDatabase("db")
 	catalog.LockTable(ctx, "foo")
 	catalog.LockTable(ctx, "bar")
@@ -397,6 +361,7 @@ var analyzerTestCases = []analyzerTestCase{
 			db, err := engine.EngineAnalyzer().Catalog.Database(ctx, "foo")
 			require.NoError(t, err)
 			greatest, err := function.NewGreatest(
+				ctx,
 				expression.NewLiteral("abc123", types.LongText),
 				expression.NewLiteral("cde456", types.LongText),
 			)
@@ -411,6 +376,7 @@ var analyzerTestCases = []analyzerTestCase{
 			db, err := engine.EngineAnalyzer().Catalog.Database(ctx, "foo")
 			require.NoError(t, err)
 			datetime, err := function.NewDatetime(
+				ctx,
 				expression.NewLiteral("20200101:120000Z", types.LongText),
 			)
 			require.NoError(t, err)
@@ -455,8 +421,9 @@ func TestAnalyzer_Exp(t *testing.T) {
 
 func assertNodesEqualWithDiff(t *testing.T, expected, actual sql.Node) {
 	if !assert.Equal(t, expected, actual) {
-		expectedStr := sql.DebugString(expected)
-		actualStr := sql.DebugString(actual)
+		ctx := sql.NewEmptyContext()
+		expectedStr := sql.DebugString(ctx, expected)
+		actualStr := sql.DebugString(ctx, actual)
 		diff, err := difflib.GetUnifiedDiffString(difflib.UnifiedDiff{
 			A:        difflib.SplitLines(expectedStr),
 			B:        difflib.SplitLines(actualStr),
@@ -564,8 +531,13 @@ func TestShowCharset(t *testing.T) {
 	}
 
 	harness := enginetest.NewMemoryHarness("", 1, nil)
+	e := enginetest.MustNewEngine(t, harness)
+	defer e.Close()
 	for _, test := range tests {
-		enginetest.TestQuery(t, harness, test.Query, test.RowGen(t), nil, nil)
+		enginetest.TestQuery(t, harness, e, queries.QueryTest{
+			Query:    test.Query,
+			Expected: test.RowGen(t),
+		})
 	}
 }
 
@@ -588,7 +560,7 @@ func TestTableFunctions(t *testing.T) {
 		memory.ExponentialDistTable{},
 		memory.NormalDistTable{})
 
-	engine := enginetest.NewEngineWithProvider(t, harness, testDatabaseProvider)
+	engine := enginetest.NewEngineWithProviderAndVariables(t, harness, testDatabaseProvider, harness.EngineVariables())
 	harness = harness.WithProvider(engine.Analyzer.Catalog.DbProvider)
 
 	engine.EngineAnalyzer().ExecBuilder = rowexec.NewBuilder(nil, sql.EngineOverrides{})
@@ -659,8 +631,10 @@ func TestTriggerViewWarning(t *testing.T) {
 	ctx.SetCurrentDatabase("mydb")
 	enginetest.CreateNewConnectionForServerEngine(ctx, e)
 
+	// A statement builds only the triggers of the tables it writes, so writing another table doesn't load the view's
+	// trigger and doesn't warn about it.
 	enginetest.TestQueryWithContext(t, ctx, e, harness, "insert into mytable values (4, 'fourth row')", []sql.Row{{types.NewOkResult(1)}}, nil, nil, nil)
-	enginetest.TestQueryWithContext(t, ctx, e, harness, "SHOW WARNINGS", []sql.Row{{"Warning", 0, "Trigger on view is not supported. Please run 'DROP TRIGGER view_trig;'"}}, nil, nil, nil)
+	enginetest.TestQueryWithContext(t, ctx, e, harness, "SHOW WARNINGS", []sql.Row{}, nil, nil, nil)
 	// TODO: this is not correct. MySQL allows inserting into views. https://github.com/dolthub/dolt/issues/10292
 	enginetest.AssertErrWithCtx(t, e, harness, ctx, "insert into myview values (5, 'fifth row')", nil, nil, "expected insert destination to be resolved or unresolved table")
 }
@@ -833,6 +807,9 @@ func TestRegex(t *testing.T) {
 	} {
 		enginetest.TestScript(t, harness, test)
 	}
+	for _, test := range queries.RegexScriptTests {
+		enginetest.TestScript(t, harness, test)
+	}
 	// We force garbage collection twice as we have two levels of finalizers on our regex objects, and we want to make
 	// sure that neither of them panic.
 	runtime.GC()
@@ -893,7 +870,7 @@ func (s SimpleTableFunction) String() string {
 	return "SimpleTableFunction"
 }
 
-func (s SimpleTableFunction) Schema() sql.Schema {
+func (s SimpleTableFunction) Schema(ctx *sql.Context) sql.Schema {
 	schema := []*sql.Column{
 		&sql.Column{
 			Name: "one",
@@ -912,7 +889,7 @@ func (s SimpleTableFunction) Children() []sql.Node {
 	return []sql.Node{}
 }
 
-func (s SimpleTableFunction) WithChildren(_ ...sql.Node) (sql.Node, error) {
+func (s SimpleTableFunction) WithChildren(ctx *sql.Context, children ...sql.Node) (sql.Node, error) {
 	return s, nil
 }
 
@@ -925,7 +902,7 @@ func (s SimpleTableFunction) Expressions() []sql.Expression {
 	return []sql.Expression{}
 }
 
-func (s SimpleTableFunction) WithExpressions(e ...sql.Expression) (sql.Node, error) {
+func (s SimpleTableFunction) WithExpressions(ctx *sql.Context, exprs ...sql.Expression) (sql.Node, error) {
 	return s, nil
 }
 
@@ -997,6 +974,127 @@ func TestTimestampBindingsCanBeCompared(t *testing.T) {
 	err = db.QueryRow("SELECT COUNT(1) FROM mytable WHERE t > ?", t0).Scan(&count)
 	require.NoError(t, err)
 	require.Equal(t, 1, count)
+}
+
+type exhaustedMemory struct{}
+
+func (exhaustedMemory) UsedMemory() uint64 { return 2 }
+func (exhaustedMemory) MaxMemory() uint64  { return 1 }
+
+func TestCountDistinctMemoryLimit(t *testing.T) {
+	db := memory.NewDatabase("mydb")
+	pro := memory.NewDBProvider(db)
+	e := sqle.NewDefault(pro)
+	newCtx := func(opts ...sql.ContextOption) *sql.Context {
+		opts = append(opts, sql.WithSession(memory.NewSession(sql.NewBaseSessionWithVariables(e.Variables()), pro)))
+		ctx := e.NewContext(context.Background(), opts...)
+		ctx.SetCurrentDatabase("mydb")
+		return ctx
+	}
+
+	for _, q := range []string{"CREATE TABLE t (i int primary key)", "INSERT INTO t VALUES (1), (2), (3)"} {
+		ctx := newCtx()
+		_, iter, _, err := e.Query(ctx, q)
+		require.NoError(t, err)
+		_, err = sql.RowIterToRows(ctx, iter)
+		require.NoError(t, err)
+	}
+
+	ctx := newCtx(sql.WithMemoryManager(sql.NewMemoryManager(exhaustedMemory{})))
+	_, iter, _, err := e.Query(ctx, "SELECT COUNT(DISTINCT i) FROM t")
+	if err == nil {
+		_, err = sql.RowIterToRows(ctx, iter)
+	}
+
+	require.True(t, sql.ErrNoMemoryAvailable.Is(err), "unexpected error: %v", err)
+	require.Zero(t, ctx.Memory.NumCaches())
+
+	for _, tt := range []struct {
+		query    string
+		expected []sql.Row
+	}{
+		{
+			query:    "SELECT COUNT(DISTINCT i), COUNT(DISTINCT i, i) FROM t",
+			expected: []sql.Row{{int64(3), int64(3)}},
+		},
+		{
+			query:    "SELECT CAST(i % 2 AS SIGNED), COUNT(DISTINCT i) FROM t GROUP BY i % 2 ORDER BY i % 2",
+			expected: []sql.Row{{int64(0), int64(1)}, {int64(1), int64(2)}},
+		},
+	} {
+		t.Run(tt.query, func(t *testing.T) {
+			ctx := newCtx()
+			_, iter, _, err := e.Query(ctx, tt.query)
+			require.NoError(t, err)
+			rows, err := sql.RowIterToRows(ctx, iter)
+			require.NoError(t, err)
+			require.Equal(t, tt.expected, rows)
+			require.Zero(t, ctx.Memory.NumCaches())
+		})
+	}
+}
+
+// TestTemporalCastPrecision checks the client error metadata and the largest valid precision.
+func TestTemporalCastPrecision(t *testing.T) {
+	db := memory.NewDatabase("mydb")
+	pro := memory.NewDBProvider(db)
+	e := sqle.NewDefault(pro)
+	ctx := e.NewContext(context.Background(), sql.WithSession(memory.NewSession(sql.NewBaseSessionWithVariables(e.Variables()), pro)))
+
+	for _, query := range []string{
+		"SELECT CAST('2020-01-01' AS DATETIME(7))",
+		"SELECT CONVERT('2020-01-01', DATETIME(7))",
+		"SELECT CAST('10:00:00' AS TIME(7))",
+		"SELECT CONVERT('10:00:00', TIME(7))",
+	} {
+		t.Run(query, func(t *testing.T) {
+			_, _, _, err := e.Query(ctx, query)
+			require.True(t, sql.ErrTooBigPrecision.Is(err), "unexpected error: %v", err)
+			require.EqualError(t, err, "Too big precision 7 specified. Maximum is 6.")
+			mysqlErr := sql.CastSQLError(err)
+			require.Equal(t, 1426, mysqlErr.Number())
+			require.Equal(t, "42000", mysqlErr.SQLState())
+		})
+	}
+
+	for _, query := range []string{
+		"SELECT CAST(CAST('10:00:00.123456' AS TIME(6)) AS CHAR)",
+		"SELECT CAST(CONVERT('10:00:00.123456', TIME(6)) AS CHAR)",
+	} {
+		t.Run(query, func(t *testing.T) {
+			_, iter, _, err := e.Query(ctx, query)
+			require.NoError(t, err)
+			rows, err := sql.RowIterToRows(ctx, iter)
+			require.NoError(t, err)
+			require.Equal(t, []sql.Row{{"10:00:00.123456"}}, rows)
+		})
+	}
+
+	for _, query := range []string{
+		"SELECT CAST(CAST('2020-01-01 10:00:00.123456' AS DATETIME(6)) AS CHAR)",
+		"SELECT CAST(CONVERT('2020-01-01 10:00:00.123456', DATETIME(6)) AS CHAR)",
+	} {
+		t.Run(query, func(t *testing.T) {
+			_, iter, _, err := e.Query(ctx, query)
+			require.NoError(t, err)
+			rows, err := sql.RowIterToRows(ctx, iter)
+			require.NoError(t, err)
+			require.Equal(t, []sql.Row{{"2020-01-01 10:00:00.123456"}}, rows)
+		})
+	}
+}
+
+func TestColumnStatisticsWithoutPrivileges(t *testing.T) {
+	db := memory.NewDatabase("mydb")
+	pro := memory.NewDBProvider(db)
+	e := sqle.NewDefault(pro)
+	ctx := e.NewContext(context.Background(), sql.WithSession(memory.NewSession(sql.NewBaseSessionWithVariables(e.Variables()), pro)))
+
+	_, iter, _, err := e.Query(ctx, "SELECT * FROM information_schema.column_statistics")
+	require.NoError(t, err)
+	rows, err := sql.RowIterToRows(ctx, iter)
+	require.NoError(t, err)
+	require.Empty(t, rows)
 }
 
 // TestAlterTableWithBadSchema is a backwards compatibility test that
@@ -1077,12 +1175,13 @@ func newDatabase() (*sql2.DB, func()) {
 
 	engine := sqle.New(analyzer.NewDefault(pro), &sqle.Config{
 		IncludeRootAccount: true,
+		EngineVariables:    harness.EngineVariables(),
 	})
 	cfg := server.Config{
 		Protocol: "tcp",
 		Address:  fmt.Sprintf("localhost:%d", port),
 	}
-	srv, err := server.NewServer(cfg, engine, sql.NewContext, harness.SessionBuilder(), nil)
+	srv, err := server.NewServer(cfg, engine, sql.ContextFactoryWithVariables(engine.Variables()), harness.SessionBuilder(), nil)
 	if err != nil {
 		panic(err)
 	}
@@ -1093,4 +1192,54 @@ func newDatabase() (*sql2.DB, func()) {
 		panic(err)
 	}
 	return db, func() { srv.Close() }
+}
+
+func TestClearAutocommitTransactionOnError(t *testing.T) {
+	harness := enginetest.NewDefaultMemoryHarness()
+	harness.NewDatabases("mydb")
+	engine, err := harness.NewEngine(t)
+	require.NoError(t, err)
+
+	// The queries are parsed up front so that QueryWithBindings takes its pre-parsed path, which is what a server
+	// using the prepared statement protocol does.
+	parse := func(t *testing.T, ctx *sql.Context, query string) sqlparser.Statement {
+		stmt, _, err := sql.DefaultMySQLParser.ParseOneWithOptions(ctx, query, sql.LoadSqlMode(ctx).ParserOptions())
+		require.NoError(t, err)
+		return stmt
+	}
+
+	for _, query := range []string{
+		"select * from doesnotexist",
+		"select doesnotexist(1)",
+		"insert into doesnotexist values (1)",
+	} {
+		t.Run(query, func(t *testing.T) {
+			ctx := harness.NewContext()
+			ctx.SetCurrentDatabase("mydb")
+			_, _, _, err := engine.QueryWithBindings(ctx, query, parse(t, ctx, query), nil, nil)
+			require.Error(t, err)
+			require.Nil(t, ctx.GetTransaction())
+		})
+	}
+
+	t.Run("explicit transaction is left in place", func(t *testing.T) {
+		ctx := harness.NewContext()
+		ctx.SetCurrentDatabase("mydb")
+		_, iter, _, err := engine.Query(ctx, "start transaction")
+		require.NoError(t, err)
+		_, err = sql.RowIterToRows(ctx, iter)
+		require.NoError(t, err)
+		require.NotNil(t, ctx.GetTransaction())
+
+		query := "select * from doesnotexist"
+		_, _, _, err = engine.QueryWithBindings(ctx, query, parse(t, ctx, query), nil, nil)
+		require.Error(t, err)
+		require.NotNil(t, ctx.GetTransaction())
+	})
+}
+
+func TestInvalidGeneratedExpressions(t *testing.T) {
+	for _, script := range queries.InvalidGeneratedExpressionScripts {
+		enginetest.TestScript(t, enginetest.NewDefaultMemoryHarness(), script)
+	}
 }

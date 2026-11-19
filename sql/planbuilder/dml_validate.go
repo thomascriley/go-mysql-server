@@ -24,7 +24,7 @@ import (
 )
 
 func (b *Builder) validateInsert(ins *plan.InsertInto) {
-	table := getResolvedTable(ins.Destination)
+	table := getResolvedTable(b.ctx, ins.Destination)
 	if table == nil {
 		return
 	}
@@ -43,7 +43,7 @@ func (b *Builder) validateInsert(ins *plan.InsertInto) {
 		}
 	}
 
-	if ins.OnDupExprs.HasUpdates() {
+	if ins.OnDup != nil {
 		var ok bool
 		_, ok = insertable.(sql.UpdatableTable)
 		if !ok {
@@ -53,34 +53,36 @@ func (b *Builder) validateInsert(ins *plan.InsertInto) {
 	}
 
 	// normalize the column name
-	dstSchema := insertable.Schema()
+	dstSchema := insertable.Schema(b.ctx)
 	columnNames := make([]string, len(ins.ColumnNames))
 	for i, name := range ins.ColumnNames {
 		columnNames[i] = strings.ToLower(name)
 	}
 
-	// If no columns are given and value tuples are not all empty, use the full schema
-	if len(columnNames) == 0 && existsNonZeroValueCount(ins.Source) {
+	// Empty value tuples implicitly target no columns so that every destination column is populated from its default.
+	if !existsNonZeroValueCount(ins.Source) {
+		columnNames = nil
+	} else if len(columnNames) == 0 {
 		columnNames = make([]string, len(dstSchema))
 		for i, f := range dstSchema {
 			columnNames[i] = f.Name
 		}
 	}
 
-	if len(ins.ColumnNames) > 0 {
+	if len(columnNames) > 0 {
 		err := validateInsertColumns(table.Name(), columnNames, dstSchema, ins.Source)
 		if err != nil {
 			b.handleErr(err)
 		}
 	}
 
-	err = validateValueCount(columnNames, ins.Source)
+	err = validateValueCount(b.ctx, columnNames, ins.Source)
 	if err != nil {
 		b.handleErr(err)
 	}
 }
 
-// Ensures that the number of elements in each Value tuple is empty
+// existsNonZeroValueCount reports whether a row source contains values rather than only empty tuples.
 func existsNonZeroValueCount(values sql.Node) bool {
 	switch node := values.(type) {
 	case *plan.Values:
@@ -162,15 +164,8 @@ func validGeneratedColumnValue(idx int, source sql.Node) bool {
 			case *sql.ColumnDefaultValue: // should be wrapped, but just in case
 				return true
 			case *expression.Wrapper:
-				if _, ok := val.Unwrap().(*sql.ColumnDefaultValue); ok {
-					return true
-				}
-				if _, ok := val.Unwrap().(*expression.DefaultColumn); ok {
-					return true
-				}
-				return false
-			case *expression.DefaultColumn: // handle unwrapped DefaultColumn
-				return true
+				_, ok := val.Unwrap().(*sql.ColumnDefaultValue)
+				return ok
 			default:
 				return false
 			}
@@ -181,7 +176,7 @@ func validGeneratedColumnValue(idx int, source sql.Node) bool {
 	}
 }
 
-func validateValueCount(columnNames []string, values sql.Node) error {
+func validateValueCount(ctx *sql.Context, columnNames []string, values sql.Node) error {
 	switch node := values.(type) {
 	case *plan.Values:
 		for _, exprTuple := range node.ExpressionTuples {
@@ -192,14 +187,14 @@ func validateValueCount(columnNames []string, values sql.Node) error {
 	case *plan.LoadData:
 		dataColLen := len(node.ColNames)
 		if dataColLen == 0 {
-			dataColLen = len(node.Schema())
+			dataColLen = len(node.Schema(ctx))
 		}
 		if len(columnNames) != dataColLen {
 			return sql.ErrInsertIntoMismatchValueCount.New()
 		}
 	default:
 		// Parser assures us that this will be some form of SelectStatement, so no need to type check it
-		if len(columnNames) != len(values.Schema()) {
+		if len(columnNames) != len(values.Schema(ctx)) {
 			return sql.ErrInsertIntoMismatchValueCount.New()
 		}
 	}

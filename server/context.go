@@ -16,6 +16,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/trace"
 
+	sqle "github.com/dolthub/go-mysql-server"
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/mysql_db"
 )
@@ -34,19 +36,36 @@ type SessionBuilder func(ctx context.Context, conn *mysql.Conn, addr string) (sq
 // it can be disposed.
 type DoneFunc func()
 
+// connInfo is the per-session state, created at authentication (NewSession). It
+// carries the session and the connection's disconnect-watch handle, which is
+// registered when the connInfo is first created and reused across any session
+// replacement on the same connection. Queries only run on authenticated
+// sessions, so this is the only place the watch needs to live.
+type connInfo struct {
+	session sql.Session
+	watch   *connState
+}
+
 // SessionManager is in charge of creating new sessions for the given
 // connections and keep track of which sessions are in each connection, so
 // they can be cancelled if the connection is closed.
 type SessionManager struct {
+	engine      *sqle.Engine
+	variables   *sql.EngineVariables
 	tracer      trace.Tracer
 	processlist sql.ProcessList
 	getDbFunc   func(ctx *sql.Context, db string) (sql.Database, error)
 	memory      *sql.MemoryManager
 	mu          *sync.Mutex
 	builder     SessionBuilder
-	sessions    map[uint32]sql.Session
+	sessions    map[uint32]*connInfo
 	connections map[uint32]*mysql.Conn
 	ctxFactory  sql.ContextFactory
+	// connWatcher detects clients that disconnect while a query is executing and
+	// cancels the in-flight query. It is registered/unregistered alongside the
+	// connection lifecycle (AddConn/RemoveConn) and may be nil (e.g. a
+	// SessionManager constructed without a server, or the watcher disabled).
+	connWatcher *connWatcher
 	addr        string
 	// Implements WaitForClosedConnections(), which is only used
 	// at server shutdown to allow the integrator to ensure that
@@ -55,8 +74,9 @@ type SessionManager struct {
 	lastPid uint64
 }
 
-// NewSessionManager creates a SessionManager with the given SessionBuilder.
-func NewSessionManager(
+// NewSessionManagerWithVariables creates a SessionManager whose connection
+// sessions and contexts must belong to |vars|.
+func NewSessionManagerWithVariables(
 	ctxFactory sql.ContextFactory,
 	builder SessionBuilder,
 	tracer trace.Tracer,
@@ -64,8 +84,13 @@ func NewSessionManager(
 	memory *sql.MemoryManager,
 	processlist sql.ProcessList,
 	addr string,
+	vars *sql.EngineVariables,
 ) *SessionManager {
+	if err := sql.ValidateEngineVariables(vars); err != nil {
+		panic(err)
+	}
 	return &SessionManager{
+		variables:   vars,
 		addr:        addr,
 		tracer:      tracer,
 		getDbFunc:   getDbFunc,
@@ -73,10 +98,22 @@ func NewSessionManager(
 		processlist: processlist,
 		mu:          new(sync.Mutex),
 		builder:     builder,
-		sessions:    make(map[uint32]sql.Session),
+		sessions:    make(map[uint32]*connInfo),
 		connections: make(map[uint32]*mysql.Conn),
 		ctxFactory:  ctxFactory,
 	}
+}
+
+func (s *SessionManager) context(ctx context.Context, opts ...sql.ContextOption) (*sql.Context, error) {
+	opts = append([]sql.ContextOption{sql.WithEngineVariables(s.variables)}, opts...)
+	result := s.ctxFactory(ctx, opts...)
+	if result == nil || result.EngineVariables() != s.variables {
+		return nil, fmt.Errorf("server variable ownership: context factory returned a context for another engine")
+	}
+	if result.Session == nil || result.Session.EngineVariables() != s.variables {
+		return nil, fmt.Errorf("server variable ownership: context session belongs to another engine")
+	}
+	return result, nil
 }
 
 func (s *SessionManager) nextPid() uint64 {
@@ -107,6 +144,12 @@ func (s *SessionManager) AddConn(conn *mysql.Conn) {
 	s.wg.Add(1)
 }
 
+// connWatchLogger builds the logger the disconnect watch uses to report a client
+// that went away mid-query.
+func connWatchLogger(conn *mysql.Conn) *logrus.Entry {
+	return logrus.NewEntry(logrus.StandardLogger()).WithField(sql.ConnectionIdLogField, conn.ConnectionID)
+}
+
 // Called once a connection is authenticated and in a ready
 // state. Responsible for creating the session associated with the
 // connection and registering the session, with appropriate
@@ -128,14 +171,22 @@ func (s *SessionManager) NewSession(ctx context.Context, conn *mysql.Conn) error
 	if err != nil {
 		return err
 	}
+	if session == nil || session.EngineVariables() != s.variables {
+		return fmt.Errorf("server variable ownership: session builder returned a session for another engine")
+	}
 
 	session.SetConnectionId(conn.ConnectionID)
 
-	if cur, ok := s.sessions[conn.ConnectionID]; ok {
-		sql.SessionEnd(cur)
+	ci := s.sessions[conn.ConnectionID]
+	if ci == nil {
+		// First session on this connection: register its disconnect watch. Reused
+		// for the connection's lifetime, including across session replacement.
+		ci = &connInfo{watch: s.connWatcher.Register(conn, connWatchLogger(conn))}
+		s.sessions[conn.ConnectionID] = ci
+	} else if ci.session != nil {
+		sql.SessionEnd(ci.session)
 	}
-
-	s.sessions[conn.ConnectionID] = session
+	ci.session = session
 
 	logger := session.GetLogger()
 	if logger == nil {
@@ -165,7 +216,10 @@ func (s *SessionManager) SetDB(ctx context.Context, conn *mysql.Conn, dbName str
 	}
 	defer sql.SessionCommandEnd(sess)
 
-	sqlCtx := s.ctxFactory(ctx, sql.WithSession(sess))
+	sqlCtx, err := s.context(ctx, sql.WithSession(sess))
+	if err != nil {
+		return err
+	}
 	sqlCtx, err = s.processlist.BeginOperation(sqlCtx)
 	if err != nil {
 		return err
@@ -219,8 +273,10 @@ func (s *SessionManager) Iter(f func(session sql.Session) (stop bool, err error)
 	// against long running callback functions being passed in that could cause long mutex blocking.
 	s.mu.Lock()
 	sessions := make([]sql.Session, 0, len(s.sessions))
-	for _, value := range s.sessions {
-		sessions = append(sessions, value)
+	for _, ci := range s.sessions {
+		if ci.session != nil {
+			sessions = append(sessions, ci.session)
+		}
 	}
 	s.mu.Unlock()
 
@@ -236,28 +292,48 @@ func (s *SessionManager) Iter(f func(session sql.Session) (stop bool, err error)
 func (s *SessionManager) session(conn *mysql.Conn) sql.Session {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.sessions[conn.ConnectionID]
+	if ci := s.sessions[conn.ConnectionID]; ci != nil {
+		return ci.session
+	}
+	return nil
+}
+
+// GetSession returns the existing session for a connection without creating a
+// query context or a new session. It returns nil if no session exists.
+func (s *SessionManager) GetSession(conn *mysql.Conn) sql.Session {
+	return s.session(conn)
 }
 
 func (s *SessionManager) getOrCreateSession(ctx context.Context, conn *mysql.Conn) (sql.Session, error) {
+	ci, err := s.getOrCreateConnInfo(ctx, conn)
+	if err != nil {
+		return nil, err
+	}
+	return ci.session, nil
+}
+
+// getOrCreateConnInfo returns the connInfo for conn, creating its session if one
+// does not exist yet. The returned connInfo carries both the session and the
+// disconnect-watch handle.
+func (s *SessionManager) getOrCreateConnInfo(ctx context.Context, conn *mysql.Conn) (*connInfo, error) {
 	s.mu.Lock()
-	sess, ok := s.sessions[conn.ConnectionID]
+	ci := s.sessions[conn.ConnectionID]
 	// Release this lock immediately. If we call NewSession below, we
 	// cannot hold the lock. We will relock if we need to.
 	s.mu.Unlock()
 
-	if !ok {
+	if ci == nil || ci.session == nil {
 		err := s.NewSession(ctx, conn)
 		if err != nil {
 			return nil, err
 		}
 
 		s.mu.Lock()
-		sess = s.sessions[conn.ConnectionID]
+		ci = s.sessions[conn.ConnectionID]
 		s.mu.Unlock()
 	}
 
-	return sess, nil
+	return ci, nil
 }
 
 // InitSessionDefaultVariable sets a default value to a parameter of a session at start.
@@ -266,35 +342,48 @@ func (s *SessionManager) InitSessionDefaultVariable(ctx context.Context, conn *m
 	if err != nil {
 		return err
 	}
-	return sess.InitSessionVariableDefault(s.ctxFactory(ctx, sql.WithSession(sess)), name, value)
+	sqlCtx, err := s.context(ctx, sql.WithSession(sess))
+	if err != nil {
+		return err
+	}
+	return sess.InitSessionVariableDefault(sqlCtx, name, value)
 }
 
 // NewContextWithQuery creates a new context for the session at the given conn.
 func (s *SessionManager) NewContextWithQuery(ctx context.Context, conn *mysql.Conn, query string) (*sql.Context, error) {
-	sess, err := s.getOrCreateSession(ctx, conn)
+	createdCtx, _, err := s.newContextAndWatch(ctx, conn, query)
+	return createdCtx, err
+}
 
+// newContextAndWatch creates a new context for the session at the given conn and
+// also returns the connection's disconnect-watch handle (nil if the watcher is
+// disabled), so the query path can notify it of query start/end. The handle
+// comes from the same connInfo lookup that builds the session, adding no extra
+// locking on the hot path.
+func (s *SessionManager) newContextAndWatch(ctx context.Context, conn *mysql.Conn, query string) (*sql.Context, *connState, error) {
+	ci, err := s.getOrCreateConnInfo(ctx, conn)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	ctx, span := s.tracer.Start(ctx, "query")
-
-	createdCtx := s.ctxFactory(
+	createdCtx, err := s.context(
 		ctx,
-		sql.WithSession(sess),
+		sql.WithSession(ci.session),
 		sql.WithTracer(s.tracer),
 		sql.WithPid(s.nextPid()),
 		sql.WithQuery(query),
 		sql.WithMemoryManager(s.memory),
 		sql.WithProcessList(s.processlist),
-		sql.WithRootSpan(span),
 		sql.WithServices(sql.Services{
 			KillConnection: s.KillConnection,
 			LoadInfile:     conn.LoadInfile,
 		}),
 	)
+	if err != nil {
+		return nil, nil, err
+	}
 
-	return createdCtx, nil
+	return createdCtx, ci.watch, nil
 }
 
 // Exposed through (*sql.Context).Services.KillConnection. Calls Close on the
@@ -314,11 +403,15 @@ func (s *SessionManager) KillConnection(connID uint32) error {
 
 // Remove the session assosiated with |conn| from the session manager.
 func (s *SessionManager) RemoveConn(conn *mysql.Conn) {
+	// Tear down the disconnect watch outside s.mu: Unregister may join a watcher
+	// goroutine, which we must not do while holding the session lock. Nil-safe.
+	s.connWatcher.Unregister(conn)
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.wg.Done()
-	if cur, ok := s.sessions[conn.ConnectionID]; ok {
-		sql.SessionEnd(cur)
+	if ci, ok := s.sessions[conn.ConnectionID]; ok && ci.session != nil {
+		sql.SessionEnd(ci.session)
 	}
 	delete(s.sessions, conn.ConnectionID)
 	delete(s.connections, conn.ConnectionID)
